@@ -3,12 +3,11 @@ rem Input Buffer - double-click to build and install the mod into Geometry Dash.
 cd /d "%~dp0"
 title Input Buffer - build
 
-rem First time (or the build folder was deleted): set it up.
-if not exist "build\build.ninja" (
-    echo Setting up the build folder...
-    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    if errorlevel 1 goto failed
-)
+rem Set up / refresh the build folder every time (a few seconds): picks up
+rem new files like resources\*.png and mod.json changes.
+echo Setting up the build folder...
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+if errorlevel 1 goto failed
 
 echo Building...
 cmake --build build

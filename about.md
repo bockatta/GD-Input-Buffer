@@ -30,7 +30,7 @@ How early a click can be and still get saved (60fps frames, 1 frame = 16.7 ms):
 
 ## The window
 
-**Left Alt** shows / hides it (or the key you set as Window Key). On phones: the **Buffer** button in the pause menu.
+**Left Alt** shows / hides it (or the key you set as Window Key). Or the **Input Buffer button** in the pause menu (green circle with the target icon), the way to open it on phones.
 
 - **Log:** what happened to each click
 - **Stats:** accuracy, your rhythm, windows, performance, your system

@@ -838,6 +838,14 @@
 //    * Stage tab: the "Left Alt: show / hide" credit text is gone; Discord is a
 //      violet pill (white bold, click = copy). Card hints, the Modes hint and
 //      grey Stats rows are white; "forget level" is violet like the badge.
+//    * Pause-menu button (every platform): CircleButtonSprite (green, Medium)
+//      with resources/pauseButtonIcon.png on top, sized to the other buttons in
+//      right-button-menu.
+//    * Phones: window x1.5 (PLATFORM_WINDOW_SCALE); hints name the pause button.
+//    * Wave releases (Extreme): held at most max(3 frames, the stage's wave
+//      release window) instead of 12 frames (WAVE_RELEASE_MAX_BASE), and a
+//      release path cut short by an orb / portal with no death counts as safe
+//      (verdictFor). Both made releases come out late or look ignored.
 //    * System line: the window's footer shows what the game runs on
 //      (Windows 10 / 11, Wine / Proton, macOS + chip, iOS / iPadOS, Android +
 //      32/64-bit), and Stats has a "System" section (OS build, device, GD,
@@ -855,6 +863,7 @@
 #include <Geode/modify/CCMouseDispatcher.hpp>
 #endif
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/ui/BasedButtonSprite.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
@@ -1096,6 +1105,11 @@ constexpr double SPOT_LAND_GRACE         = 1.0;
 // Ship / wave: a death within this many base ticks after your usual next input
 // still counts as the click's fault (you can't react faster than your rhythm).
 constexpr int    WAVE_GRACE_BASE         = 4;
+// Extreme: a wave RELEASE is held at most this many base ticks (12 = 3 frames,
+// 50 ms) instead of the 12-frame hold cap (2.1). A held release keeps the wave
+// going up, so a long hold read as "late" or "ignored" - past this it goes
+// through as you made it.
+constexpr int    WAVE_RELEASE_MAX_BASE   = 12;
 // A held click the live check never approves, with no click-time plan to fall
 // back on, goes in after this many base ticks (1 frame).
 constexpr int    LIVE_GIVEUP_BASE        = 4;
@@ -1343,6 +1357,13 @@ struct ModeInfo {
             int ext = holdBased() ? c.extremeHoldCap : c.extremeWindow;
             ext = static_cast<int>(std::lround(ext * s));
             t = std::max(t, ext);
+            // Wave releases: short cap (WAVE_RELEASE_MAX_BASE), never below the
+            // stage's own wave-release window.
+            if (wave && !push) {
+                int const cap = static_cast<int>(std::lround(WAVE_RELEASE_MAX_BASE * s));
+                int const own = static_cast<int>(std::floor(c.window[W_WAVE_REL] / dt + 0.001f));
+                t = std::min(t, std::max(cap, own));
+            }
         }
         return t;
     }
@@ -4539,6 +4560,8 @@ public:
             if (c.extreme) {
                 bool const holdW = w == W_SHIP || w == W_SHIP_REL || w == W_WAVE || w == W_WAVE_REL;
                 f = std::max(f, static_cast<float>(holdW ? c.extremeHoldCap : c.extremeWindow) * BASE_DT);
+                // wave releases: short cap (2.1), same math as windowTicks
+                if (w == W_WAVE_REL) f = std::min(f, std::max(WAVE_RELEASE_MAX_BASE * BASE_DT, e.window[w]));
             }
             kv(fmt::format("  {}", winLabel(w)), fmt::format("{:g}f{}", std::round(f * 100.f) / 100.f, autoOn ? " (auto)" : ""),
                autoOn ? COL_GREEN : COL_WHITE);
@@ -4813,6 +4836,11 @@ public:
             case SimEnd::OutOfBudget: return ibcore::Verdict::Budget;
             case SimEnd::Survived:    return ibcore::Verdict::Good;
             case SimEnd::Truncated:
+                // Wave release (2.1): the path survived up to an orb / portal we
+                // can't see past - the release itself didn't kill you, so let it
+                // go. Holding it there kept the wave rising until the window ran
+                // out (late / "ignored" releases near portals and orbs).
+                if (!x.push && x.mode.wave && !x.mode.ship) return ibcore::Verdict::Good;
                 // Safe until an orb / portal we can't see past, and clearly further than frame 0.
                 return rd.ticks > r0Ticks + scaleTicks(6, x.s) ? ibcore::Verdict::Partial : ibcore::Verdict::Bad;
             case SimEnd::Died:
@@ -5765,9 +5793,18 @@ std::string windowKeyName();
 // or the pause-menu button on phones (no keyboard).
 std::string toggleHint() {
 #ifdef GEODE_IS_MOBILE
-    return "Pause menu > Buffer to toggle";
+    return "Pause menu button to toggle";
 #else
     return windowKeyName() + " to toggle";
+#endif
+}
+
+// "how to bring the window back", for the hide notification and the empty Log.
+std::string showHowTo() {
+#ifdef GEODE_IS_MOBILE
+    return "the Input Buffer button in the pause menu";
+#else
+    return windowKeyName();
 #endif
 }
 
@@ -5803,6 +5840,11 @@ std::string windowKeyName() {
 }
 
 constexpr char const* AUTHOR_NAME    = "AlQuerez23";
+#ifdef GEODE_IS_MOBILE
+constexpr float PLATFORM_WINDOW_SCALE = 1.5f; // window size on iOS / Android (2.1)
+#else
+constexpr float PLATFORM_WINDOW_SCALE = 1.0f;
+#endif
 constexpr char const* TITLE_BADGE = "V2.1"; // the badge next to the title
 constexpr char const* AUTHOR_DISCORD = "alquerez23";
 
@@ -5963,8 +6005,9 @@ protected:
         setAnchorPoint({0.f, 0.f});
 
         Config const c = Config::load();
-        // Window Size 1.0 = half the original size.
-        setScale(0.5f * std::clamp(c.hudScale, 0.5f, 2.0f));
+        // Window Size 1.0 = half the original size. Phones get 1.5x on top (2.1):
+        // the same window is tiny on a phone screen.
+        setScale(0.5f * PLATFORM_WINDOW_SCALE * std::clamp(c.hudScale, 0.5f, 2.0f));
         m_alpha = windowOpacity();
         s_builtScale = c.hudScale;
         s_builtAlpha = m_alpha;
@@ -6092,7 +6135,7 @@ protected:
         // Close: a white X in a small box (GD's close button is a green sprite).
         boxButton(m_titleMenu, "X", {W - 11.f, H - TITLE_H / 2.f}, 12.f, 12.f, C_BTN, ccColor3B{255, 255, 255}, 0.3f, [] {
             BufferWindow::toggle();
-            Notification::create(fmt::format("Input Buffer hidden - press {} to show it again", windowKeyName()),
+            Notification::create(fmt::format("Input Buffer hidden - {} shows it again", showHowTo()),
                                  NotificationIcon::None, 2.0f)->show();
         });
 
@@ -6464,7 +6507,7 @@ protected:
             // Empty log: say what will show up here, and how to hide the window.
             m_data.emplace_back("Nothing logged yet.", COL_WHITE);
             m_data.emplace_back("Buffered clicks, when they fired, and deaths show up here while you play.", C_MUTED);
-            m_data.emplace_back(fmt::format("{} shows / hides this window. Drag it by the title bar.", windowKeyName()), C_MUTED);
+            m_data.emplace_back(fmt::format("Show / hide this window: {}. Drag it by the title bar.", showHowTo()), C_MUTED);
         }
         m_rowCount = static_cast<int>(m_data.size());
         scrollBy(0);
@@ -6951,25 +6994,50 @@ class $modify(BufMouse, CCMouseDispatcher) {
 };
 #endif
 
-// Pause menu: an "Input Buffer" button that shows / hides the window (1.26.2).
-// Every platform - and the only way on Android, which has no keyboard.
+// Pause menu button that shows / hides the window (1.26.2), on every platform
+// (the only way on phones). GD's green circle base with the mod's icon
+// (resources/pauseButtonIcon.png, icon only), sized to match the others.
 class $modify(BufPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
-        auto* spr = ButtonSprite::create("Buffer", "bigFont.fnt", "GJ_button_04.png", 0.6f);
-        spr->setScale(0.55f);
+        // GD's own green circle button (same base, rings, outline and shading as
+        // the gear next to it) with the mod's icon on top. If the icon isn't in
+        // the build (resources\ folder missing), fall back to the old text
+        // button so there's always a way to open the window.
+        CCNode* spr = nullptr;
+        if (CCSprite::create("pauseButtonIcon.png"_spr)) {
+            spr = CircleButtonSprite::createWithSprite("pauseButtonIcon.png"_spr, 1.f,
+                                                       CircleBaseColor::Green, CircleBaseSize::Medium);
+        }
+        if (!spr) {
+            log::warn("[InputBuffer] pauseButtonIcon.png not found - is resources\\pauseButtonIcon.png in the build? Using the text button.");
+            spr = ButtonSprite::create("Buffer", "bigFont.fnt", "GJ_button_04.png", 0.6f);
+            if (!spr) return;
+        }
+        auto* menu = this->getChildByID("right-button-menu");
+        // same size as the buttons already in that menu (their sprites vary by GD version)
+        float target = 0.f;
+        if (menu) {
+            for (auto* child : CCArrayExt<CCNode*>(menu->getChildren())) {
+                float const w = child->getScaledContentSize().width;
+                if (w > target) target = w;
+            }
+        }
+        if (target <= 0.f) target = 38.f;
+        float const w = spr->getContentSize().width;
+        if (w > 0.f) spr->setScale(target / w);
         auto* btn = CCMenuItemExt::createSpriteExtra(spr, [](CCMenuItemSpriteExtra*) { BufferWindow::toggle(); });
         btn->setID("input-buffer-button"_spr);
-        if (auto* menu = this->getChildByID("right-button-menu")) {
+        if (menu) {
             menu->addChild(btn);
             menu->updateLayout();
+            log::info("[InputBuffer] pause button added to right-button-menu");
         } else {
+            log::info("[InputBuffer] no right-button-menu in the pause menu - button placed bottom-left");
             // no such menu (another mod moved things): our own, bottom-left
             auto* m = CCMenu::create();
             m->addChild(btn);
-            auto const win = CCDirector::sharedDirector()->getWinSize();
-            m->setPosition({45.f, 30.f});
-            (void)win;
+            m->setPosition({35.f, 35.f});
             this->addChild(m, 10);
         }
     }

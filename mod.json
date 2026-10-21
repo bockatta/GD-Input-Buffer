@@ -11,6 +11,11 @@
 	"name": "Input Buffer",
 	"developer": "AlQuerez",
 	"description": "Discord: alquerez23",
+	"resources": {
+		"sprites": [
+			"resources/*.png"
+		]
+	},
 	"settings": {
 		"stage": {
 			"type": "string",

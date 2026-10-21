@@ -82,6 +82,21 @@ jobs:
       - uses: geode-sdk/build-geode-mod/combine@main
         id: build
 
+      # Lists what is inside the combined .geode, so a missing platform binary
+      # (the "No binary could be found for current platform" error on a phone)
+      # shows up right here in the log. Only warns - it never fails the build.
+      - name: Check the package has every platform
+        continue-on-error: true
+        shell: bash
+        run: |
+          p="${{ steps.build.outputs.build-output }}"
+          if [ -d "$p" ]; then f=$(ls "$p"/*.geode 2>/dev/null | head -n 1); else f="$p"; fi
+          echo "package: $f"
+          unzip -l "$f" || exit 0
+          for bin in alquerez.inputbuffer.dll alquerez.inputbuffer.dylib alquerez.inputbuffer.ios.dylib alquerez.inputbuffer.android32.so alquerez.inputbuffer.android64.so; do
+            unzip -l "$f" | grep -qF " $bin" || echo "::warning title=Missing binary::$bin is not in the package"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: Build Output

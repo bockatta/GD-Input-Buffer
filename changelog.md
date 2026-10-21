@@ -8,6 +8,12 @@
 - Discord is now a purple button under the Stage tab cards (white, bold). Click it to copy alquerez23. The old "Left Alt: show / hide this window" line there is gone (the bottom of the window already says it).
 - White text: "F6 cycles stages", "frames @60fps, 0.5 steps", the Modes tab hint, and the grey rows in Stats.
 - "forget level" is purple like the V2.1 badge.
+- The pause-menu button is now a green circle like GD's own pause buttons, using GD's own green circle base (same rings, outline and shading as the gear) with the gold arrow, target and timeline icon on top, and it's the same size as the buttons next to it. It's on every platform: Windows, Mac, iOS and Android.
+- If the button image is missing from a build, the pause menu falls back to the old "Buffer" text button, so the window can always be opened. build.bat now refreshes the build setup every time, so new images get picked up.
+- Phones: the window is 1.5x bigger on iOS and Android (Window Size still scales it on top).
+- Phones: hints say to use the pause-menu button instead of a key.
+- New purple logo.
+- Wave releases on Extreme: a release is now held at most 5 frames instead of 12, so it can't come out way late or look ignored. And a release that's safe up to an orb or portal (where the prediction stops) now goes straight through instead of being held until the window ran out.
 - New mod description: how the mod works, the stages, and a version table with the platforms each version works on.
 - New system line: the bottom of the window shows what the game is running on: Windows 10 / 11, Wine / Proton (Linux, Steam Deck), macOS with Apple Silicon / Intel / Rosetta, iOS / iPadOS, or Android 32 / 64-bit.
 - Stats has a new "System" section: the full OS version / build, the device (chip or phone model), and the Geometry Dash, Geode and Input Buffer versions. Handy when someone reports a bug.

@@ -38,7 +38,7 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 
 ## The window
 
-**Left Alt** shows / hides it (change it in the settings: *Window Key*). On phones, use the **Buffer** button in the pause menu. While a level runs it shrinks to a small pill ("Small while playing").
+**Left Alt** shows / hides it (change it in the settings: *Window Key*). You can also use the **Input Buffer button** in the pause menu (green circle with the target icon), which is the way on phones; the window is bigger there too. While a level runs it shrinks to a small pill ("Small while playing").
 
 - **Log**: what the buffer did with each click: buffered, fired, raw, deaths.
 - **Stats**: prediction accuracy, your rhythm, windows, performance, and your system.
@@ -73,5 +73,8 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 - **"V2.1"** badge next to the title, and "by AlQuerez23" / "Discord: alquerez23".
 - The bottom of the window says how to toggle it ("Left Alt to toggle", or your own key) and what you're running on (Windows 10 / 11, macOS, iOS, Android).
 - New **System** section in Stats: OS version, device, Geometry Dash, Geode and mod versions.
+- Phones: a GD-style green pause-menu button, and a 1.5x bigger window.
+- New purple logo.
+- Wave releases on Extreme: held at most 5 frames (was 12), and releases near orbs / portals no longer come out late.
 
 Every version's full changes are in [changelog.md](changelog.md).
