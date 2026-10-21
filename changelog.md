@@ -2,6 +2,7 @@
 
 ## v2.0.0
 - Input Buffer V2: everything since v1.17 in one release - exact predictions (one-tick check 100%), learned orb speeds, size portals predicted, held clicks that follow their plan, much lighter per frame, the new purple window with the in-game pill, the new Log and Stats, Android, iOS and macOS support. Details per step below.
+- Build fixes for iOS: the keyboard hook (macOS only) is no longer compiled on phones, and the GitHub build works around a missing include in Geode's current iOS bindings.
 
 ## v1.26.2
 - Fixed the "random orb": a circle could show up next to an orb. It was the orb effect being drawn by the mod's hidden prediction player. Predictions no longer trigger it, and the jump itself comes from the learned orb speeds as before.

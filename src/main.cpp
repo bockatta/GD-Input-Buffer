@@ -834,8 +834,10 @@
 #include <Geode/ui/Notification.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 #include <Geode/ui/OverlayManager.hpp>
-#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #ifdef GEODE_IS_DESKTOP
+// keyboard hook header: desktop only (it doesn't compile on iOS - no
+// CCKeyboardDispatcher constructor address there; only macOS uses the hook)
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/CCMouseDispatcher.hpp>
 #endif
 #include <Geode/modify/PauseLayer.hpp>
