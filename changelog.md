@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.1.0
+- The badge next to the title now says V2.1.
+- "by AlQuerez" and the system name at the bottom are now white and bold.
+- Name and Discord updated: the title says "by AlQuerez23" and the Stage tab says "Discord: alquerez23".
+- The bottom-left of the window now says how to show / hide it, like "Left Alt to toggle" (whatever key you set), in white bold, instead of "INPUT BUFFER  EXTREME". On phones it points to the Buffer button in the pause menu.
+- Discord is now a purple button under the Stage tab cards (white, bold). Click it to copy alquerez23. The old "Left Alt: show / hide this window" line there is gone (the bottom of the window already says it).
+- White text: "F6 cycles stages", "frames @60fps, 0.5 steps", the Modes tab hint, and the grey rows in Stats.
+- "forget level" is purple like the V2.1 badge.
+- New mod description: how the mod works, the stages, and a version table with the platforms each version works on.
+- New system line: the bottom of the window shows what the game is running on: Windows 10 / 11, Wine / Proton (Linux, Steam Deck), macOS with Apple Silicon / Intel / Rosetta, iOS / iPadOS, or Android 32 / 64-bit.
+- Stats has a new "System" section: the full OS version / build, the device (chip or phone model), and the Geometry Dash, Geode and Input Buffer versions. Handy when someone reports a bug.
+
 ## v2.0.0
 - Input Buffer V2: everything since v1.17 in one release - exact predictions (one-tick check 100%), learned orb speeds, size portals predicted, held clicks that follow their plan, much lighter per frame, the new purple window with the in-game pill, the new Log and Stats, Android, iOS and macOS support. Details per step below.
 - Build fixes for iOS: the keyboard hook (macOS only) is no longer compiled on phones, and the GitHub build works around a missing include in Geode's current iOS bindings.

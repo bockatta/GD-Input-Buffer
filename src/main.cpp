@@ -810,7 +810,7 @@
 //    * Polish: the window pops in, the tab highlight slides, the last tab is
 //      remembered, Window Opacity setting (panels only, text stays solid);
 //      "forget level" / "all settings" moved into the OPTIONS title row.
-//    * "V2" badge next to the title.
+//    * "V2" badge next to the title (TITLE_BADGE, now "V2.1").
 //
 //  NEW IN 1.26.2
 //  ------------------------------------------------------------------------
@@ -828,6 +828,20 @@
 //    * iOS + macOS: every hooked / called function checked in the 2.2081
 //      bindings (no "inline" on ios / imac / m1). macOS uses the keyboard hook
 //      for the Window Key and the mouse-wheel hook; iOS the pause-menu button.
+//
+//  NEW IN 2.1
+//  ------------------------------------------------------------------------
+//    * Title badge now reads "V2.1"; "by AlQuerez23" and the system name are
+//      white bigFont (bold). Discord: alquerez23.
+//    * Footer left: "<Window Key> to toggle" (white bold) instead of the status
+//      line ("INPUT BUFFER  EXTREME" ...); phones: "Pause menu > Buffer".
+//    * Stage tab: the "Left Alt: show / hide" credit text is gone; Discord is a
+//      violet pill (white bold, click = copy). Card hints, the Modes hint and
+//      grey Stats rows are white; "forget level" is violet like the badge.
+//    * System line: the window's footer shows what the game runs on
+//      (Windows 10 / 11, Wine / Proton, macOS + chip, iOS / iPadOS, Android +
+//      32/64-bit), and Stats has a "System" section (OS build, device, GD,
+//      Geode and mod versions). Read once (systemInfo()), cached.
 // ============================================================================
 
 #include <Geode/Geode.hpp>
@@ -852,6 +866,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -863,7 +878,129 @@
 #include <vector>
 #include "BufferCore.hpp"
 
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
+#include <sys/sysctl.h>
+#elif defined(GEODE_IS_ANDROID)
+#include <sys/system_properties.h>
+#endif
+
 using namespace geode::prelude;
+
+// ----------------------------------------------------------------------------
+//  System info (2.1): what the game is running on, for the window's footer
+//  and the Stats "System" section. Read once, then cached.
+// ----------------------------------------------------------------------------
+namespace {
+
+struct SystemInfo {
+    std::string brief;   // footer: "Windows 11", "macOS 15.1 - Apple Silicon", ...
+    std::string full;    // Stats: with build / version numbers
+    std::string device;  // Stats: chip / model, "" if unknown
+};
+
+#if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
+std::string sysctlString(char const* name) {
+    char buf[256] = {};
+    size_t len = sizeof(buf) - 1;
+    if (sysctlbyname(name, buf, &len, nullptr, 0) != 0 || len == 0) return "";
+    return std::string(buf, strnlen(buf, len));
+}
+#endif
+
+#if defined(GEODE_IS_ANDROID)
+std::string androidProp(char const* name) {
+    char buf[PROP_VALUE_MAX] = {};
+    int const n = __system_property_get(name, buf);
+    return n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string();
+}
+#endif
+
+SystemInfo readSystemInfo() {
+    SystemInfo si;
+#if defined(GEODE_IS_WINDOWS)
+    // GetVersionEx lies to apps without a manifest; ntdll's RtlGetVersion doesn't.
+    // Windows 11 still says 10.0 - it's told apart by its build number (22000+).
+    HMODULE const nt = GetModuleHandleW(L"ntdll.dll");
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    RTL_OSVERSIONINFOW v{};
+    v.dwOSVersionInfoSize = sizeof(v);
+    if (nt) {
+        if (auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(nt, "RtlGetVersion"))) fn(&v);
+    }
+    std::string name;
+    if (v.dwMajorVersion == 10 && v.dwBuildNumber >= 22000) name = "Windows 11";
+    else if (v.dwMajorVersion == 10) name = "Windows 10";
+    else if (v.dwMajorVersion > 0) name = fmt::format("Windows {}.{}", v.dwMajorVersion, v.dwMinorVersion);
+    else name = "Windows";
+    si.brief = name;
+    si.full = v.dwBuildNumber > 0 ? fmt::format("{} (build {})", name, v.dwBuildNumber) : name;
+    // Wine / Proton (Linux, Steam Deck, Mac): ntdll has Wine's own exports.
+    if (nt) {
+        using WineVerFn = char const*(__cdecl*)();
+        using WineHostFn = void(__cdecl*)(char const**, char const**);
+        if (auto wv = reinterpret_cast<WineVerFn>(GetProcAddress(nt, "wine_get_version"))) {
+            char const* sys = nullptr;
+            char const* rel = nullptr;
+            if (auto wh = reinterpret_cast<WineHostFn>(GetProcAddress(nt, "wine_get_host_version"))) wh(&sys, &rel);
+            std::string host = sys ? sys : "";
+            if (host == "Darwin") host = "macOS";
+            char const* ver = wv();
+            si.brief = host.empty() ? "Wine" : "Wine on " + host;
+            si.full = fmt::format("Wine {}{} (as {})", ver ? ver : "", host.empty() ? "" : " on " + host, name);
+        }
+    }
+#elif defined(GEODE_IS_MACOS)
+    std::string const ver = sysctlString("kern.osproductversion");
+    std::string chip;
+  #if defined(GEODE_IS_ARM_MAC)
+    chip = "Apple Silicon";
+  #else
+    int translated = 0;
+    size_t tlen = sizeof(translated);
+    bool const rosetta = sysctlbyname("sysctl.proc_translated", &translated, &tlen, nullptr, 0) == 0 && translated == 1;
+    chip = rosetta ? "Intel build on Apple Silicon (Rosetta)" : "Intel";
+  #endif
+    std::string const os = ver.empty() ? "macOS" : "macOS " + ver;
+    si.brief = os + " - " + (chip.rfind("Intel build", 0) == 0 ? std::string("Rosetta") : chip);
+    si.full = os + ", " + chip;
+    std::string const cpu = sysctlString("machdep.cpu.brand_string");
+    std::string const model = sysctlString("hw.model");
+    si.device = cpu.empty() ? model : (model.empty() ? cpu : cpu + " (" + model + ")");
+#elif defined(GEODE_IS_IOS)
+    std::string const ver = sysctlString("kern.osproductversion");
+    std::string const machine = sysctlString("hw.machine"); // "iPhone15,2", "iPad13,4"
+    std::string os = "iOS";
+    if (machine.rfind("iPad", 0) == 0) os = "iPadOS";
+    si.brief = ver.empty() ? os : os + " " + ver;
+    si.full = si.brief;
+    if (!machine.empty() && machine.rfind("iP", 0) != 0) si.full += " (on a Mac)";
+    si.device = machine;
+#elif defined(GEODE_IS_ANDROID)
+    std::string const ver = androidProp("ro.build.version.release");
+    std::string const sdk = androidProp("ro.build.version.sdk");
+  #if defined(GEODE_IS_ANDROID64)
+    char const* bits = "64-bit";
+  #else
+    char const* bits = "32-bit";
+  #endif
+    std::string const os = ver.empty() ? "Android" : "Android " + ver;
+    si.brief = os + " - " + bits;
+    si.full = sdk.empty() ? si.brief : fmt::format("{} (API {}), {}", os, sdk, bits);
+    std::string const make = androidProp("ro.product.manufacturer");
+    std::string const model = androidProp("ro.product.model");
+    si.device = make.empty() ? model : (model.empty() ? make : make + " " + model);
+#else
+    si.brief = si.full = "Unknown platform";
+#endif
+    return si;
+}
+
+SystemInfo const& systemInfo() {
+    static SystemInfo const info = readSystemInfo();
+    return info;
+}
+
+} // namespace
 
 namespace {
 
@@ -4319,6 +4456,8 @@ public:
             rows.emplace_back("\x01" + t, COL_WHITE);
         };
         auto kv = [&](std::string const& label, std::string const& value, ccColor3B col = COL_WHITE) {
+            // grey rows read as white (2.1); green / yellow / orange still mean something
+            if (col.r == COL_GREY.r && col.g == COL_GREY.g && col.b == COL_GREY.b) col = COL_WHITE;
             rows.emplace_back(label + "\t" + value, col);
         };
         auto note = [&](std::string const& t, ccColor3B col = COL_GREY) { rows.emplace_back("  " + t, col); };
@@ -4434,6 +4573,17 @@ public:
         if (c.learnSpots && m_spots.size() > 0) {
             head("Learn from attempts (mini cube)");
             kv("Spots on this level", fmt::format("{} good, {} bad", m_spots.goodCount(), m_spots.badCount()));
+        }
+
+        // ---- what the game runs on (2.1)
+        {
+            SystemInfo const& si = systemInfo();
+            head("System");
+            kv("Running on", si.full);
+            if (!si.device.empty()) kv("Device", si.device);
+            kv("Geometry Dash", Loader::get()->getGameVersion());
+            kv("Geode", Loader::get()->getVersion().toVString());
+            kv("Input Buffer", Mod::get()->getVersion().toVString());
         }
 
         // ---- details (debugging), only with "Log: show safe clicks"
@@ -5609,6 +5759,18 @@ TrajectoryBufferSim s_sim;
 //      your clicks (no swallowed jumps). Interact with it while paused, or
 //      outside a level. The mouse wheel scrolls it any time.
 // ----------------------------------------------------------------------------
+std::string windowKeyName();
+
+// Footer hint (2.1): how to show / hide the window - the Window Key you set,
+// or the pause-menu button on phones (no keyboard).
+std::string toggleHint() {
+#ifdef GEODE_IS_MOBILE
+    return "Pause menu > Buffer to toggle";
+#else
+    return windowKeyName() + " to toggle";
+#endif
+}
+
 // Window key name for on-screen hints ("Left Alt"), from the Window Key
 // setting. cocos key codes are Windows virtual-key codes.
 std::string windowKeyName() {
@@ -5640,8 +5802,9 @@ std::string windowKeyName() {
     return "the Window Key";
 }
 
-constexpr char const* AUTHOR_NAME    = "AlQuerez";
-constexpr char const* AUTHOR_DISCORD = "AlQuerez#3900";
+constexpr char const* AUTHOR_NAME    = "AlQuerez23";
+constexpr char const* TITLE_BADGE = "V2.1"; // the badge next to the title
+constexpr char const* AUTHOR_DISCORD = "alquerez23";
 
 class BufferWindow : public CCLayer {
 public:
@@ -5769,6 +5932,7 @@ protected:
     CCLayerColor*  m_scrollTrack = nullptr;
     CCLayerColor*  m_scrollThumb = nullptr;
     CCLabelBMFont* m_footer = nullptr;
+    CCLabelBMFont* m_platform = nullptr; // footer, right: "Windows 11" etc. (2.1)
     CCMenu* m_titleMenu = nullptr; // close button
     CCMenu* m_tabMenu = nullptr;
     CCMenu* m_listMenu = nullptr;  // scroll arrows / list buttons
@@ -5840,20 +6004,21 @@ protected:
         title->setAnchorPoint({0.f, 0.5f});
         title->setPosition({PAD + 2.f, H - TITLE_H / 2.f + 0.5f});
         m_body->addChild(title, 2);
-        // "V2" badge right after the title: violet pill, white text.
+        // Version badge right after the title ("V2.1"): violet pill, white text,
+        // sized to the text.
         float const titleEnd = PAD + 2.f + title->getContentSize().width * 0.38f;
-        float const badgeW = 15.f, badgeH = 9.f;
+        auto* v2 = CCLabelBMFont::create(TITLE_BADGE, "bigFont.fnt");
+        v2->setScale(0.2f);
+        float const badgeW = std::max(15.f, v2->getContentSize().width * 0.2f + 6.f), badgeH = 9.f;
         auto* badge = panel(badgeW, badgeH, C_BTN_SEL, 255, 3.f);
         badge->setPosition({titleEnd + 4.f, H - TITLE_H / 2.f - badgeH / 2.f + 0.5f});
         m_body->addChild(badge, 2);
-        auto* v2 = CCLabelBMFont::create("V2", "bigFont.fnt");
-        v2->setScale(0.2f);
         v2->setColor({255, 255, 255});
         v2->setPosition({titleEnd + 4.f + badgeW / 2.f, H - TITLE_H / 2.f + 0.5f});
         m_body->addChild(v2, 3);
-        auto* by = CCLabelBMFont::create(fmt::format("by {}", AUTHOR_NAME).c_str(), "chatFont.fnt");
-        by->setScale(0.42f);
-        by->setColor(C_DIM);
+        auto* by = CCLabelBMFont::create(fmt::format("by {}", AUTHOR_NAME).c_str(), "bigFont.fnt");
+        by->setScale(0.2f);
+        by->setColor({255, 255, 255});
         by->setAnchorPoint({0.f, 0.5f});
         by->setPosition({titleEnd + 4.f + badgeW + 5.f, H - TITLE_H / 2.f});
         m_body->addChild(by, 2);
@@ -5909,12 +6074,19 @@ protected:
         auto* footLine = CCLayerColor::create(ccColor4B{150, 110, 255, 45}, W - 16.f, 1.f);
         footLine->setPosition({8.f, FOOT_H});
         m_body->addChild(footLine, 1);
-        m_footer = CCLabelBMFont::create("", "chatFont.fnt");
-        m_footer->setScale(0.45f);
+        // Left: how to show / hide the window ("Left Alt to toggle"), white bold (2.1).
+        m_footer = CCLabelBMFont::create("", "bigFont.fnt");
+        m_footer->setScale(0.2f);
         m_footer->setAnchorPoint({0.f, 0.5f});
         m_footer->setPosition({PAD + 2.f, FOOT_H / 2.f});
-        m_footer->setColor(C_MUTED);
+        m_footer->setColor({255, 255, 255});
         m_body->addChild(m_footer, 2);
+        // What the game runs on, right side of the footer (left of "clear" on the Log tab).
+        m_platform = CCLabelBMFont::create(systemInfo().brief.c_str(), "bigFont.fnt");
+        m_platform->setScale(0.2f);
+        m_platform->setAnchorPoint({1.f, 0.5f});
+        m_platform->setColor({255, 255, 255});
+        m_body->addChild(m_platform, 2);
 
         m_titleMenu = makeMenu();
         // Close: a white X in a small box (GD's close button is a green sprite).
@@ -6083,7 +6255,7 @@ protected:
         if (!hint.empty()) {
             auto* hl = CCLabelBMFont::create(hint.c_str(), "chatFont.fnt");
             hl->setScale(0.4f);
-            hl->setColor(C_DIM);
+            hl->setColor({255, 255, 255});
             hl->setAnchorPoint({1.f, 0.5f});
             hl->setPosition({x + w - 6.f, y + h - 6.f});
             m_settingsLabels->addChild(hl);
@@ -6263,13 +6435,19 @@ protected:
                 drawRound(m_headerPill, hw, 12.f, C_PILL, 240);
             }
         }
-        std::string const foot = s_sim.statusLine();
+        std::string const foot = toggleHint(); // was the status line ("INPUT BUFFER  EXTREME" ...) before 2.1
         if (force || foot != m_shownFooter) {
             m_shownFooter = foot;
             m_footer->setString(foot.c_str());
-            m_footer->setScale(0.45f);
-            // room for "clear" on the Log tab
-            limitNodeWidth(m_footer, W - 2.f * PAD - (m_tab == TAB_LOG ? 34.f : 4.f), 0.45f, 0.25f);
+            m_footer->setScale(0.2f);
+            // room for "clear" on the Log tab and the system name on the right
+            float const right = W - PAD - (m_tab == TAB_LOG ? 34.f : 2.f);
+            float platW = 0.f;
+            if (m_platform) {
+                m_platform->setPosition({right, FOOT_H / 2.f});
+                platW = m_platform->getContentSize().width * m_platform->getScale() + 8.f;
+            }
+            limitNodeWidth(m_footer, std::max(40.f, right - platW - (PAD + 2.f)), 0.2f, 0.12f);
         }
         if (!isList(m_tab)) return;
         if (m_tab == TAB_LOG) {
@@ -6472,7 +6650,7 @@ protected:
         // -- OPTIONS card (30..77): title row has the two buttons, then 2x2 toggles
         card(cx, 30.f, cw, 47.f, "OPTIONS");
         float const colL = cx + 4.f, colR = W / 2.f + 2.f;
-        boxButton(m_settingsMenu, "forget level", {W - PAD - 108.f, 70.f}, 62.f, 11.f, C_BTN, COL_ORANGE, 0.21f, [] {
+        boxButton(m_settingsMenu, "forget level", {W - PAD - 108.f, 70.f}, 62.f, 11.f, C_BTN_SEL, ccColor3B{255, 255, 255}, 0.21f, [] {
             if (s_sim.inLevelWithSpots()) s_sim.forgetSpots();
             else Notification::create("Open the level first (pause it), then press forget level", NotificationIcon::None, 1.8f)->show();
         });
@@ -6485,15 +6663,15 @@ protected:
         addToggle(colL, 39.f, "Log: show safe clicks", "log-safe-clicks", false);
         addToggle(colR, 39.f, "Small while playing", "compact-play", true);
 
-        // -- credit line (between the cards and the footer)
-        auto* credit = CCLabelBMFont::create(
-            fmt::format("Discord: {}     {}: show / hide this window", AUTHOR_DISCORD, windowKeyName()).c_str(),
-            "chatFont.fnt");
-        credit->setScale(0.45f);
-        credit->setColor(C_DIM);
-        limitNodeWidth(credit, W - 2.f * PAD, 0.45f, 0.25f);
-        credit->setPosition({W / 2.f, 22.f});
-        m_settingsLabels->addChild(credit);
+        // -- Discord (2.1): a violet pill like the version badge, white bold text,
+        // centred under the cards. Clicking it copies the name. (The "Left Alt:
+        // show / hide" hint moved to the footer: "Left Alt to toggle".)
+        static std::string const discordText = fmt::format("Discord: {}", AUTHOR_DISCORD);
+        boxButtonFit(m_settingsMenu, discordText.c_str(), {W / 2.f, 22.f}, ccColor3B{255, 255, 255}, [] {
+            bool const ok = geode::utils::clipboard::write(AUTHOR_DISCORD);
+            Notification::create(ok ? fmt::format("Copied {}", AUTHOR_DISCORD) : fmt::format("Discord: {}", AUTHOR_DISCORD),
+                                 NotificationIcon::None, 1.5f)->show();
+        }, 0.22f, 12.f, C_BTN_SEL);
     }
 
     // ---- modes page ------------------------------------------------------------------
@@ -6549,7 +6727,7 @@ protected:
         boxButton(m_settingsMenu, "all off", {PAD + 74.f, by}, 44.f, 13.f, C_BTN, COL_ORANGE, 0.24f, [setAll] { setAll(false); });
         auto* hint = CCLabelBMFont::create("Off = clicks in that mode go through raw", "chatFont.fnt");
         hint->setScale(0.45f);
-        hint->setColor(C_DIM);
+        hint->setColor({255, 255, 255});
         hint->setAnchorPoint({1.f, 0.5f});
         hint->setPosition({W - PAD - 4.f, by});
         m_settingsLabels->addChild(hint);

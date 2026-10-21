@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v2.0.0",
+	"version": "v2.1.0",
 	"id": "alquerez.inputbuffer",
 	"name": "Input Buffer",
 	"developer": "AlQuerez",
-	"description": "AlQuerez#3900",
+	"description": "Discord: alquerez23",
 	"settings": {
 		"stage": {
 			"type": "string",
