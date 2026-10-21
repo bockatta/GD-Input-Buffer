@@ -74,6 +74,7 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 - The bottom of the window says how to toggle it ("Left Alt to toggle", or your own key) and what you're running on (Windows 10 / 11, macOS, iOS, Android).
 - New **System** section in Stats: OS version, device, Geometry Dash, Geode and mod versions.
 - Phones: a GD-style green pause-menu button, and a 1.5x bigger window.
+- Fixed the crash on iOS / Apple Silicon Mac when touching an orb.
 - New purple logo.
 - Wave releases on Extreme: held at most 5 frames (was 12), and releases near orbs / portals no longer come out late.
 

@@ -846,6 +846,10 @@
 //      release window) instead of 12 frames (WAVE_RELEASE_MAX_BASE), and a
 //      release path cut short by an orb / portal with no death counts as safe
 //      (verdictFor). Both made releases come out late or look ignored.
+//    * Orb crash on iOS / Apple Silicon Mac fixed: RingObject::triggerActivated
+//      is no longer hooked (12 bytes on arm64, too small for a hook - it
+//      clobbered powerOnObject next to it). Hooked-function sizes checked on
+//      ios / m1 / imac: everything else has 60+ bytes.
 //    * System line: the window's footer shows what the game runs on
 //      (Windows 10 / 11, Wine / Proton, macOS + chip, iOS / iPadOS, Android +
 //      32/64-bit), and Stats has a "System" section (OS build, device, GD,
@@ -7146,21 +7150,23 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         EffectGameObject::triggerObject(p0, p1, p2);
     }
 };
-// Orb side effects (effect circle, activation, spawn triggers) must not run
-// when a sim player uses an orb during a test.
+// Orb side effects (effect circle, spawn triggers) must not run when a sim
+// player uses an orb during a test.
+// NOT hooked (2.1): RingObject::triggerActivated. On iOS and Apple Silicon
+// Macs it is only 12 bytes long - smaller than an arm64 hook jump - so hooking
+// it overwrote the start of powerOnObject right after it and crashed the game
+// the moment you touched an orb. Its side effects in a test are covered
+// anyway: spawn triggers (EffectGameObject::triggerObject) and the circle
+// (spawnCircle) are blocked, and orb "activated" flags are put back after
+// every test.
 class $modify(BufRingObject, RingObject) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("RingObject::spawnCircle", -1000000);
-        (void)self.setHookPriority("RingObject::triggerActivated", -1000000);
         (void)self.setHookPriority("RingObject::powerOnObject", -1000000);
     }
     void spawnCircle() {
         if (s_sim.isSimulating()) return;
         RingObject::spawnCircle();
-    }
-    void triggerActivated(float x) {
-        if (s_sim.isSimulating()) return;
-        RingObject::triggerActivated(x);
     }
     void powerOnObject(int state) {
         if (s_sim.isSimulating()) return;

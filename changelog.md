@@ -12,6 +12,7 @@
 - If the button image is missing from a build, the pause menu falls back to the old "Buffer" text button, so the window can always be opened. build.bat now refreshes the build setup every time, so new images get picked up.
 - Phones: the window is 1.5x bigger on iOS and Android (Window Size still scales it on top).
 - Phones: hints say to use the pause-menu button instead of a key.
+- Fixed a crash on iOS and Apple Silicon Macs when touching an orb. The mod hooked a tiny orb function that's too small to hook on those devices, which broke the function right next to it. That hook is gone (what it did is already covered by the mod's other orb checks).
 - New purple logo.
 - Wave releases on Extreme: a release is now held at most 5 frames instead of 12, so it can't come out way late or look ignored. And a release that's safe up to an orb or portal (where the prediction stops) now goes straight through instead of being held until the window ran out.
 - New mod description: how the mod works, the stages, and a version table with the platforms each version works on.
