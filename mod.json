@@ -1,0 +1,69 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081"
+	},
+	"version": "v2.0.0",
+	"id": "alquerez.inputbuffer",
+	"name": "Input Buffer",
+	"developer": "AlQuerez",
+	"description": "AlQuerez#3900",
+	"settings": {
+		"stage": {
+			"type": "string",
+			"name": "Stage",
+			"description": "How much the buffer helps (how early a click can be and still be saved). Off = raw input. Stage 1: 1 frame. Stage 2: 2 frames. Stage 3: 4 frames (3 ship / wave). Stage 4: 8 frames (5 ship / wave). Extreme: 20 frames (12 ship / wave). Custom: your own frames, set in the window (Left Alt) with Apply. F6 cycles through them.",
+			"default": "Stage 1",
+			"one-of": [
+				"Off",
+				"Stage 1",
+				"Stage 2",
+				"Stage 3",
+				"Stage 4",
+				"Extreme",
+				"Custom"
+			]
+		},
+		"cycle-key": {
+			"type": "keybind",
+			"name": "Stage Cycle Key",
+			"description": "Cycles Stage 1 > 2 > 3 > 4 > Extreme > Custom > Off.",
+			"default": "F6",
+			"category": "gameplay"
+		},
+		"window-key-v3": {
+			"type": "keybind",
+			"name": "Window Key",
+			"description": "Shows / hides the Input Buffer window (Log, Stats, Stage).",
+			"default": "LeftAlt",
+			"category": "gameplay"
+		},
+		"window-size": {
+			"type": "float",
+			"name": "Window Size",
+			"description": "Size of the Input Buffer window.",
+			"default": 1.0,
+			"min": 0.5,
+			"max": 2.0,
+			"control": {
+				"input": true,
+				"slider": true,
+				"slider-step": 0.1
+			}
+		},
+		"window-opacity": {
+			"type": "float",
+			"name": "Window Opacity",
+			"description": "How see-through the Input Buffer window's background is (text stays solid).",
+			"default": 0.95,
+			"min": 0.3,
+			"max": 1.0,
+			"control": {
+				"input": true,
+				"slider": true,
+				"slider-step": 0.05
+			}
+		}
+	}
+}

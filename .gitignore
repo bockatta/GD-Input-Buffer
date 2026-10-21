@@ -1,0 +1,4 @@
+build/
+*.geode
+.vs/
+.vscode/
