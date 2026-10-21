@@ -825,6 +825,9 @@
 //      menu shows / hides the window (the way to open it on Android).
 //      .github/workflows/multi-platform.yml builds Windows + Android32/64 and
 //      combines them into one .geode.
+//    * iOS + macOS: every hooked / called function checked in the 2.2081
+//      bindings (no "inline" on ios / imac / m1). macOS uses the keyboard hook
+//      for the Window Key and the mouse-wheel hook; iOS the pause-menu button.
 // ============================================================================
 
 #include <Geode/Geode.hpp>

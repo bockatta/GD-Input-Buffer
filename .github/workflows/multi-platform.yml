@@ -1,4 +1,4 @@
-# Builds Input Buffer for Windows, Android (32 + 64 bit) and iOS on GitHub's
+# Builds Input Buffer for Windows, macOS, Android (32 + 64 bit) and iOS on GitHub's
 # servers and combines them into ONE .geode that works on all of them.
 # Push the project to a GitHub repo -> Actions tab -> "Build Geode Mod" ->
 # the finished .geode is under "Artifacts" (Build Output).
@@ -18,6 +18,8 @@ jobs:
         config:
           - name: Windows
             os: windows-latest
+          - name: macOS
+            os: macos-latest
           - name: Android32
             os: ubuntu-latest
             target: Android32
