@@ -36,6 +36,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # iOS: Geode's newest bindings forget to include fmod.hpp in the generated
+      # FMOD::Sound source on iOS ("incomplete type 'FMOD::Sound'"). Use a copy of
+      # the bindings with that include added. Not our code - remove this step
+      # once Geode fixes it upstream.
+      - name: Patch Geode bindings (iOS)
+        if: matrix.config.target == 'iOS'
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/geode-sdk/bindings "$RUNNER_TEMP/bindings-repo"
+          f="$RUNNER_TEMP/bindings-repo/bindings/2.2081/FMOD.bro"
+          { echo '#import ios <fmod.hpp>'; cat "$f"; } > "$f.new" && mv "$f.new" "$f"
+          head -3 "$f"
+          echo "GEODE_BINDINGS_REPO_PATH=$RUNNER_TEMP/bindings-repo" >> "$GITHUB_ENV"
+
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
