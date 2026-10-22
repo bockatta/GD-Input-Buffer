@@ -1,6 +1,8 @@
 # Changelog
 
 ## v2.1.0
+- Fixed the buffer only working well after scanning the level (mini cube especially). Mini cube is back to how it predicted before: the extra player state predictions started copying in this version (jump / slope / boost values and what you're touching) is gone from normal predictions again. Only the level scan uses it.
+- Click guide dots are drawn as filled circles the same way the window draws its panels.
 - The badge next to the title now says V2.1.
 - "by AlQuerez" and the system name at the bottom are now white and bold.
 - Name and Discord updated: the title says "by AlQuerez23" and the Stage tab says "Discord: alquerez23".
@@ -14,6 +16,52 @@
 - Phones: hints say to use the pause-menu button instead of a key.
 - Fixed a crash on iOS and Apple Silicon Macs when touching an orb. The mod hooked a tiny orb function that's too small to hook on those devices, which broke the function right next to it. That hook is gone (what it did is already covered by the mod's other orb checks).
 - New purple logo.
+- Wave and ship, input checking: when you let go while a press is still being held (or the other way round), the mod used to move your second input by the same delay to keep your spacing. A +18t mini-wave press moved your release 18t too, and that's what killed you. Now it tests both: your second input on time vs. keeping the spacing, and uses on time when that's safe (less lag), otherwise whichever survives.
+- Wave and ship, less harsh: an input is never held longer than about 3/4 of your own usual hold (for presses) or gap (for releases). Ship releases on Extreme are capped at 5 frames like wave releases.
+- Fixed a false "one-tick check: prediction differs" right after respawning (most visible with a start position): a check from the end of the last attempt was compared with the new spawn.
+- Fixed "the physics hook isn't running" showing up when nothing was wrong. It came from clicking while dead or respawning; now it only shows if the game keeps drawing frames without any physics steps while you're alive.
+- The "Input Buffer - Stage ..." banner only shows when you press F6, not when you pick a stage in the window.
+- Show paths: the hitboxes at both ends of the path are circles now.
+- The Log no longer shows OK (safe click) and QUEUED lines. "Log: show safe clicks" is now called "Log: more detail".
+- New Tools tab:
+  - Orb helper (toggle): a click made a little early for an orb waits and goes in the tick you touch the orb (up to 5 frames early). Only if not pressing until then is safe. Meant for orb double-clicks and UFO / swing orbs.
+  - Level scan (beta): pause at the start of the level (or a checkpoint) and press "scan level". The mod plays the level ahead on its hidden player and finds a set of inputs that gets through. It runs while you stay paused and saves the result for the level. A scan always starts from where you paused, so if it stops somewhere, pause past that point and scan again - the new part is added to what's saved. It can't run the level's triggers, so parts with moving objects may come out wrong, and it stops at dual / mirror / teleport portals for now (scan again after the portal).
+  - Scan fix: it got stuck right away in tight parts (wave / ship / UFO), because it wanted every input to survive on its own for a while - there the next input is always needed soon. It now takes the input that gets furthest - even by a single tick - and lets the next one carry on. The scan also starts from your real player now (exactly what the normal predictions use). When it does get stuck, the message says the gamemode, how soon it would die and what kills it, how many inputs it tried and how far the best one got.
+  - Scan, rebuilt: it follows up to 64 different versions of the run at the same time. Every 2 ticks (every tick in wave) each version tries both "keep going" and "switch" (press / let go); versions that crash are dropped, and the survivors are kept spread over the whole height range. The version that gets furthest with the fewest inputs, staying away from spikes, becomes the route.
+  - Why it got stuck ("every path dies there"): it used to keep the versions with the fewest inputs, so they all ended up as near-copies of "don't press" a few px apart, flew into the same wall together, and switching at the last moment couldn't save any of them. Now the versions stay spread out, and wave versions can switch every tick (was every 2).
+  - Click guide routes are cleaner: no extra inputs, and the route keeps a margin from spikes instead of turning right at their tips.
+  - The scan no longer stops at triggers ("speed portal/trigger ... ahead"): it can't run triggers anyway, and speed portals are always applied. A version that runs into something it can't see past is dropped; the scan only stops there if no version gets around it.
+  - The scan uses your own runs where it can't simulate the level: while you play, the mod saves your real player's state every block (only from parts you got at least 3 blocks past). When every version of the scan dies, or it reaches something it can't run (a trigger, a moving part), it carries on from your own run just past that spot instead of stopping. Right after a gamemode portal it also switches over to your real state in the new gamemode if you have one there (GD does more on a real portal entry than the scan's hidden player can copy - in Amethyst's UFO every version died right after the portal). So: play a level once as far as you can, then scan, and the scan reaches at least as far as you got. These states are kept until you leave the level.
+  - When the scan stops, the message says what killed every version and where it is in the level.
+  - The scan never stops before the end of the level now. When every version dies at a spot, it:
+    1. backs up about 4 blocks and tries harder there (4x the versions, a switch every tick, finer heights),
+    2. carries on from your own run just past the spot, if you've played past it,
+    3. with "Real game (practice)" on and practice mode, tries the spot with the REAL level (see below),
+    4. and as a last resort goes through the spot (deaths ignored for one block) and carries on - that spot gets no dots, everything after it does.
+    The message at the end says how often it needed each one.
+  - Portals in the scan now do what GD does first on a real portal: the player's own "switched to gamemode" step (speed / velocity changes on entry), then the switch. That was missing, and it's the likely reason every version died right after Amethyst's UFO portal.
+  - Your run's states are saved now (per level), so the scan can use runs from earlier sessions too. Only plain values are saved; a GD update starts a fresh file.
+  - Show scan (Tools, on by default): while the scan runs you can see what it's doing in the level behind the pause menu - the versions it's following (yellow lines), where they die (red dots), and spots it had to go through without a solution (orange). It stays up until your next attempt.
+  - Real game (practice) (Tools, off by default, experimental): in practice mode, where the hidden player can't get through, the scan plays the real level from where you paused - triggers, moving parts and portals all run for real. It follows the route found so far, tries inputs every 2 ticks past it, and backs up to its own checkpoints when it dies, until it's 2 blocks past the spot. Then the level goes back to exactly where you paused (a practice respawn) and the normal scan carries on from the real state. While it runs your clicks, deaths and the level end are held off, nothing counts as progress, and the attempt counter goes up with each of its respawns. It's new and couldn't be tested on a real level yet - if anything looks wrong, turn it off and send a report.
+  - The scan only runs when you press "scan level" (no automatic scans when you pause).
+  - Export report now lists the scanned route (every scanned press / release with its spot and gamemode) and where gravity flips in the scan, so a wrong guide can be checked against your real clicks.
+  - The pop-up when a scan ends is short now ("Level scan: 34% done"); the full message is on the Tools tab.
+  - Scan goes through gamemode portals now (experimental): the hidden player switches to ship / ball / UFO / wave / robot / spider / swing / cube with its own switches, nothing in the level is touched. It still stops at dual, mirror and teleport portals.
+  - Every version starts from your real player with its saved movement on top (copying the player into a spare hidden one lost something - in a mini wave the copy died on its first tick).
+  - The scan copies what your player is standing on / touching (ground, slope, walls) too.
+  - If every version dies at one spot, the message says what kills them there.
+  - Scan inputs per gamemode: cube, ball, spider, UFO and swing get single clicks (press, let go a tick later) - one dot per click. Only ship, wave and robot use press + release (there it matters how long you hold).
+  - Click guide (toggle): round dots where the scan's clicks go (cyan). In ship, wave and robot also where you let go (pink), joined to the press by a white line. No text.
+  - The white line follows the path the scan took between the press and the release, so a robot jump draws its curve instead of a straight line.
+  - Fixed the scan running from the wrong place on start-position levels (like Shardscapes StartPos): pausing before the attempt had started scanned from the level's normal spawn on the floor, before the start position moved you, so it scanned a path you never take (stuck at 90%, and the guide dots were off screen at the bottom). Scanning now waits until the attempt has started.
+  - If your run is nowhere near the scanned path (10+ blocks away for about 1.5 seconds), that part of the scan is dropped, dots and all, so a scan saved from the wrong place clears itself. Pause there and press scan level to redo it.
+  - The normal buffer never needs a scan: with no scan (or Snap to scan off) every click is predicted as usual.
+  - Snap to scan: releases snap too. A release after a press that snapped to a cyan dot now waits for its own pink dot; before, it kept the press's delay (or went on time), so presses lined up with the guide and releases didn't.
+  - Snap to scan (toggle, off by default): when your click matches a scanned input (same gamemode, same height on the path), the mod uses the scan instead of predicting: a little early (within your stage's window), it waits for the scanned spot. Less work at click time, and the input already knows where it goes.
+  - Your stats: attempts, deaths, best %, completions and clicks buffered, for this level and all levels, saved between sessions.
+  - Export report: saves the Log, Stats, settings, system info and a trace of every click to a file, copies it, and opens the folder (PC / Mac). Send that file instead of screenshots.
+- Wave, lighter: each wave prediction now only looks as far ahead as matters - until your next input at your own rhythm plus a short grace (where you go after that is your next input's job, the same rule as before). It used to look 3-4x further every time, which was most of the work and the cause of frame drops while spamming. Same decisions, roughly half the work or less per test.
+- Wave, held releases: a release that's being held now follows its plan like presses do, instead of running a full prediction every tick while it waits. Less work while you spam, and it fires on the planned tick.
 - Wave releases on Extreme: a release is now held at most 5 frames instead of 12, so it can't come out way late or look ignored. And a release that's safe up to an orb or portal (where the prediction stops) now goes straight through instead of being held until the window ran out.
 - New mod description: how the mod works, the stages, and a version table with the platforms each version works on.
 - New system line: the bottom of the window shows what the game is running on: Windows 10 / 11, Wine / Proton (Linux, Steam Deck), macOS with Apple Silicon / Intel / Rosetta, iOS / iPadOS, or Android 32 / 64-bit.

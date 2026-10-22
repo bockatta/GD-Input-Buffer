@@ -850,6 +850,37 @@
 //      is no longer hooked (12 bytes on arm64, too small for a hook - it
 //      clobbered powerOnObject next to it). Hooked-function sizes checked on
 //      ios / m1 / imac: everything else has 60+ bytes.
+//    * Wave engine: the lookahead only reaches a bit past the input's own
+//      stretch (x.waveCommit = your next input at your rhythm + grace; horizon
+//      max(2x commit, commit + 8, 26) base ticks instead of 65 / 50) - a wave
+//      death after that is the next input's job anyway, so the verdicts are
+//      the same and every test is ~1.5-2.5x cheaper (spam frame spikes).
+//    * Held RELEASES follow their plan too (planDrifted) instead of a full
+//      prediction every tick while held.
+//    * Wave / ship follow-ups (pickFollowUpTime): an input arriving behind a
+//      held one is tested on time vs keeping the spacing; on time when safe.
+//      Delays capped at HOLD_DELAY_FRAC of your rhythm (min 6 base ticks);
+//      Extreme ship releases capped like wave releases.
+//    * "Physics hook isn't running" only after STALL_FRAMES frames with no step
+//      while alive (clicks while dead / respawning were flagged).
+//    * Stage banner only for the F6 key; no OK / QUEUED log lines.
+//    * Tools tab: Orb helper (ORB_HELP_BASE), saved stats (stats-life /
+//      stats-<level>), export report (reports/report-*.txt + clipboard, trace
+//      of every click).
+//    * Level scan (startScan / scanSlice, ScanRunner on the overlay): while
+//      paused, a beam search from where you paused - up to SCAN_BEAM versions
+//      of the run, each tries "keep" and "switch" every SCAN_STEP_BASE ticks,
+//      dead ones dropped, survivors thinned to one per (button, height, fall
+//      speed) bucket, fewest inputs first. Each version's state is a
+//      PlayerSnap applied on top of the real player (copying into a spare
+//      PlayerObject lost state). Best version's inputs -> routes/<level>.txt.
+//      Click guide draws it; Snap to scan (routeMatch) holds early inputs
+//      until the scanned spot.
+//      Gamemode portals: in scan tests only (m_scanSim) the hidden player
+//      switches mode with its own toggles (setSimMode) and gets the portal as
+//      m_lastPortalPos; the snapshot carries the mode. The report traces the
+//      real player's mode switches (lastPortalPos, portalY) to compare.
+//    * Show paths: hitboxes at the path ends are circles (drawRing).
 //    * System line: the window's footer shows what the game runs on
 //      (Windows 10 / 11, Wine / Proton, macOS + chip, iOS / iPadOS, Android +
 //      32/64-bit), and Stats has a "System" section (OS build, device, GD,
@@ -886,6 +917,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1049,6 +1081,9 @@ constexpr int   LIVE_BUDGET_MIN_US       = 800;
 // without a call; a held input is force-fired after this long (wall clock,
 // longer than the biggest window).
 constexpr int   STEP_STALL_MS            = 150;
+// ...and only called "the hook isn't running" after this many rendered frames
+// in a row with the player alive, not paused, and no physics step (2.1).
+constexpr int   STALL_FRAMES             = 8;
 constexpr int   WATCHDOG_MS              = 600;
 // A velocity orb counts as the target of a click if the sim player reaches it
 // within this many base ticks after the click lands (125 ms).
@@ -1114,6 +1149,40 @@ constexpr int    WAVE_GRACE_BASE         = 4;
 // going up, so a long hold read as "late" or "ignored" - past this it goes
 // through as you made it.
 constexpr int    WAVE_RELEASE_MAX_BASE   = 12;
+// Wave / ship (2.1): no input is held longer than this share of your own
+// rhythm (your usual hold for a press, gap for a release), and never less
+// than HOLD_DELAY_MIN_BASE. A delay longer than the gesture itself moved the
+// whole zig-zag: a +18t mini-wave press, then its release 18t late, death.
+constexpr float  HOLD_DELAY_FRAC         = 0.75f;
+constexpr int    HOLD_DELAY_MIN_BASE     = 6;
+// Orb helper (2.1): how far ahead (base ticks, 83 ms) an early click looks for
+// the next orb to wait for.
+constexpr int    ORB_HELP_BASE           = 20;
+// Level scan (2.1): see scanSlice().
+constexpr int    SCAN_STEP_BASE          = 2;     // a version may switch every 2 ticks (240 TPS)
+constexpr float  SCAN_STEP_WAVE          = 1.f;   // wave: every tick - mini wave gaps are tight
+constexpr int    SCAN_BEAM               = 64;    // versions kept alive at once (spread over heights)
+constexpr float  SCAN_SAFE_CLR           = 12.f;  // closer than this to a hazard costs the route (guide keeps a margin)
+constexpr float  SCAN_CLOSE_COST         = 0.25f; // cost per step spent right at a hazard (an input costs 1)
+constexpr float  SCAN_Y_BUCKET           = 3.f;   // versions closer than this in height count as the same
+constexpr int    SCAN_SLICE_US           = 12000; // CPU per frame while scanning (paused)
+constexpr int    SCAN_BEAM_WIDE          = 256;   // "trying harder" after backing up: 4x the versions ...
+constexpr float  SCAN_Y_BUCKET_WIDE      = 1.5f;  // ... finer heights, and a switch every tick
+constexpr float  SCAN_REWIND_EVERY       = 40.f;  // keep a copy of the versions every 40 px ...
+constexpr int    SCAN_REWIND_KEEP        = 12;    // ... the last 12 of them
+constexpr float  SCAN_REWIND_PX          = 120.f; // stuck: back up about 4 blocks
+constexpr float  SCAN_WIDE_PAST          = 90.f;  // and try harder until 3 blocks past the stuck spot
+constexpr float  SCAN_SKIP_PAST          = 30.f;  // last resort: go through the spot, 1 block past it
+constexpr int    REAL_DECIDE_TICKS       = 2;     // real-game scan: an input decision every 2 ticks
+constexpr int    REAL_CP_EVERY           = 8;     // a checkpoint every 8 decisions (16 ticks)
+constexpr int    REAL_CP_KEEP            = 48;    // keep the last 48 (~3 s to back up through)
+constexpr int    REAL_MAX_RESETS         = 600;   // give up on a spot after this many tries
+constexpr float  REAL_PAST               = 60.f;  // done when 2 blocks past the stuck spot
+constexpr float  ANCHOR_STEP             = 30.f;  // real-player state saved every block of travel (scan restarts)
+constexpr float  ANCHOR_SAFE             = 90.f;  // ... and only kept if you got 3 blocks past it
+constexpr float  ROUTE_OFF_Y             = 300.f; // real player this far (10 blocks) off the scanned path ...
+constexpr int    ROUTE_OFF_CHECKS        = 90;    // ... for this many checks (every 4 ticks, ~1.5s) drops that part
+constexpr float  ROUTE_SNAP_Y_TOL        = 10.f; // you're on the scanned path if this close in height
 // A held click the live check never approves, with no click-time plan to fall
 // back on, goes in after this many base ticks (1 frame).
 constexpr int    LIVE_GIVEUP_BASE        = 4;
@@ -1235,6 +1304,11 @@ struct Config {
     float autoWindowMax = 4.0f;
     bool  calibReset   = false;
     bool  overlay      = false;
+    bool  orbHelper    = false; // Tools tab (2.1): an early click waits for the next orb
+    bool  clickGuide   = false; // Tools tab (2.1): dots where the level scan's inputs go
+    bool  routeSnap    = false; // Tools tab (2.1): early clicks snap to the scanned inputs (off by default)
+    bool  scanView     = true;  // Tools tab (2.1): draw the scan's versions while it runs
+    bool  realScan     = false; // Tools tab (2.1): practice mode - where the hidden player is wrong, scan with the real game
     bool  learnSpots   = true;  // learn from attempts (saved value, Stage tab)
     bool  practiceOnly = false;
     bool  showBadge    = false;
@@ -1276,6 +1350,11 @@ struct Config {
         c.hud        = mod->getSavedValue<bool>("window-shown", true);
         c.hudVerbose = mod->getSavedValue<bool>("log-safe-clicks", false);
         c.overlay    = mod->getSavedValue<bool>("show-paths", false);
+        c.orbHelper  = mod->getSavedValue<bool>("orb-helper", false);
+        c.clickGuide = mod->getSavedValue<bool>("click-guide", false);
+        c.routeSnap  = mod->getSavedValue<bool>("route-snap", false);
+        c.scanView   = mod->getSavedValue<bool>("scan-view", true);
+        c.realScan   = mod->getSavedValue<bool>("real-scan", false);
         c.learnSpots = mod->getSavedValue<bool>("learn-spots", true);
         // Accuracy tracking records the path of every prediction and checks it
         // 100ms later: diagnostics, so only with "Log: show safe clicks" (1.26.0).
@@ -1361,11 +1440,15 @@ struct ModeInfo {
             int ext = holdBased() ? c.extremeHoldCap : c.extremeWindow;
             ext = static_cast<int>(std::lround(ext * s));
             t = std::max(t, ext);
-            // Wave releases: short cap (WAVE_RELEASE_MAX_BASE), never below the
-            // stage's own wave-release window.
-            if (wave && !push) {
+            // Wave / ship releases: short cap (WAVE_RELEASE_MAX_BASE), never
+            // below the stage's own release window (ship too since 2.1: held
+            // ship releases kept you climbing into the ceiling).
+            if ((wave || ship) && !push) {
                 int const cap = static_cast<int>(std::lround(WAVE_RELEASE_MAX_BASE * s));
-                int const own = static_cast<int>(std::floor(c.window[W_WAVE_REL] / dt + 0.001f));
+                float ownF = 1e9f;
+                if (wave) ownF = std::min(ownF, c.window[W_WAVE_REL]);
+                if (ship) ownF = std::min(ownF, c.window[W_SHIP_REL]);
+                int const own = static_cast<int>(std::floor(ownF / dt + 0.001f));
                 t = std::min(t, std::max(cap, own));
             }
         }
@@ -1861,6 +1944,8 @@ struct ClickNote {
     bool      stream      = false; // wave spam: kept the stream's steady shift
     bool      rescue      = false; // no safe moment found by the quick search: held, checked every tick
     bool      portal      = false; // held until past a gamemode / size portal (its own log line)
+    bool      orbHelp     = false; // held by the orb helper until the next orb (2.1)
+    bool      route       = false; // held until a scanned input's window starts (2.1)
 };
 
 // ----------------------------------------------------------------------------
@@ -1934,6 +2019,8 @@ ccColor3B logTagColor(std::string const& tag) {
     if (tag == "HOLD")   return {110, 200, 255};
     if (tag == "OK")     return {150, 150, 170};
     if (tag == "CHECK")  return {255, 225, 90};
+    if (tag == "ORB")    return {255, 205, 90};
+    if (tag == "SNAP")   return {120, 230, 255};
     return {198, 166, 255}; // NOTE
 }
 
@@ -2090,6 +2177,36 @@ class TrajectoryBufferSim {
 
     // Trajectory overlay and badge
     Ref<CCDrawNode> m_overlay;
+
+    // ---- 2.1: orb helper, click guide, saved stats, report ------------------
+    bool        m_routeHold = false;           // the held input waits for a scanned window (m_spotTargetX)
+    long long   m_routeHits = 0, m_routeSnaps = 0; // inputs inside a scanned window / snapped to one
+    bool        m_orbHelpHold = false;         // the held click waits for this orb
+    RingObject* m_orbHelpRing = nullptr;
+    // Level scan (2.1): the route the scanner found, one entry per input, with
+    // the stretch (x0..x1) where that input still works. Saved per level.
+    struct RoutePt {
+        float x = 0.f, y = 0.f;   // where the input goes in
+        bool  push = true;
+        float x0 = 0.f, x1 = 0.f; // it works anywhere in here (same path)
+        std::string mode;         // ModeInfo::name() when it was found
+    };
+    std::vector<RoutePt> m_route;              // this level, sorted by x
+    std::filesystem::path m_routeFile;
+    std::vector<ibcore::Point2> m_routePath;   // the scan's path itself (for curved guide lines), sorted by x
+    std::vector<std::pair<float, float>> m_scanned; // stretches a scan already went through
+    int         m_routeOff = 0;                // route checks in a row far off the scanned path
+    Ref<CCDrawNode> m_guideNode;
+    struct SavedStats {
+        long long attempts = 0, deaths = 0, clicks = 0, buffered = 0, completions = 0;
+        float best = 0.f; // best % in normal mode
+    };
+    SavedStats  m_lvlStats, m_lifeStats;
+    std::string m_lvlKey;                      // "online-123" / "local-xxxxxxxx"
+    std::string m_lvlName;
+    bool        m_attemptPending = false;      // count an attempt on the next physics step
+    bool        m_forceDetails = false;        // statsRows: the Details section too (report)
+    std::deque<std::string> m_trace;           // every click / log line, for the report
     bool  m_overlayShown = false;
     Ref<CCLabelBMFont> m_badge;
     std::string m_badgeText;
@@ -2174,7 +2291,10 @@ class TrajectoryBufferSim {
     int       m_simFirstRingLast = -1;
     int       m_simNextRingTick = -1;
     float     m_spotTargetX = 0.f, m_spotTargetDir = 1.f; // where that spot is (level x) and travel direction
-    long long m_hookMissing = 0;     // ... passed raw because the physics hook wasn't running
+    long long m_hookMissing = 0;
+    int       m_framesSinceStep = 0; // rendered frames since the last physics step (alive, not paused)
+    long long m_followOnTime = 0;   // wave / ship follow-ups that went in on time (2.1)
+    long long m_followSpacing = 0;  // ... that kept the held input's spacing     // ... passed raw because the physics hook wasn't running
     long long m_simUsTotal = 0;
     long long m_liveUsSum = 0, m_liveChecks = 0, m_liveUsMax = 0;
     // Wave spam ("stream"): one steady shift for the whole stream (1.16.0)
@@ -2386,9 +2506,21 @@ class TrajectoryBufferSim {
         m_overlay->drawPolygon(pts, 4, ccColor4F{0.f, 0.f, 0.f, 0.f}, width, col);
     }
 
+    // Circle outline (2.1: the path ends used to be squares).
+    void drawRing(CCPoint c, float radius, ccColor4F col, float width) {
+        constexpr int N = 20;
+        CCPoint pts[N];
+        for (int i = 0; i < N; i++) {
+            float const a = 6.2831853f * static_cast<float>(i) / static_cast<float>(N);
+            pts[i] = CCPoint{c.x + radius * std::cos(a), c.y + radius * std::sin(a)};
+        }
+        m_overlay->drawPolygon(pts, N, ccColor4F{0.f, 0.f, 0.f, 0.f}, width, col);
+    }
+
     void drawPlayerBox(CCPoint c, float rotDeg, float size) {
-        drawHitbox(c, rotDeg, size, ccColor4F{1.f, 0.2f, 0.2f, 0.95f}, 1.0f);         // outer (red)
-        drawHitbox(c, rotDeg, size * 0.36f, ccColor4F{0.2f, 0.35f, 1.f, 0.95f}, 1.0f); // inner (blue)
+        (void)rotDeg;
+        drawRing(c, size * 0.5f, ccColor4F{1.f, 0.35f, 0.55f, 0.95f}, 1.0f);   // outer (pink)
+        drawRing(c, size * 0.18f, ccColor4F{0.25f, 0.45f, 1.f, 0.95f}, 1.0f);  // inner (blue)
     }
 
     void drawPreview(PlayLayer* pl, std::vector<ibcore::Point2> const& path, ccColor4F lineCol) {
@@ -2441,6 +2573,1501 @@ class TrajectoryBufferSim {
         m_overlay.swap(nullptr);
         m_overlayShown = false;
     }
+
+public:
+    // ------------------------------------------------------------------------
+    //  2.1: report trace, saved stats, click guide
+    // ------------------------------------------------------------------------
+    static constexpr size_t MAX_TRACE = 2000;
+    void trace(std::string line) {
+        m_trace.push_back(fmt::format("{:9.3f} {}", levelMs() / 1000.f, line));
+        while (m_trace.size() > MAX_TRACE) m_trace.pop_front();
+    }
+
+    // "online-123" / "local-xxxxxxxx" (same names the learned-spot files use).
+    static std::string levelFileKey(GJGameLevel* lvl) {
+        if (!lvl) return "";
+        int const id = lvl->m_levelID.value();
+        if (id > 0) return fmt::format("online-{}", id);
+        uint32_t h = 2166136261u;
+        for (char ch : std::string(lvl->m_levelName)) { h ^= static_cast<uint8_t>(ch); h *= 16777619u; }
+        return fmt::format("local-{:08x}", h);
+    }
+
+    static SavedStats parseStats(std::string const& t) {
+        SavedStats st;
+        SavedStats v;
+        if (parseNums(t, ',', v.attempts, v.deaths, v.clicks, v.buffered, v.completions, v.best)) st = v;
+        return st;
+    }
+    static std::string formatStats(SavedStats const& st) {
+        return fmt::format("{},{},{},{},{},{:.2f}", st.attempts, st.deaths, st.clicks, st.buffered, st.completions, st.best);
+    }
+    void loadLifeStats() {
+        static bool loaded = false;
+        if (loaded) return;
+        loaded = true;
+        m_lifeStats = parseStats(Mod::get()->getSavedValue<std::string>("stats-life", ""));
+    }
+    void saveLevelStats() {
+        auto* mod = Mod::get();
+        mod->setSavedValue<std::string>("stats-life", formatStats(m_lifeStats));
+        if (!m_lvlKey.empty()) mod->setSavedValue<std::string>("stats-" + m_lvlKey, formatStats(m_lvlStats));
+    }
+
+    void loadLevelExtras(PlayLayer* pl) {
+        loadLifeStats();
+        GJGameLevel* lvl = pl ? pl->m_level : nullptr;
+        m_lvlKey = levelFileKey(lvl);
+        m_lvlName = lvl ? std::string(lvl->m_levelName) : std::string();
+        m_lvlStats = m_lvlKey.empty() ? SavedStats{} : parseStats(Mod::get()->getSavedValue<std::string>("stats-" + m_lvlKey, ""));
+        m_attemptPending = true;
+        m_trace.clear();
+        trace(fmt::format("level \"{}\" ({})", m_lvlName, m_lvlKey));
+        // anchors belong to this level session
+        m_anchors.clear();
+        m_attemptAnchors.clear();
+        m_anchorLastX = -1e9f;
+        // level scan route
+        m_route.clear();
+        m_routePath.clear();
+        m_scanned.clear();
+        m_routeFile.clear();
+        if (!m_lvlKey.empty()) {
+            std::error_code ec;
+            std::filesystem::path const dir = Mod::get()->getSaveDir() / "routes";
+            std::filesystem::create_directories(dir, ec);
+            m_routeFile = dir / (m_lvlKey + ".txt");
+            std::ifstream in(m_routeFile);
+            RoutePt r;
+            int pu = 0;
+            while (in >> r.x >> r.y >> pu >> r.x0 >> r.x1 >> r.mode) {
+                r.push = pu != 0;
+                std::replace(r.mode.begin(), r.mode.end(), '_', ' ');
+                m_route.push_back(r);
+            }
+            std::ifstream pin(dir / (m_lvlKey + "-path.txt"));
+            ibcore::Point2 pt;
+            while (pin >> pt.x >> pt.y) m_routePath.push_back(pt);
+            std::ifstream din(dir / (m_lvlKey + "-done.txt"));
+            float a = 0.f, b = 0.f;
+            while (din >> a >> b) m_scanned.emplace_back(a, b);
+        }
+        loadAnchors();
+        drawGuide(pl);
+    }
+
+    // Level finished (end animation): a completion, and the whole attempt counts for the guide.
+    void onLevelEnd(PlayLayer* pl) {
+        if (!pl) return;
+        if (!pl->m_isPracticeMode) {
+            m_lvlStats.completions++;
+            m_lifeStats.completions++;
+            m_lvlStats.best = 100.f;
+        }
+        trace("level complete");
+        commitAnchors(0.f, true);
+        saveAnchors();
+        saveLevelStats();
+    }
+
+    // Route from a level scan replaces what it covers ([lo, hi] in x).
+    void routeMerge(std::vector<RoutePt> const& found, float lo, float hi,
+                    std::vector<ibcore::Point2> const& path = {}) {
+        if (!path.empty()) {
+            std::vector<ibcore::Point2> np;
+            np.reserve(m_routePath.size() + path.size());
+            for (auto const& q : m_routePath) if (q.x < lo || q.x > hi) np.push_back(q);
+            for (auto const& q : path) if (q.x >= lo && q.x <= hi) np.push_back(q);
+            std::stable_sort(np.begin(), np.end(), [](ibcore::Point2 const& a, ibcore::Point2 const& b) { return a.x < b.x; });
+            m_routePath = std::move(np);
+        }
+        // stretches scanned (so auto scan knows where it still has to go)
+        m_scanned.emplace_back(lo, hi);
+        std::sort(m_scanned.begin(), m_scanned.end());
+        std::vector<std::pair<float, float>> mg;
+        for (auto const& r : m_scanned) {
+            if (!mg.empty() && r.first <= mg.back().second + 1.f) mg.back().second = std::max(mg.back().second, r.second);
+            else mg.push_back(r);
+        }
+        m_scanned = std::move(mg);
+        std::vector<RoutePt> next;
+        next.reserve(m_route.size() + found.size());
+        for (auto const& r : m_route) if (r.x < lo || r.x > hi) next.push_back(r);
+        for (auto const& r : found) next.push_back(r);
+        std::stable_sort(next.begin(), next.end(), [](RoutePt const& a, RoutePt const& b) { return a.x < b.x; });
+        m_route = std::move(next);
+        routeSave();
+    }
+
+    // Writes the route, its path and the scanned stretches for this level.
+    void routeSave() {
+        if (!m_routeFile.empty()) {
+            auto const dir = m_routeFile.parent_path();
+            std::ofstream pout(dir / (m_lvlKey + "-path.txt"), std::ios::trunc);
+            for (auto const& q : m_routePath) pout << fmt::format("{:.1f} {:.1f}\n", q.x, q.y);
+            std::ofstream dout(dir / (m_lvlKey + "-done.txt"), std::ios::trunc);
+            for (auto const& r : m_scanned) dout << fmt::format("{:.1f} {:.1f}\n", r.first, r.second);
+        }
+        if (!m_routeFile.empty()) {
+            std::ofstream out(m_routeFile, std::ios::trunc);
+            for (auto const& r : m_route) {
+                std::string m = r.mode.empty() ? std::string("none") : r.mode;
+                std::replace(m.begin(), m.end(), ' ', '_');
+                out << fmt::format("{:.2f} {:.2f} {} {:.2f} {:.2f} {}\n", r.x, r.y, r.push ? 1 : 0, r.x0, r.x1, m);
+            }
+        }
+    }
+
+    // The real player is far off the scanned path for a while (the scan started
+    // before a start position placed the player, the level moves things, or you
+    // take another way): from there on that stretch counts as not scanned - its
+    // dots go, and "scan level" from a pause there redoes it.
+    void routeCheck(PlayLayer* pl, PlayerObject* p) {
+        if (m_routePath.size() < 2 || (m_tick & 3) != 0) return;
+        float const x = p->getPositionX();
+        auto rit = std::find_if(m_scanned.begin(), m_scanned.end(),
+                                [x](std::pair<float, float> const& r) { return x >= r.first && x <= r.second; });
+        if (rit == m_scanned.end()) { m_routeOff = 0; return; }
+        auto it = std::lower_bound(m_routePath.begin(), m_routePath.end(), x,
+                                   [](ibcore::Point2 const& q, float v) { return q.x < v; });
+        if (it == m_routePath.end() || it == m_routePath.begin()) return;
+        ibcore::Point2 const a = *(it - 1), b = *it;
+        if (b.x - a.x > 200.f) return; // a gap in the path (scan stopped there)
+        float const t = b.x - a.x > 0.01f ? (x - a.x) / (b.x - a.x) : 0.f;
+        float const py = a.y + t * (b.y - a.y);
+        float const off = p->getPositionY() - py;
+        if (std::fabs(off) > ROUTE_OFF_Y) m_routeOff++;
+        else m_routeOff = 0;
+        if (m_routeOff < ROUTE_OFF_CHECKS) return;
+        m_routeOff = 0;
+        float const cut = std::max(rit->first, x - 30.f);
+        float const end = rit->second;
+        auto inside = [cut, end](float v) { return v >= cut && v <= end; };
+        std::erase_if(m_route, [&](RoutePt const& r) { return inside(r.x); });
+        std::erase_if(m_routePath, [&](ibcore::Point2 const& q) { return inside(q.x); });
+        if (cut <= rit->first + 1.f) m_scanned.erase(rit);
+        else rit->second = cut;
+        routeSave();
+        drawGuide(pl);
+        trace(fmt::format("route: you're {:+.0f}px from the scanned path at x={:.0f} - {:.0f}..{:.0f} is unscanned again",
+                          off, x, cut, end));
+        pushLog("Your run is nowhere near the scanned path here - that part of the scan is dropped. Pause here and press scan level to redo it.",
+                COL_YELLOW, false);
+    }
+
+    // Click guide: dots where the scan's inputs go - press (cyan), let go
+    // (pink) - a white line from each press to its release. No text. Drawn
+    // once into the level (it scrolls with it).
+    void drawGuide(PlayLayer* pl) {
+        bool const on = cfg().clickGuide && pl && pl->m_objectLayer;
+        if (!on) {
+            if (m_guideNode.data()) m_guideNode->clear();
+            return;
+        }
+        if (!m_guideNode.data()) {
+            m_guideNode = CCDrawNode::create();
+            if (!m_guideNode.data()) return;
+        }
+        if (m_guideNode->getParent() != pl->m_objectLayer) {
+            if (m_guideNode->getParent()) m_guideNode->removeFromParent();
+            pl->m_objectLayer->addChild(m_guideNode.data(), 9998);
+        }
+        m_guideNode->clear();
+        ccColor4F const white{1.f, 1.f, 1.f, 0.85f};
+        ccColor4F const pressCol{0.35f, 0.9f, 1.f, 1.f};
+        ccColor4F const relCol{1.f, 0.45f, 0.8f, 1.f};
+        // Releases only matter in ship / wave / robot: only there a release dot
+        // and the white press -> release line (2.1). Everywhere else one dot per click.
+        auto holdName = [](std::string const& m) {
+            return m.find("ship") != std::string::npos || m.find("wave") != std::string::npos ||
+                   m.find("robot") != std::string::npos;
+        };
+        for (size_t i = 0; i < m_route.size(); i++) {
+            if (!m_route[i].push || !holdName(m_route[i].mode)) continue;
+            for (size_t j = i + 1; j < m_route.size() && j < i + 8; j++) {
+                if (m_route[j].push) break;
+                // along the scan's own path (a robot jump is a curve)
+                float const xa = m_route[i].x, xb = m_route[j].x;
+                auto it = std::lower_bound(m_routePath.begin(), m_routePath.end(), xa,
+                                           [](ibcore::Point2 const& q, float v) { return q.x < v; });
+                CCPoint prev{m_route[i].x, m_route[i].y};
+                for (; it != m_routePath.end() && it->x <= xb; ++it) {
+                    CCPoint const cur{it->x, it->y};
+                    m_guideNode->drawSegment(prev, cur, 0.8f, white);
+                    prev = cur;
+                }
+                m_guideNode->drawSegment(prev, CCPoint{m_route[j].x, m_route[j].y}, 0.8f, white);
+                break;
+            }
+        }
+        // Filled circles (drawDot comes out square in GD's cocos - 2.1).
+        for (auto const& r : m_route) {
+            if (!r.push && !holdName(r.mode)) continue; // no release dots outside ship / wave / robot
+            constexpr int N = 16;
+            CCPoint pts[N];
+            for (int i = 0; i < N; i++) {
+                float const a = 6.2831853f * static_cast<float>(i) / static_cast<float>(N);
+                pts[i] = CCPoint{r.x + 3.5f * std::cos(a), r.y + 3.5f * std::sin(a)};
+            }
+            ccColor4F const col = r.push ? pressCol : relCol;
+            m_guideNode->drawPolygon(pts, N, col, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f}); // same call as the window's panels
+        }
+    }
+    void releaseGuide() {
+        if (m_guideNode.data() && m_guideNode->getParent()) m_guideNode->removeFromParent();
+        m_guideNode.swap(nullptr);
+    }
+    // Gamemode as a number (0 cube, 1 ship, 2 ball, 3 ufo, 4 wave, 5 robot,
+    // 6 spider, 7 swing) and switching a HIDDEN player between them with the
+    // player's own toggles (no level / camera / ground code) - level scan only.
+    static int modeCode(PlayerObject* p) {
+        if (p->m_isShip) return 1;
+        if (p->m_isBall) return 2;
+        if (p->m_isBird) return 3;
+        if (p->m_isDart) return 4;
+        if (p->m_isRobot) return 5;
+        if (p->m_isSpider) return 6;
+        if (p->m_isSwing) return 7;
+        return 0;
+    }
+    static int portalMode(GameObjectType t) {
+        switch (t) {
+            case GameObjectType::CubePortal:   return 0;
+            case GameObjectType::ShipPortal:   return 1;
+            case GameObjectType::BallPortal:   return 2;
+            case GameObjectType::UfoPortal:    return 3;
+            case GameObjectType::WavePortal:   return 4;
+            case GameObjectType::RobotPortal:  return 5;
+            case GameObjectType::SpiderPortal: return 6;
+            case GameObjectType::SwingPortal:  return 7;
+            default: return -1;
+        }
+    }
+    static void setSimMode(PlayerObject* p, int code) {
+        int const cur = modeCode(p);
+        if (cur == code) return;
+        switch (cur) {
+            case 1: p->toggleFlyMode(false, true); break;
+            case 2: p->toggleRollMode(false, true); break;
+            case 3: p->toggleBirdMode(false, true); break;
+            case 4: p->toggleDartMode(false, true); break;
+            case 5: p->toggleRobotMode(false, true); break;
+            case 6: p->toggleSpiderMode(false, true); break;
+            case 7: p->toggleSwingMode(false, true); break;
+            default: break;
+        }
+        switch (code) {
+            case 1: p->toggleFlyMode(true, true); break;
+            case 2: p->toggleRollMode(true, true); break;
+            case 3: p->toggleBirdMode(true, true); break;
+            case 4: p->toggleDartMode(true, true); break;
+            case 5: p->toggleRobotMode(true, true); break;
+            case 6: p->toggleSpiderMode(true, true); break;
+            case 7: p->toggleSwingMode(true, true); break;
+            default: break;
+        }
+    }
+    bool      m_scanSim = false;          // the current test belongs to a level scan
+    long long m_scanModeSwitches = 0;
+    int       m_scanPortalTraces = 0;
+    int       m_lastRealMode = -1;
+
+    // Level scan (2.1): the moving state of a sim player, saved as plain values.
+    // A test starts from the REAL player (gamemode, size, hitbox - everything
+    // syncSimPlayer copies) and then gets these values on top. Copying into a
+    // spare hidden PlayerObject and starting from that lost something: in a
+    // mini wave the copy died on its first tick.
+#define IB_SNAP_FIELDS(X) \
+    X(m_width) X(m_height) X(m_gravityMod) X(m_isOnGround) X(m_isUpsideDown) X(m_vehicleSize) X(m_playerSpeed) \
+    X(m_yVelocity) X(m_gravity) X(m_speedMultiplier) X(m_position) X(m_lastPortalPos) X(m_lastGroundedPos) \
+    X(m_lastActivatedPortal) X(m_isOnGround2) X(m_lastLandTime) X(m_stateOnGround) X(m_isGoingLeft) X(m_isSideways) \
+    X(m_isDashing) X(m_jumpBuffered) X(m_stateJumpBuffered) X(m_wasJumpBuffered) X(m_stateRingJump) \
+    X(m_stateRingJump2) X(m_wasRobotJump) X(m_fixRobotJump) X(m_touchedRing) X(m_touchedCustomRing) \
+    X(m_touchedGravityPortal) X(m_touchedPad) X(m_fallSpeed) X(m_isAccelerating) X(m_accelerationOrSpeed) \
+    X(m_isOnSlope) X(m_wasOnSlope) X(m_slopeVelocity) X(m_maybeUpsideDownSlope) X(m_slopeRotation) \
+    X(m_currentSlopeYVelocity) X(m_isCurrentSlopeTop) X(m_unk3d0) X(m_blackOrbRelated) X(m_unk3e0) X(m_unk3e1) \
+    X(m_collidedTopMinY) X(m_collidedBottomMaxY) X(m_collidedLeftMaxX) X(m_collidedRightMinX) X(m_stateFlipGravity) \
+    X(m_stateForce) X(m_stateForceVector) X(m_affectedByForces) X(m_lastMovedTime) X(m_playerSpeedAC) \
+    X(m_jumpRelatedAC2) X(m_lastJumpTime) X(m_lastFlipTime) X(m_lastSpiderFlipTime) X(m_snapDistance) X(m_totalTime) \
+    X(m_yVelocityBeforeSlope) X(m_groundYVelocity) X(m_yVelocityRelated) X(m_yVelocityRelated3) X(m_ringJumpRelated) X(m_maybeIsBoosted) X(m_decreaseBoostSlide) X(m_stateBoostX) X(m_stateBoostY) X(m_maybeStateForce2) X(m_stateNoAutoJump) X(m_hasEverJumped) X(m_fixGravityBug) X(m_slopeStartTime) X(m_slopeEndTime) X(m_slopeFlipGravityRelated) X(m_dashStartTime) X(m_maybeSlidingTime) X(m_maybeSlidingStartTime) X(m_changedDirectionsTime) X(m_maybeReverseSpeed) X(m_maybeReverseAcceleration) X(m_xVelocityRelated) X(m_xVelocityRelated2) \
+    X(m_maybeLastGroundObject) X(m_lastCollisionBottom) X(m_lastCollisionTop) X(m_lastCollisionLeft) X(m_lastCollisionRight) X(m_currentSlope2) X(m_preLastGroundObject) X(m_collidedObject) X(m_lastGroundObject) X(m_collidingWithLeft) X(m_collidingWithRight) X(m_isCollidingWithSlope) X(m_currentPotentialSlope) X(m_currentSlope) X(m_collidingWithSlopeId) X(m_objectSnappedTo) X(m_maybeIsColliding) X(m_groundObjectMaterial) X(m_maybeGoingCorrectSlopeDirection) X(m_maybeChangedDirectionAngle)
+    struct PlayerSnap {
+#define IB_SNAP_DECL(f) std::remove_cvref_t<decltype(std::declval<PlayerObject&>().f)> f{};
+        IB_SNAP_FIELDS(IB_SNAP_DECL)
+#undef IB_SNAP_DECL
+        std::vector<int> touchedRings; // gd::unordered_set: copied by hand (like syncSimPlayer does)
+        int     mode = 0;              // modeCode() - the scan passes gamemode portals
+        CCPoint pos{};
+        float   scale = 1.f;
+        CCSize  content{};
+    };
+    static PlayerSnap snapFrom(PlayerObject* p) {
+        PlayerSnap s;
+#define IB_SNAP_GET(f) s.f = p->f;
+        IB_SNAP_FIELDS(IB_SNAP_GET)
+#undef IB_SNAP_GET
+        for (int id : p->m_touchedRings) s.touchedRings.push_back(id);
+        s.mode = modeCode(p);
+        s.pos = p->getPosition();
+        s.scale = p->getScale();
+        s.content = p->getContentSize();
+        return s;
+    }
+    static void applySnap(PlayerObject* p, PlayerSnap const& s) {
+        p->setPosition(s.pos);
+        p->setScale(s.scale);
+        p->setContentSize(s.content);
+#define IB_SNAP_SET(f) p->f = s.f;
+        IB_SNAP_FIELDS(IB_SNAP_SET)
+#undef IB_SNAP_SET
+        p->m_touchedRings.clear();
+        for (int id : s.touchedRings) p->m_touchedRings.insert(id);
+    }
+    PlayerSnap const* m_simSnap = nullptr; // set: tests start from this state (level scan)
+    float m_scanClr = 1e9f;                // level scan: closest a test came to a hazard (every tick)
+
+    // ------------------------------------------------------------------------
+    //  Level scan (2.1): finds a route of inputs that gets through the level,
+    //  using the same hidden-player physics as the predictions.
+    //
+    //  Beam search: it keeps up to SCAN_BEAM different "versions" of the run at
+    //  once. Every SCAN_STEP_BASE ticks each version tries both "keep doing what
+    //  you're doing" and "switch" (press / let go), versions that die are
+    //  dropped, and the survivors are thinned out so the ones left are spread
+    //  over different heights / speeds (so one dead end can't take them all),
+    //  preferring fewer inputs. It reaches the end (or a portal it can't pass)
+    //  and the best version's inputs become the route.
+    //  Runs while the game is PAUSED, a slice per frame. Limits: triggers don't
+    //  run (moving parts can be wrong), it stops at gamemode / dual / mirror /
+    //  teleport portals, no dual / platformer.
+    // ------------------------------------------------------------------------
+    struct BeamHist {
+        int   parent = -1;
+        float x = 0.f, y = 0.f;   // where the input went in (toggled) / where the step started
+        bool  toggled = false;
+        bool  held = false;
+        uint8_t mode = 0;         // gamemode it went in at (index in m_scanModeNames)
+    };
+    struct BeamNode {
+        PlayerSnap snap;
+        bool  fromReal = true;    // the very first one: the real player itself
+        bool  held = false;
+        int   toggles = 0;
+        float cost = 0.f;         // inputs + time spent right at hazards (lower = nicer route)
+        int   hist = -1;          // its entry in m_beamHist
+        BeamHist pend;            // its step, added to m_beamHist only if it's kept
+        float x = 0.f, y = 0.f;
+        double vy = 0.0;
+        int   mode = 0;           // index in m_scanModeNames
+        int   modeCode = 0;       // modeCode(): decides tap vs hold inputs
+        std::vector<GameObject*> orbs; // orbs this version has used
+    };
+
+    // Drops history no surviving version leads back to (parents always come
+    // before children, so one pass in order rebuilds it).
+    void compactHist() {
+        std::vector<int> remap(m_beamHist.size(), -1);
+        auto mark = [&](std::vector<BeamNode> const& v) {
+            for (auto const& b : v) {
+                for (int h = b.hist; h >= 0 && remap[static_cast<size_t>(h)] == -1; h = m_beamHist[static_cast<size_t>(h)].parent)
+                    remap[static_cast<size_t>(h)] = -2;
+            }
+        };
+        mark(m_beam);
+        for (auto const& r : m_rewind) mark(r.second);
+        std::vector<BeamHist> nh;
+        for (size_t i = 0; i < m_beamHist.size(); i++) {
+            if (remap[i] != -2) continue;
+            BeamHist e = m_beamHist[i];
+            e.parent = e.parent >= 0 ? remap[static_cast<size_t>(e.parent)] : -1;
+            remap[i] = static_cast<int>(nh.size());
+            nh.push_back(e);
+        }
+        for (auto& b : m_beam) if (b.hist >= 0) b.hist = remap[static_cast<size_t>(b.hist)];
+        for (auto& r : m_rewind) for (auto& b : r.second) if (b.hist >= 0) b.hist = remap[static_cast<size_t>(b.hist)];
+        m_beamHist = std::move(nh);
+    }
+    std::vector<std::string> m_scanModeNames;
+    int scanModeIndex(PlayerObject* p) {
+        ModeInfo mi;
+        mi.add(p);
+        std::string const nm = mi.name();
+        for (size_t i = 0; i < m_scanModeNames.size(); i++) if (m_scanModeNames[i] == nm) return static_cast<int>(i);
+        m_scanModeNames.push_back(nm);
+        return static_cast<int>(m_scanModeNames.size()) - 1;
+    }
+    // Anchors (2.1): your REAL player's state, saved every ANCHOR_STEP px while
+    // you play (only from stretches you got clearly past). Where the scan can't
+    // simulate something (a portal entry, a trigger, a moving part) it carries
+    // on from one of these instead of stopping - the real game already did that
+    // part right. Kept for this session of the level only.
+    struct Anchor {
+        float x = 0.f;
+        PlayerSnap snap;
+        std::string modeName;
+        bool held = false;
+    };
+    std::map<int, Anchor> m_anchors;          // by x / ANCHOR_STEP
+    bool m_anchorsDirty = false;
+    std::vector<Anchor>   m_attemptAnchors;   // this attempt, not yet confirmed
+    float m_anchorLastX = -1e9f, m_attemptLastX = 0.f;
+    int   m_scanJumps = 0;
+    CCPoint m_simKillPos{};
+
+    void recordAnchor(PlayLayer* pl, PlayerObject* p) {
+        float const x = p->getPositionX();
+        m_attemptLastX = x;
+        if (pl->m_gameState.m_isDualMode || p->m_isPlatformer || m_simulating) return;
+        if (std::fabs(x - m_anchorLastX) < ANCHOR_STEP) return;
+        m_anchorLastX = x;
+        Anchor a;
+        a.x = x;
+        a.snap = snapFrom(p);
+        ModeInfo mi;
+        mi.add(p);
+        a.modeName = mi.name();
+        a.held = m_gameHolding;
+        m_attemptAnchors.push_back(std::move(a));
+    }
+    // The attempt ended at `endX` (death / restart: only what's well before it
+    // counts - a state right before a death may already be doomed; finished: all).
+    void commitAnchors(float endX, bool all) {
+        for (auto& a : m_attemptAnchors) {
+            if (!all && a.x > endX - ANCHOR_SAFE) continue;
+            m_anchors[static_cast<int>(std::floor(a.x / ANCHOR_STEP))] = std::move(a);
+            m_anchorsDirty = true;
+        }
+        m_attemptAnchors.clear();
+        m_anchorLastX = -1e9f;
+    }
+    Anchor const* anchorAfter(float x) const {
+        auto it = m_anchors.lower_bound(static_cast<int>(std::floor(x / ANCHOR_STEP)));
+        for (; it != m_anchors.end(); ++it) if (it->second.x > x + 5.f) return &it->second;
+        return nullptr;
+    }
+
+    // ---- saved run states (2.1): your run's states survive leaving the level.
+    // Plain values only (pointers to level objects are dropped - they only mean
+    // something while the level is open). Checked against the game version and
+    // the field layout, so an update just starts a fresh file.
+    template <class T> static void snapPut(std::string& o, T const& v) {
+        if constexpr (std::is_pointer_v<T>) { (void)v; }
+        else if constexpr (std::is_same_v<T, cocos2d::CCPoint>) { snapPut(o, v.x); snapPut(o, v.y); }
+        else if constexpr (std::is_same_v<T, cocos2d::CCSize>) { snapPut(o, v.width); snapPut(o, v.height); }
+        else if constexpr (std::is_trivially_copyable_v<T>) { o.append(reinterpret_cast<char const*>(&v), sizeof(T)); }
+    }
+    template <class T> static bool snapGet(char const*& p, char const* e, T& v) {
+        if constexpr (std::is_pointer_v<T>) { v = nullptr; return true; }
+        else if constexpr (std::is_same_v<T, cocos2d::CCPoint>) { return snapGet(p, e, v.x) && snapGet(p, e, v.y); }
+        else if constexpr (std::is_same_v<T, cocos2d::CCSize>) { return snapGet(p, e, v.width) && snapGet(p, e, v.height); }
+        else if constexpr (std::is_trivially_copyable_v<T>) {
+            if (e - p < static_cast<std::ptrdiff_t>(sizeof(T))) return false;
+            std::memcpy(&v, p, sizeof(T));
+            p += sizeof(T);
+            return true;
+        } else {
+            return true;
+        }
+    }
+    static uint64_t snapSig() {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](std::string_view t) { for (char ch : t) { h ^= static_cast<unsigned char>(ch); h *= 1099511628211ull; } };
+#define IB_SNAP_SIG(f) mix(#f); mix(std::to_string(sizeof(std::declval<PlayerSnap&>().f)));
+        IB_SNAP_FIELDS(IB_SNAP_SIG)
+#undef IB_SNAP_SIG
+        mix(Loader::get()->getGameVersion());
+        return h;
+    }
+    std::filesystem::path anchorsFile() const {
+        if (m_routeFile.empty()) return {};
+        return m_routeFile.parent_path() / (m_lvlKey + "-runs.bin");
+    }
+    void saveAnchors() {
+        if (!m_anchorsDirty) return;
+        auto const f = anchorsFile();
+        if (f.empty()) return;
+        m_anchorsDirty = false;
+        std::string o = "IBRUN1";
+        snapPut(o, snapSig());
+        snapPut(o, static_cast<uint32_t>(m_anchors.size()));
+        for (auto const& [k, a] : m_anchors) {
+            snapPut(o, a.x);
+            snapPut(o, static_cast<uint8_t>(a.held ? 1 : 0));
+            snapPut(o, static_cast<uint16_t>(a.modeName.size()));
+            o += a.modeName;
+            PlayerSnap const& sn = a.snap;
+            snapPut(o, sn.mode);
+            snapPut(o, sn.pos);
+            snapPut(o, sn.scale);
+            snapPut(o, sn.content);
+#define IB_SNAP_PUT(f) snapPut(o, sn.f);
+            IB_SNAP_FIELDS(IB_SNAP_PUT)
+#undef IB_SNAP_PUT
+            snapPut(o, static_cast<uint32_t>(sn.touchedRings.size()));
+            for (int id : sn.touchedRings) snapPut(o, id);
+        }
+        std::ofstream out(f, std::ios::binary | std::ios::trunc);
+        out.write(o.data(), static_cast<std::streamsize>(o.size()));
+    }
+    void loadAnchors() {
+        auto const f = anchorsFile();
+        if (f.empty()) return;
+        std::ifstream in(f, std::ios::binary);
+        if (!in) return;
+        std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (data.size() < 6 || data.compare(0, 6, "IBRUN1") != 0) return;
+        char const* p = data.data() + 6;
+        char const* e = data.data() + data.size();
+        uint64_t sig = 0;
+        uint32_t n = 0;
+        if (!snapGet(p, e, sig) || sig != snapSig() || !snapGet(p, e, n)) return;
+        int loaded = 0;
+        for (uint32_t i = 0; i < n && i < 100000; i++) {
+            Anchor a;
+            uint8_t held = 0;
+            uint16_t len = 0;
+            if (!snapGet(p, e, a.x) || !snapGet(p, e, held) || !snapGet(p, e, len) || e - p < len) break;
+            a.held = held != 0;
+            a.modeName.assign(p, len);
+            p += len;
+            PlayerSnap& sn = a.snap;
+            if (!snapGet(p, e, sn.mode) || !snapGet(p, e, sn.pos) || !snapGet(p, e, sn.scale) || !snapGet(p, e, sn.content)) break;
+            bool ok = true;
+#define IB_SNAP_GETF(f) ok = ok && snapGet(p, e, sn.f);
+            IB_SNAP_FIELDS(IB_SNAP_GETF)
+#undef IB_SNAP_GETF
+            uint32_t rc = 0;
+            if (!ok || !snapGet(p, e, rc) || rc > 4096) break;
+            for (uint32_t j = 0; j < rc; j++) {
+                int id = 0;
+                if (!snapGet(p, e, id)) { ok = false; break; }
+                sn.touchedRings.push_back(id);
+            }
+            if (!ok) break;
+            m_anchors[static_cast<int>(std::floor(a.x / ANCHOR_STEP))] = std::move(a);
+            loaded++;
+        }
+        if (loaded > 0) trace(fmt::format("loaded {} saved run states for the scan", loaded));
+    }
+
+    enum class ScanState { Off, Running, Done };
+    ScanState   m_scanState = ScanState::Off;
+    std::vector<BeamNode> m_beam;
+    std::vector<BeamHist> m_beamHist;
+    std::vector<GameObject*> m_scanSavedOrbs;  // m_realUsedOrbs before the scan
+    float       m_scanStartX = 0.f, m_scanX = 0.f, m_scanEndX = 1.f;
+    std::string m_scanMsg;
+    ModeInfo    m_scanMode;
+    float       m_scanDt = BASE_DT, m_scanS = 1.f;
+    long long   m_scanSteps = 0;
+    int         m_scanInputs = 0;
+    int         m_scanLastMode = -1;           // the beam's gamemode last step (portal re-sync)
+    // Never stop (2.1): back up and try harder, then your own run, then the
+    // real game (practice), then go through the spot.
+    std::deque<std::pair<float, std::vector<BeamNode>>> m_rewind; // copies of the versions, by x
+    float       m_rewindLastX = -1e9f;
+    float       m_scanWideUntil = -1e9f;       // trying harder until here
+    float       m_scanWideAt = -1e9f;          // last spot it backed up for
+    float       m_realTriedAt = -1e9f;         // last spot the real game was tried at
+    bool        m_scanNoclip = false;          // sim: deaths don't count (going through a spot)
+    int         m_scanSkips = 0, m_scanBackups = 0, m_scanReal = 0;
+    std::vector<std::pair<float, float>> m_scanSkipRanges; // gone through, not found
+    std::deque<CCPoint> m_scanDeathPts;        // where versions died lately (scan view)
+    Ref<CCDrawNode> m_scanViewNode;
+    std::string m_scanLastWhat;
+
+    bool scanning() const { return m_scanState == ScanState::Running; }
+    std::string scanStatus() const {
+        if (m_scanState == ScanState::Running) {
+            float const span = std::max(1.f, m_scanEndX - m_scanStartX);
+            return fmt::format("scanning... {:.0f}%  ({} paths alive)", 100.f * std::clamp((m_scanX - m_scanStartX) / span, 0.f, 1.f),
+                               m_beam.size());
+        }
+        if (!m_scanMsg.empty()) return m_scanMsg;
+        if (!m_route.empty()) return fmt::format("{} inputs saved for this level", m_route.size());
+        return "not scanned yet";
+    }
+
+    void startScan(PlayLayer* pl) {
+        if (scanning()) return;
+        m_scanMsg.clear();
+        if (!pl || !pl->m_player1 || pl->m_player1->m_isDead) { m_scanMsg = "open a level and pause it first"; return; }
+        if (!pl->m_isPaused) { m_scanMsg = "pause the level first (it scans while paused)"; return; }
+        if (m_attemptPending) {
+            // Paused before the first tick: a start position hasn't placed the
+            // player yet, so the scan would run from the level's default spawn.
+            m_scanMsg = "let the attempt start first (unpause for a moment, then pause and scan)";
+            return;
+        }
+        if (pl->m_gameState.m_isDualMode || pl->m_player1->m_isPlatformer) { m_scanMsg = "can't scan dual or platformer parts"; return; }
+        Config const& c = cfg();
+        Ctx x;
+        if (!makeCtx(pl, true, c, x)) { m_scanMsg = "can't scan from here"; return; }
+        ensureSimPlayers(pl);
+        m_scanDt = x.dt;
+        m_scanS = x.s;
+        m_scanMode = ModeInfo{};
+        m_scanMode.add(pl->m_player1);
+        m_scanSavedOrbs = m_realUsedOrbs;
+        m_scanSteps = 0;
+        m_scanInputs = 0;
+        m_scanJumps = 0;
+        m_scanLastMode = -1;
+        m_rewind.clear();
+        m_rewindLastX = -1e9f;
+        m_scanWideUntil = m_scanWideAt = m_realTriedAt = -1e9f;
+        m_scanSkips = m_scanBackups = m_scanReal = 0;
+        m_scanSkipRanges.clear();
+        m_scanDeathPts.clear();
+        saveAnchors();
+        m_scanLastWhat.clear();
+        m_beam.clear();
+        m_beamHist.clear();
+        m_scanModeNames.clear();
+        m_scanPortalTraces = 0;
+        m_scanModeSwitches = 0;
+        BeamNode root;
+        root.fromReal = true;
+        root.mode = scanModeIndex(pl->m_player1);
+        root.modeCode = modeCode(pl->m_player1);
+        root.held = m_gameHolding;
+        root.x = pl->m_player1->getPositionX();
+        root.y = pl->m_player1->getPositionY();
+        root.vy = pl->m_player1->m_yVelocity;
+        m_beamHist.push_back(BeamHist{-1, root.x, root.y, false, root.held, static_cast<uint8_t>(root.mode)});
+        root.hist = 0;
+        m_beam.push_back(std::move(root));
+        m_scanStartX = m_scanX = pl->m_player1->getPositionX();
+        m_scanEndX = std::max(m_scanStartX + 1.f, pl->m_levelLength);
+        m_scanState = ScanState::Running;
+        trace(fmt::format("scan start at ({:.1f},{:.1f}) mode={} speed={:.2f} level length={:.0f}", m_scanStartX,
+                          pl->m_player1->getPositionY(), m_scanMode.name(), pl->m_player1->m_playerSpeed, pl->m_levelLength));
+    }
+
+    // The best version's inputs (furthest, then fewest inputs) -> the route.
+    void scanBuildRoute(std::vector<BeamNode> const& from, std::vector<RoutePt>& out,
+                        std::vector<ibcore::Point2>* pathOut = nullptr) {
+        out.clear();
+        if (pathOut) pathOut->clear();
+        if (from.empty()) return;
+        size_t best = 0;
+        for (size_t i = 1; i < from.size(); i++) {
+            if (from[i].x > from[best].x + 0.5f ||
+                (std::fabs(from[i].x - from[best].x) <= 0.5f && from[i].cost < from[best].cost)) best = i;
+        }
+        if (pathOut) pathOut->push_back(ibcore::Point2{from[best].x, from[best].y, 0.f});
+        for (int h = from[best].hist; h >= 0; h = m_beamHist[static_cast<size_t>(h)].parent) {
+            BeamHist const& e = m_beamHist[static_cast<size_t>(h)];
+            if (pathOut) pathOut->push_back(ibcore::Point2{e.x, e.y, 0.f});
+            if (!e.toggled) continue;
+            RoutePt rp;
+            rp.x = e.x;
+            rp.y = e.y;
+            rp.push = e.held;
+            rp.x0 = rp.x1 = e.x; // snapping goes to this exact spot
+            rp.mode = e.mode < m_scanModeNames.size() ? m_scanModeNames[e.mode] : m_scanMode.name();
+            out.push_back(rp);
+        }
+        std::reverse(out.begin(), out.end());
+        if (pathOut) std::reverse(pathOut->begin(), pathOut->end());
+    }
+
+    // The scanned stretch so far ([m_scanStartX, furthest]) -> saved route.
+    void commitSegment(std::vector<BeamNode> const& from) {
+        if (from.empty()) return;
+        std::vector<RoutePt> found;
+        std::vector<ibcore::Point2> path;
+        scanBuildRoute(from, found, &path);
+        m_scanInputs += static_cast<int>(found.size());
+        float hi = m_scanX;
+        for (auto const& r : found) hi = std::max(hi, r.x);
+        if (hi > m_scanStartX + 1.f) routeMerge(found, m_scanStartX, hi, path);
+    }
+
+    // Stuck (or at something it can't simulate): carry on from your own run,
+    // past this spot. False: no run of yours got past here yet.
+    bool scanJump(char const* why) {
+        Anchor const* a = anchorAfter(m_scanX);
+        if (!a) return false;
+        commitSegment(m_beam);
+        float const from = m_scanX;
+        m_beam.clear();
+        m_beamHist.clear();
+        m_rewind.clear(); // their history is gone
+        m_rewindLastX = -1e9f;
+        BeamNode root;
+        root.fromReal = false;
+        root.snap = a->snap;
+        root.held = a->held;
+        root.modeCode = a->snap.mode;
+        root.mode = 0;
+        {
+            auto it = std::find(m_scanModeNames.begin(), m_scanModeNames.end(), a->modeName);
+            if (it == m_scanModeNames.end()) { m_scanModeNames.push_back(a->modeName); it = m_scanModeNames.end() - 1; }
+            root.mode = static_cast<int>(it - m_scanModeNames.begin());
+        }
+        root.x = a->x;
+        root.y = a->snap.pos.y;
+        root.vy = a->snap.m_yVelocity;
+        m_beamHist.push_back(BeamHist{-1, root.x, root.y, false, root.held, static_cast<uint8_t>(root.mode)});
+        root.hist = 0;
+        m_beam.push_back(std::move(root));
+        m_scanStartX = m_scanX = a->x;
+        m_scanLastMode = a->snap.mode;
+        m_scanJumps++;
+        trace(fmt::format("scan: {} at x={:.0f} - carrying on from your own run at ({:.1f},{:.1f}) {}", why, from, a->x,
+                          a->snap.pos.y, a->modeName));
+        return true;
+    }
+
+    void finishScan(PlayLayer* pl, std::string msg, std::vector<BeamNode> const* keepFrom) {
+        if (keepFrom) commitSegment(*keepFrom);
+        drawGuide(pl);
+        {
+            std::string extra;
+            auto add = [&](std::string t) { extra += extra.empty() ? t : ", " + t; };
+            if (m_scanBackups > 0) add(fmt::format("tried harder {}x", m_scanBackups));
+            if (m_scanJumps > 0) add(fmt::format("used your run {}x", m_scanJumps));
+            if (m_scanReal > 0) add(fmt::format("used the real game {}x", m_scanReal));
+            if (m_scanSkips > 0) add(fmt::format("went through {} spot{} it couldn't solve", m_scanSkips, m_scanSkips == 1 ? "" : "s"));
+            if (!extra.empty()) msg += " (" + extra + ")";
+        }
+        m_realUsedOrbs = m_scanSavedOrbs;
+        m_beam.clear();
+        m_beamHist.clear();
+        m_beamHist.shrink_to_fit();
+        m_scanMsg = std::move(msg);
+        m_scanState = ScanState::Done;
+        trace(fmt::format("scan: {} (gamemode portals passed in tests: {})", m_scanMsg, m_scanModeSwitches));
+        // short: the full message is on the Tools tab
+        Notification::create(fmt::format("Level scan: {:.0f}% done", pctAt(pl, m_scanX)), NotificationIcon::None, 1.5f)->show();
+    }
+
+    // Called once per frame by the scan runner.
+    void scanSlice() {
+        if (!scanning()) return;
+        PlayLayer* pl = PlayLayer::get();
+        if (!pl || !m_simPlayer1.data() || !pl->m_player1) {
+            m_scanState = ScanState::Off; m_beam.clear(); m_beamHist.clear(); m_scanMsg = "stopped (left the level)"; return;
+        }
+        if (!pl->m_isPaused) {
+            if (m_realScan) realScanAbort(pl, "unpaused"); // the level goes back to where you paused first
+            finishScan(pl, fmt::format("stopped at {:.0f}% - stay paused while it scans", pctAt(pl, m_scanX)), &m_beam);
+            return;
+        }
+        auto const t0 = Clock::now();
+        if (m_realScan) {
+            realScanSlice(pl, t0);
+            drawScanView(pl);
+            return;
+        }
+        while (std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() < SCAN_SLICE_US) {
+            if (m_realScan) break; // the real game took over (next frame)
+            // Step length: finer while any version is a wave (all versions stay
+            // on the same tick), and every tick while trying harder.
+            bool const wide = m_scanX < m_scanWideUntil;
+            int const beamCap = wide ? SCAN_BEAM_WIDE : SCAN_BEAM;
+            float const bucket = wide ? SCAN_Y_BUCKET_WIDE : SCAN_Y_BUCKET;
+            bool anyWave = false;
+            for (auto const& b : m_beam) if (b.modeCode == 4) anyWave = true;
+            int const k = wide ? 1
+                        : anyWave ? std::max(1, static_cast<int>(std::lround(SCAN_STEP_WAVE * m_scanS)))
+                                  : std::max(1, scaleTicks(SCAN_STEP_BASE, m_scanS));
+            std::vector<BeamNode> next;
+            next.reserve(m_beam.size() * 2);
+            bool trunc = false;
+            TruncInfo truncInfo;
+            for (BeamNode const& n : m_beam) {
+                // Ship / wave / robot: the button state matters - "keep" or
+                // "switch" (press / let go). Everything else: "nothing" or a TAP
+                // (press, let go a tick later) - holding a cube just bunny-hops,
+                // and the guide wants one dot per jump (2.1).
+                bool const holdMode = n.modeCode == 1 || n.modeCode == 4 || n.modeCode == 5;
+                for (int sw = 0; sw < 2; sw++) {
+                    bool const toggle = sw == 1;
+                    bool const held = holdMode ? (toggle ? !n.held : n.held) : false;
+                    // run k ticks from this version
+                    bool const g = m_gameHolding;
+                    float const ph = m_phase;
+                    bool const rec = m_recordPath;
+                    m_gameHolding = holdMode ? n.held : false;
+                    m_phase = 0.f;
+                    m_recordPath = false;
+                    m_hasDeadline = false;
+                    m_realUsedOrbs = m_scanSavedOrbs;
+                    for (auto* o : n.orbs) m_realUsedOrbs.push_back(o);
+                    m_simSnap = n.fromReal ? nullptr : &n.snap;
+                    m_scanSim = true;
+                    int const delay = toggle ? 0 : k;
+                    FollowUp tap;
+                    if (!holdMode && toggle) { tap.at[0] = 1; tap.held[0] = false; } // let go a tick later
+                    SimResult const r = simulate(pl, pl->m_player1, nullptr, false, holdMode ? held : true, delay,
+                                                 k - delay, true, m_scanDt, m_scanS, tap);
+                    m_scanSim = false;
+                    m_simSnap = nullptr;
+                    m_gameHolding = g;
+                    m_phase = ph;
+                    m_recordPath = rec;
+                    m_scanSteps += k;
+                    if (r.end == SimEnd::Died) {
+                        m_scanLastWhat = deathWhat(r) + fmt::format(" - at ({:.0f},{:.0f})", m_simKillPos.x, m_simKillPos.y);
+                        m_scanDeathPts.push_back(m_simKillPos);
+                        if (m_scanDeathPts.size() > 300) m_scanDeathPts.pop_front();
+                        continue;
+                    }
+                    if (r.end == SimEnd::Truncated) { trunc = true; truncInfo = r.trunc; continue; }
+                    PlayerObject* s1 = m_simPlayer1.data();
+                    BeamNode c;
+                    c.snap = snapFrom(s1);
+                    c.fromReal = false;
+                    c.held = held;
+                    c.toggles = n.toggles + (toggle ? 1 : 0);
+                    // nicer route: fewer inputs, and not brushing past spikes
+                    float const clr = m_scanClr;
+                    float const close = clr < SCAN_SAFE_CLR ? (SCAN_SAFE_CLR - std::max(0.f, clr)) / SCAN_SAFE_CLR : 0.f;
+                    c.cost = n.cost + (toggle ? 1.f : 0.f) + SCAN_CLOSE_COST * close;
+                    c.x = s1->getPositionX();
+                    c.y = s1->getPositionY();
+                    c.vy = s1->m_yVelocity;
+                    c.mode = scanModeIndex(s1);
+                    c.modeCode = modeCode(s1);
+                    if (c.modeCode != n.modeCode && m_scanPortalTraces < 40) {
+                        m_scanPortalTraces++;
+                        trace(fmt::format("scan: mode {} -> {} at ({:.1f},{:.1f}) vy={:.2f} onGround={} lastPortalPos=({:.1f},{:.1f})",
+                                          n.modeCode, c.modeCode, c.x, c.y, c.vy, s1->m_isOnGround, s1->m_lastPortalPos.x,
+                                          s1->m_lastPortalPos.y));
+                    }
+                    c.orbs = n.orbs;
+                    if (m_simOrbObj) c.orbs.push_back(m_simOrbObj);
+                    // a tap is recorded as one press (no release); ship / wave / robot keep both
+                    c.pend = BeamHist{n.hist, n.x, n.y, toggle, holdMode ? held : true, static_cast<uint8_t>(n.mode)};
+                    next.push_back(std::move(c));
+                }
+            }
+            m_realUsedOrbs = m_scanSavedOrbs;
+            if (next.empty() && scanRecover(pl, trunc)) {
+                if (!scanning()) return;
+                continue;
+            }
+            if (next.empty()) {
+                if (trunc) {
+                    finishScan(pl, fmt::format("stopped at {:.0f}%: {} - play past it once, then scan again", pctAt(pl, m_scanX),
+                                               describeTrunc(truncInfo)), &m_beam);
+                } else {
+                    // what the last versions looked like, for the report
+                    for (auto const& b : m_beam) {
+                        trace(fmt::format("scan: stuck version at ({:.1f},{:.1f}) vy={:.2f} mode={} held={} onGround={} inputs={}",
+                                          b.x, b.y, b.vy, b.modeCode, b.held, b.fromReal ? false : b.snap.m_isOnGround, b.toggles));
+                    }
+                    std::string const where = m_beam.empty() || static_cast<size_t>(m_beam.front().mode) >= m_scanModeNames.size()
+                        ? m_scanMode.name() : m_scanModeNames[static_cast<size_t>(m_beam.front().mode)];
+                    finishScan(pl, fmt::format("stuck at {:.0f}% ({}): every path dies there ({}) - play past it once, then scan again",
+                                               pctAt(pl, m_scanX), where, m_scanLastWhat), &m_beam);
+                }
+                return;
+            }
+            // Thin out (2.1 rework): one version per (button, height, falling
+            // speed, gamemode) bucket - the cheapest - and if that's still too
+            // many, keep them SPREAD over the whole height range. (It used to
+            // keep the fewest-input ones: all versions ended up as near-copies
+            // of "don't press" a few px apart, flew into the same wall, and a
+            // late switch couldn't save any of them - "every path dies".)
+            std::stable_sort(next.begin(), next.end(), [](BeamNode const& l, BeamNode const& r) { return l.cost < r.cost; });
+            std::vector<BeamNode> uniq;
+            uniq.reserve(next.size());
+            {
+                std::set<std::tuple<int, int, int, int>> seen;
+                for (auto& c : next) {
+                    auto const key = std::make_tuple(c.held ? 1 : 0, static_cast<int>(std::lround(c.y / bucket)),
+                                                     static_cast<int>(std::lround(c.vy * 2.0)), c.mode);
+                    if (!seen.insert(key).second) continue;
+                    uniq.push_back(std::move(c));
+                }
+            }
+            std::vector<BeamNode> kept;
+            if (uniq.size() <= static_cast<size_t>(beamCap)) {
+                kept = std::move(uniq);
+            } else {
+                // uniq[0] is the cheapest: always kept. The rest evenly by height.
+                kept.reserve(beamCap);
+                kept.push_back(std::move(uniq[0]));
+                std::vector<size_t> order(uniq.size() - 1);
+                for (size_t i = 0; i < order.size(); i++) order[i] = i + 1;
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return uniq[a].y < uniq[b].y || (uniq[a].y == uniq[b].y && uniq[a].cost < uniq[b].cost);
+                });
+                size_t const want = static_cast<size_t>(beamCap) - 1;
+                size_t last = SIZE_MAX;
+                for (size_t i = 0; i < want; i++) {
+                    size_t const j = (order.size() - 1) * i / (want - 1);
+                    if (j == last) continue;
+                    last = j;
+                    kept.push_back(std::move(uniq[order[j]]));
+                }
+            }
+            for (auto& c : kept) {
+                m_beamHist.push_back(c.pend);
+                c.hist = static_cast<int>(m_beamHist.size()) - 1;
+            }
+            m_beam = std::move(kept);
+            // Through a gamemode portal: GD does more on a real portal entry
+            // than the hidden player's switch (Amethyst's UFO died right after
+            // it in every version). If your own run has a state just past it
+            // in the same gamemode, carry on from that.
+            if (!m_beam.empty() && m_beam.front().modeCode != m_scanLastMode) {
+                int const nm = m_beam.front().modeCode;
+                bool const switched = m_scanLastMode >= 0;
+                m_scanLastMode = nm;
+                if (switched) {
+                    float bx = m_scanX;
+                    for (auto const& b : m_beam) bx = std::max(bx, b.x);
+                    m_scanX = bx;
+                    Anchor const* a = anchorAfter(bx);
+                    if (a && a->x <= bx + 3.f * ANCHOR_STEP && a->snap.mode == nm) {
+                        scanJump("through a gamemode portal");
+                        continue;
+                    }
+                }
+            }
+            float maxX = m_scanX;
+            for (auto const& b : m_beam) maxX = std::max(maxX, b.x);
+            m_scanX = maxX;
+            // a copy every few blocks to back up to when stuck
+            float bmax = -1e9f;
+            for (auto const& b : m_beam) bmax = std::max(bmax, b.x);
+            if (bmax >= m_rewindLastX + SCAN_REWIND_EVERY) {
+                m_rewind.emplace_back(bmax, m_beam);
+                m_rewindLastX = bmax;
+                while (m_rewind.size() > static_cast<size_t>(SCAN_REWIND_KEEP)) m_rewind.pop_front();
+            }
+            // (A version that reached something it can't see past is dropped;
+            // the scan only ends there when no version gets around it.)
+            if (m_scanX >= m_scanEndX - 1.f) {
+                finishScan(pl, "done - to the end of the level", &m_beam);
+                return;
+            }
+            if (m_beamHist.size() > 1500000) compactHist(); // drop dead branches' history
+            if (m_beamHist.size() > 1500000) scanRebase();   // still huge: save what's found, carry on fresh
+        }
+        drawScanView(pl);
+    }
+
+    // Save the route so far and carry on with the same versions, fresh history
+    // (a very long level - it never stops for that).
+    void scanRebase() {
+        commitSegment(m_beam);
+        m_beamHist.clear();
+        m_rewind.clear();
+        m_rewindLastX = -1e9f;
+        for (auto& b : m_beam) {
+            m_beamHist.push_back(BeamHist{-1, b.x, b.y, false, b.held, static_cast<uint8_t>(b.mode)});
+            b.hist = static_cast<int>(m_beamHist.size()) - 1;
+        }
+        m_scanStartX = m_scanX;
+    }
+
+    // Every version died (or ran into something it can't simulate). In order:
+    //  1. back up ~4 blocks and try harder (4x the versions, every tick),
+    //  2. carry on from your own run past the spot,
+    //  3. practice mode + "Real game" on: find it with the real game,
+    //  4. go through the spot (deaths ignored for a block) and carry on -
+    //     that spot gets no dots, everything after it does.
+    // So the scan always reaches the end.
+    bool scanRecover(PlayLayer* pl, bool trunc) {
+        float const stuckX = m_scanX;
+        if (!trunc && stuckX > m_scanWideAt + 30.f && !m_rewind.empty()) {
+            size_t pick = 0;
+            for (size_t i = 0; i < m_rewind.size(); i++) if (m_rewind[i].first <= stuckX - SCAN_REWIND_PX) pick = i;
+            std::vector<BeamNode> back = m_rewind[pick].second;
+            float const bx = m_rewind[pick].first;
+            m_rewind.erase(m_rewind.begin() + static_cast<std::ptrdiff_t>(pick) + 1, m_rewind.end());
+            m_rewindLastX = bx;
+            m_beam = std::move(back);
+            m_scanWideAt = stuckX;
+            m_scanWideUntil = stuckX + SCAN_WIDE_PAST;
+            m_scanBackups++;
+            trace(fmt::format("scan: every version dies at x={:.0f} ({}) - backing up to x={:.0f} and trying harder",
+                              stuckX, m_scanLastWhat, bx));
+            return true;
+        }
+        if (scanJump(trunc ? "can't simulate what's ahead" : "every version dies")) {
+            m_rewind.clear();
+            m_rewindLastX = -1e9f;
+            return true;
+        }
+        if (cfg().realScan && pl && pl->m_isPracticeMode && stuckX > m_realTriedAt + 30.f) {
+            m_realTriedAt = stuckX;
+            if (realScanStart(pl, stuckX)) return true;
+        } else if (cfg().realScan && pl && !pl->m_isPracticeMode && stuckX > m_realTriedAt + 30.f) {
+            m_realTriedAt = stuckX;
+            trace("scan: \"Real game\" is on but this isn't practice mode - it only uses the real game in practice");
+        }
+        return scanSkip(pl, stuckX, trunc);
+    }
+
+    // Last resort: the furthest version goes through the spot with deaths
+    // ignored until a block past it, and the scan carries on from there.
+    bool scanSkip(PlayLayer* pl, float stuckX, bool trunc) {
+        if (m_beam.empty() || !pl) return false;
+        size_t best = 0;
+        for (size_t i = 1; i < m_beam.size(); i++) {
+            if (m_beam[i].x > m_beam[best].x + 0.5f ||
+                (std::fabs(m_beam[i].x - m_beam[best].x) <= 0.5f && m_beam[i].cost < m_beam[best].cost)) best = i;
+        }
+        BeamNode cur = m_beam[best];
+        bool const holdMode = cur.modeCode == 1 || cur.modeCode == 4 || cur.modeCode == 5;
+        float const target = stuckX + SCAN_SKIP_PAST;
+        for (int chunk = 0; chunk < 900 && cur.x < target; chunk++) {
+            bool const g = m_gameHolding;
+            float const ph = m_phase;
+            bool const rec = m_recordPath;
+            m_gameHolding = holdMode ? cur.held : false;
+            m_phase = 0.f;
+            m_recordPath = false;
+            m_hasDeadline = false;
+            m_realUsedOrbs = m_scanSavedOrbs;
+            for (auto* o : cur.orbs) m_realUsedOrbs.push_back(o);
+            m_simSnap = cur.fromReal ? nullptr : &cur.snap;
+            m_scanSim = true;
+            m_scanNoclip = true;
+            int const k = std::max(1, scaleTicks(4, m_scanS));
+            SimResult const r = simulate(pl, pl->m_player1, nullptr, false, holdMode ? cur.held : false, k, 0, true,
+                                         m_scanDt, m_scanS);
+            m_scanNoclip = false;
+            m_scanSim = false;
+            m_simSnap = nullptr;
+            m_gameHolding = g;
+            m_phase = ph;
+            m_recordPath = rec;
+            m_realUsedOrbs = m_scanSavedOrbs;
+            PlayerObject* s1 = m_simPlayer1.data();
+            if (!s1 || r.end == SimEnd::OutOfBudget) break;
+            float const nx = s1->getPositionX();
+            cur.snap = snapFrom(s1);
+            cur.fromReal = false;
+            cur.y = s1->getPositionY();
+            cur.vy = s1->m_yVelocity;
+            cur.mode = scanModeIndex(s1);
+            cur.modeCode = modeCode(s1);
+            if (nx <= cur.x + 0.01f) { cur.x = nx; break; } // not moving (stuck in a wall)
+            cur.x = nx;
+        }
+        if (cur.x <= stuckX + 1.f) {
+            finishScan(pl, fmt::format("stopped at {:.0f}%: can't get past x={:.0f} even ignoring deaths{}", pctAt(pl, stuckX),
+                                       stuckX, trunc ? "" : (" (" + m_scanLastWhat + ")")), &m_beam);
+            return true;
+        }
+        commitSegment(m_beam);
+        m_beam.clear();
+        m_beamHist.clear();
+        m_rewind.clear();
+        m_rewindLastX = -1e9f;
+        cur.toggles = 0;
+        cur.cost = 0.f;
+        m_beamHist.push_back(BeamHist{-1, cur.x, cur.y, false, cur.held, static_cast<uint8_t>(cur.mode)});
+        cur.hist = 0;
+        float const nx = cur.x;
+        m_scanLastMode = cur.modeCode;
+        m_beam.push_back(std::move(cur));
+        m_scanSkipRanges.emplace_back(stuckX, nx);
+        m_scanSkips++;
+        m_scanStartX = m_scanX = nx;
+        trace(fmt::format("scan: couldn't solve x={:.0f} ({}) - went through to x={:.0f} and carried on", stuckX,
+                          trunc ? "can't simulate it" : m_scanLastWhat, nx));
+        return true;
+    }
+
+    // ---- scan view (2.1, Tools: "Show scan"): the versions' paths while it
+    // runs (yellow), where they die (red), and stretches it went through
+    // without a solution (orange). Stays up until your next attempt.
+    void drawScanView(PlayLayer* pl) {
+        if (!cfg().scanView || !pl || !pl->m_objectLayer) { releaseScanView(); return; }
+        if (!m_scanViewNode.data()) {
+            m_scanViewNode = CCDrawNode::create();
+            if (!m_scanViewNode.data()) return;
+        }
+        if (m_scanViewNode->getParent() != pl->m_objectLayer) {
+            if (m_scanViewNode->getParent()) m_scanViewNode->removeFromParent();
+            pl->m_objectLayer->addChild(m_scanViewNode.data(), 9997);
+        }
+        m_scanViewNode->clear();
+        ccColor4F const yellow{1.f, 0.85f, 0.2f, 0.55f};
+        ccColor4F const red{1.f, 0.25f, 0.25f, 0.9f};
+        ccColor4F const orange{1.f, 0.55f, 0.1f, 0.9f};
+        size_t const stride = std::max<size_t>(1, m_beam.size() / 48); // at most ~48 drawn (trying harder runs 256)
+        for (size_t bi = 0; bi < m_beam.size(); bi += stride) {
+            BeamNode const& b = m_beam[bi];
+            CCPoint prev{b.x, b.y};
+            int h = b.hist;
+            for (int n = 0; h >= 0 && n < 100 && static_cast<size_t>(h) < m_beamHist.size(); n++) {
+                BeamHist const& e = m_beamHist[static_cast<size_t>(h)];
+                CCPoint const cur{e.x, e.y};
+                m_scanViewNode->drawSegment(prev, cur, 0.4f, yellow);
+                prev = cur;
+                h = e.parent;
+            }
+        }
+        for (auto const& d : m_scanDeathPts) {
+            CCPoint pts[6];
+            for (int i = 0; i < 6; i++) {
+                float const a = 6.2831853f * static_cast<float>(i) / 6.f;
+                pts[i] = CCPoint{d.x + 2.f * std::cos(a), d.y + 2.f * std::sin(a)};
+            }
+            m_scanViewNode->drawPolygon(pts, 6, red, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
+        }
+        for (auto const& r : m_scanSkipRanges) {
+            m_scanViewNode->drawSegment(CCPoint{r.first, pl->m_player1 ? pl->m_player1->getPositionY() : 0.f},
+                                        CCPoint{r.second, pl->m_player1 ? pl->m_player1->getPositionY() : 0.f}, 1.2f, orange);
+        }
+    }
+    void releaseScanView() {
+        if (m_scanViewNode.data() && m_scanViewNode->getParent()) m_scanViewNode->removeFromParent();
+        m_scanViewNode.swap(nullptr);
+    }
+
+    // ------------------------------------------------------------------------
+    //  Real-game scan (2.1, Tools: "Real game", practice mode only). Where the
+    //  hidden player can't get through, the scan plays the REAL level - its
+    //  triggers, moving parts and portals all run for real - from where you
+    //  paused: it follows the route found so far, and past it tries inputs
+    //  (every 2 ticks) and backs up to its own checkpoints when it dies, until
+    //  it's 2 blocks past the spot. Then the level goes back exactly to where
+    //  you paused (a practice respawn) and the normal scan carries on from the
+    //  real state it reached. While it runs: deaths, the level end and your
+    //  clicks are held off; nothing is saved as progress (practice).
+    // ------------------------------------------------------------------------
+    struct RealCp { CheckpointObject* cp = nullptr; int decision = 0; bool held = false; size_t inputs = 0, path = 0; };
+    struct RealIn { int decision = 0; RoutePt pt; };
+    bool m_realScan = false, m_realInputNow = false, m_realDied = false, m_realEnded = false, m_realRestoring = false;
+    CheckpointObject* m_realCp0 = nullptr;
+    std::vector<RealCp> m_realCps;
+    std::vector<uint8_t> m_realAct, m_realTried;
+    std::vector<RealIn> m_realInputs;
+    std::vector<ibcore::Point2> m_realPath;
+    int   m_realDecision = 0, m_realTick = 0, m_realResets = 0, m_realStall = 0;
+    bool  m_realHeld = false, m_realTapUp = false;
+    float m_realTarget = 0.f, m_realStartX = 0.f, m_realLastX = 0.f, m_realBestX = 0.f;
+
+public:
+    bool realScanning() const { return m_realScan; }
+    bool realInputNow() const { return m_realInputNow; }
+    bool realRestoring() const { return m_realRestoring; }
+    // destroyPlayer during a real-game scan: a death to back up from, not a real one
+    bool realScanDeath(PlayLayer* pl, PlayerObject* p) {
+        if (!m_realScan || m_realRestoring || !pl || (p != pl->m_player1 && p != pl->m_player2)) return false;
+        m_realDied = true;
+        return true;
+    }
+    bool realScanEnd() {
+        if (!m_realScan) return false;
+        m_realEnded = true;
+        return true;
+    }
+private:
+    void realPress(PlayLayer* pl, bool down) {
+        m_realInputNow = true;
+        pl->handleButton(down, 1, true);
+        m_realInputNow = false;
+    }
+    // Back to a checkpoint the practice way: it becomes the last checkpoint for
+    // a moment and the level respawns there.
+    void realRestore(PlayLayer* pl, CheckpointObject* cp) {
+        if (!pl || !cp || !pl->m_checkpointArray) return;
+        m_realRestoring = true;
+        pl->m_checkpointArray->addObject(cp);
+        pl->resetLevel();
+        pl->m_checkpointArray->removeObject(cp);
+        m_realRestoring = false;
+        m_realDied = false;
+        m_realEnded = false;
+    }
+    void realReleaseCps() {
+        for (auto& c : m_realCps) if (c.cp && c.cp != m_realCp0) c.cp->release();
+        m_realCps.clear();
+        if (m_realCp0) { m_realCp0->release(); m_realCp0 = nullptr; }
+    }
+    bool realScanStart(PlayLayer* pl, float stuckX) {
+        if (!pl || !pl->m_player1 || !pl->m_checkpointArray || pl->m_gameState.m_isDualMode) return false;
+        commitSegment(m_beam); // the route so far guides the real run
+        CheckpointObject* cp = pl->createCheckpoint();
+        if (!cp) return false;
+        cp->retain();
+        m_realCp0 = cp;
+        m_realCps.clear();
+        m_realCps.push_back(RealCp{cp, 0, m_gameHolding, 0, 0});
+        m_realAct.clear();
+        m_realTried.clear();
+        m_realInputs.clear();
+        m_realPath.clear();
+        m_realDecision = m_realTick = m_realResets = m_realStall = 0;
+        m_realHeld = m_gameHolding;
+        m_realTapUp = false;
+        m_realDied = m_realEnded = false;
+        m_realStartX = m_realLastX = m_realBestX = pl->m_player1->getPositionX();
+        m_realTarget = stuckX + REAL_PAST;
+        m_realScan = true;
+        m_scanReal++;
+        trace(fmt::format("scan: stuck at x={:.0f} ({}) - trying it with the real game from x={:.0f}", stuckX,
+                          m_scanLastWhat, m_realStartX));
+        return true;
+    }
+    // Ends the real-game part: the level goes back to where you paused.
+    void realScanAbort(PlayLayer* pl, char const* why, bool restore = true) {
+        if (!m_realScan) return;
+        trace(fmt::format("scan: real game stopped ({}) at x={:.0f}, furthest x={:.0f}", why, m_realLastX, m_realBestX));
+        if (restore && pl && m_realCp0) {
+            realRestore(pl, m_realCp0);
+            realPress(pl, false); // you're paused and not holding
+        }
+        m_realScan = false;
+        realReleaseCps();
+    }
+    // The real game couldn't do it either: go through the spot instead.
+    void realScanFail(PlayLayer* pl, char const* why) {
+        realScanAbort(pl, why);
+        if (scanning()) scanSkip(pl, m_realTarget - REAL_PAST, false);
+    }
+    // The saved route says to switch here? (guides the real run)
+    int realRouteWants(float x0, float x1, bool holdMode, bool held) const {
+        for (auto const& r : m_route) {
+            if (r.x < x0) continue;
+            if (r.x >= x1) break;
+            if (holdMode ? (r.push != held) : r.push) return 1;
+        }
+        return 0;
+    }
+    void realScanSlice(PlayLayer* pl, Clock::time_point t0) {
+        PlayerObject* p = pl ? pl->m_player1 : nullptr;
+        if (!p) { realScanFail(pl, "no player"); return; }
+        float const dt = m_scanDt * (1.f / 60.f); // one physics tick in seconds
+        while (std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() < SCAN_SLICE_US) {
+            int const mc = modeCode(p);
+            bool const holdMode = mc == 1 || mc == 4 || mc == 5;
+            // a decision at its first tick
+            if (m_realTick == 0) {
+                int act = 0;
+                if (static_cast<size_t>(m_realDecision) < m_realAct.size()) {
+                    act = m_realAct[static_cast<size_t>(m_realDecision)];
+                } else {
+                    float const step = std::max(0.1f, m_p1Speed * m_scanDt) * static_cast<float>(REAL_DECIDE_TICKS);
+                    float const x = p->getPositionX();
+                    act = realRouteWants(x, x + step, holdMode, m_realHeld);
+                    m_realAct.push_back(static_cast<uint8_t>(act));
+                    m_realTried.push_back(static_cast<uint8_t>(1 << act));
+                }
+                if (act == 1) {
+                    bool const down = holdMode ? !m_realHeld : true;
+                    m_realInputs.push_back(RealIn{m_realDecision, RoutePt{}});
+                    RoutePt& rp = m_realInputs.back().pt;
+                    rp.x = rp.x0 = rp.x1 = p->getPositionX();
+                    rp.y = p->getPositionY();
+                    rp.push = down;
+                    ModeInfo mi;
+                    mi.add(p);
+                    rp.mode = mi.name();
+                    realPress(pl, down);
+                    if (holdMode) m_realHeld = down;
+                    else m_realTapUp = true;
+                }
+            }
+            // one real tick
+            pl->update(dt);
+            if (m_realTapUp) { realPress(pl, false); m_realTapUp = false; }
+            float const x = p->getPositionX();
+            if (std::fabs(x - m_realLastX) < 0.001f && !m_realDied) {
+                if (++m_realStall > 8) { realScanFail(pl, "the level doesn't step while paused"); return; }
+            } else {
+                m_realStall = 0;
+            }
+            m_realLastX = x;
+            m_realBestX = std::max(m_realBestX, x);
+            if (++m_realTick >= REAL_DECIDE_TICKS) {
+                m_realTick = 0;
+                m_realDecision++;
+                m_realPath.push_back(ibcore::Point2{x, p->getPositionY(), 0.f});
+                if (m_realDecision % REAL_CP_EVERY == 0 && !m_realDied) {
+                    if (CheckpointObject* cp = pl->createCheckpoint()) {
+                        cp->retain();
+                        m_realCps.push_back(RealCp{cp, m_realDecision, m_realHeld, m_realInputs.size(), m_realPath.size()});
+                        while (m_realCps.size() > static_cast<size_t>(REAL_CP_KEEP) + 1) {
+                            // keep the first (where you paused) and the newest ones
+                            if (m_realCps[1].cp) m_realCps[1].cp->release();
+                            m_realCps.erase(m_realCps.begin() + 1);
+                        }
+                    }
+                }
+            }
+            if (m_realEnded || x >= m_realTarget) { realScanDone(pl); return; }
+            if (m_realDied) {
+                if (!realBacktrack(pl)) { realScanFail(pl, "no input around here gets through"); return; }
+            }
+        }
+    }
+    // Died: the newest decision with an input not tried yet gets it, from the
+    // checkpoint before it (the decisions in between are replayed).
+    bool realBacktrack(PlayLayer* pl) {
+        if (++m_realResets > REAL_MAX_RESETS || m_realCps.empty()) return false;
+        int const deathAt = m_realDecision;
+        int i = static_cast<int>(m_realAct.size()) - 1;
+        while (i >= 0 && m_realTried[static_cast<size_t>(i)] == 3) i--;
+        // only up to ~1 s before the death: further back it's not this spot
+        if (i < 0 || i < deathAt - 120) return false;
+        uint8_t const other = static_cast<uint8_t>(m_realAct[static_cast<size_t>(i)] ^ 1);
+        m_realAct[static_cast<size_t>(i)] = other;
+        m_realTried[static_cast<size_t>(i)] = 3;
+        m_realAct.resize(static_cast<size_t>(i) + 1);
+        m_realTried.resize(static_cast<size_t>(i) + 1);
+        // newest checkpoint at or before decision i
+        size_t c = 0;
+        for (size_t j = 0; j < m_realCps.size(); j++) if (m_realCps[j].decision <= i) c = j;
+        RealCp const cp = m_realCps[c];
+        for (size_t j = c + 1; j < m_realCps.size(); j++) if (m_realCps[j].cp && m_realCps[j].cp != m_realCp0) m_realCps[j].cp->release();
+        m_realCps.resize(c + 1);
+        realRestore(pl, cp.cp);
+        m_realDecision = cp.decision;
+        m_realTick = 0;
+        m_realHeld = cp.held;
+        m_realTapUp = false;
+        m_realInputs.resize(std::min(m_realInputs.size(), cp.inputs));
+        m_realPath.resize(std::min(m_realPath.size(), cp.path));
+        if (pl->m_player1) m_realLastX = pl->m_player1->getPositionX();
+        // the game's button follows what the replay will hold
+        realPress(pl, cp.held);
+        return true;
+    }
+    void realScanDone(PlayLayer* pl) {
+        PlayerObject* p = pl->m_player1;
+        float const endX = p->getPositionX();
+        // the real run's inputs replace the route over what it covered
+        std::vector<RoutePt> found;
+        for (auto const& r : m_realInputs) found.push_back(r.pt);
+        routeMerge(found, m_realStartX, endX, m_realPath);
+        // carry on with the normal scan from the real state it reached
+        BeamNode root;
+        root.fromReal = false;
+        root.snap = snapFrom(p);
+        root.held = m_realHeld;
+        root.modeCode = modeCode(p);
+        root.mode = scanModeIndex(p);
+        root.x = endX;
+        root.y = p->getPositionY();
+        root.vy = p->m_yVelocity;
+        trace(fmt::format("scan: the real game got through to x={:.0f} ({} inputs, {} tries)", endX, found.size(), m_realResets));
+        realScanAbort(pl, "got through");
+        m_beam.clear();
+        m_beamHist.clear();
+        m_rewind.clear();
+        m_rewindLastX = -1e9f;
+        m_beamHist.push_back(BeamHist{-1, root.x, root.y, false, root.held, static_cast<uint8_t>(root.mode)});
+        root.hist = 0;
+        m_scanLastMode = root.modeCode;
+        m_beam.push_back(std::move(root));
+        m_scanStartX = m_scanX = endX;
+    }
+
+public:
+    // Leaving the level: drop the scan.
+    void releaseScan() {
+        if (scanning()) m_realUsedOrbs = m_scanSavedOrbs;
+        m_beam.clear();
+        m_beamHist.clear();
+        if (m_scanState == ScanState::Running) m_scanState = ScanState::Off;
+        m_scanMsg.clear();
+    }
+
+    static float pctAt(PlayLayer* pl, float x) {
+        float const len = pl ? pl->m_levelLength : 0.f;
+        return len > 1.f ? std::clamp(100.f * x / len, 0.f, 100.f) : 0.f;
+    }
+
+    // Snap (2.1): your input matches a scanned one (same direction and
+    // gamemode, same height on the path). 1 = inside its window (fine as it
+    // is), 2 = early by no more than your stage window (hold until targetX),
+    // 0 = not on the scanned route.
+    int routeMatch(PlayLayer* pl, bool push, ModeInfo const& mode, int windowTicks, float dt, float& targetX) const {
+        if (m_route.empty() || !pl || !pl->m_player1) return 0;
+        PlayerObject* p = pl->m_player1;
+        float const px = p->getPositionX(), py = p->getPositionY();
+        float const dir = m_p1Dir < 0.f ? -1.f : 1.f;
+        float const reach = m_p1Speed * dt * static_cast<float>(std::max(0, windowTicks));
+        std::string const name = mode.name();
+        for (auto const& r : m_route) {
+            if (r.push != push || r.mode != name) continue;
+            if (std::fabs(py - r.y) > ROUTE_SNAP_Y_TOL) continue;
+            float const lo = dir > 0.f ? r.x0 : -r.x1, hi = dir > 0.f ? r.x1 : -r.x0, q = px * dir;
+            if (q >= lo && q <= hi) return 1;
+            if (q < lo && lo - q <= reach + 0.5f) { targetX = dir > 0.f ? r.x0 : r.x1; return 2; }
+        }
+        return 0;
+    }
+
+
+    // For the window (Tools tab).
+    SavedStats levelStats() const { return m_lvlStats; }
+    SavedStats lifeStats() { loadLifeStats(); return m_lifeStats; }
+    std::string levelName() const { return m_lvlName; }
+
+    // Everything you'd otherwise screenshot, in one text file (and returned).
+    std::string buildReport() {
+        Config const& c = cfg();
+        std::string out;
+        auto line = [&](std::string const& t) { out += t; out += '\n'; };
+        line("Input Buffer report");
+        line(fmt::format("mod {}  geode {}  gd {}", Mod::get()->getVersion().toVString(),
+                         Loader::get()->getVersion().toVString(), Loader::get()->getGameVersion()));
+        line(fmt::format("system: {}  device: {}", systemInfo().full, systemInfo().device));
+        line(fmt::format("level: {} ({})  in level: {}", m_lvlName, m_lvlKey, PlayLayer::get() ? "yes" : "no"));
+        line(fmt::format("stage: {}  orb helper: {}  click guide: {}  show paths: {}  learn: {}  detail log: {}",
+                         STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].name, c.orbHelper, c.clickGuide, c.overlay,
+                         c.learnSpots, c.hudVerbose));
+        line("");
+        line("== Stats ==");
+        m_forceDetails = true;
+        auto rows = statsRows();
+        m_forceDetails = false;
+        for (auto const& r : rows) {
+            std::string t = r.first;
+            if (!t.empty() && t[0] == '\x01') { line(""); line("-- " + t.substr(1) + " --"); continue; }
+            for (auto& ch : t) if (ch == '\t') ch = ':';
+            line(t);
+        }
+        line("");
+        line("== Log (newest first) ==");
+        for (auto const& r : historyRows(true)) {
+            std::string t = r.first;
+            if (!t.empty() && t[0] == '\x02') t = t.substr(1);
+            for (auto& ch : t) if (ch == '\x1f') ch = ' ';
+            line(t);
+        }
+        line("");
+        line(fmt::format("== Scanned route ({} inputs, scanned: {}) ==", m_route.size(), [&] {
+            std::string t;
+            for (auto const& r : m_scanned) t += fmt::format("{}{:.0f}..{:.0f}", t.empty() ? "" : ", ", r.first, r.second);
+            return t.empty() ? std::string("nothing") : t;
+        }()));
+        for (size_t i = 0; i < m_route.size() && i < 400; i++) {
+            auto const& r = m_route[i];
+            line(fmt::format("  {:.1f} {:.1f} {} {}", r.x, r.y, r.push ? "press" : "release", r.mode));
+        }
+        if (m_route.size() > 400) line(fmt::format("  ... {} more", m_route.size() - 400));
+        line("");
+        line("== Trace (every click and log line, oldest first) ==");
+        for (auto const& t : m_trace) line(t);
+        return out;
+    }
+    std::filesystem::path saveReport(std::string const& text) {
+        std::error_code ec;
+        std::filesystem::path const dir = Mod::get()->getSaveDir() / "reports";
+        std::filesystem::create_directories(dir, ec);
+        auto const now = std::chrono::system_clock::now().time_since_epoch();
+        long long const secs = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+        std::filesystem::path const file = dir / fmt::format("report-{}-{}.txt", m_lvlKey.empty() ? "menu" : m_lvlKey, secs);
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << text;
+        return file;
+    }
+private:
 
     // Small tag bottom-left while the buffer is active (fair play / recordings).
     void updateBadge(PlayLayer* pl, Config const& c) {
@@ -2505,6 +4132,7 @@ class TrajectoryBufferSim {
         self->m_collisionLogLeft->removeAllObjects();
         self->m_collisionLogRight->removeAllObjects();
     }
+
 
     // Same attribute + hitbox synchronisation Show Trajectory uses, plus the
     // movement state and the BUTTON state, so every test starts from exactly
@@ -2597,6 +4225,9 @@ class TrajectoryBufferSim {
         sim->m_lastSpiderFlipTime = real->m_lastSpiderFlipTime;
         sim->m_snapDistance = real->m_snapDistance;
         sim->m_totalTime = real->m_totalTime;
+        // (2.1 copied ~45 more fields here - jump / slope / boost state and what
+        // the player touches. Reverted: mini cube predictions changed with it.
+        // The level scan's snapshots still carry them - see PlayerSnap.)
     }
     void setHeld(PlayerObject* p1, PlayerObject* p2, bool held) {
         if (held && !m_simHeld) m_simPressTick = m_simTick; // a new press inside this test
@@ -2622,6 +4253,9 @@ class TrajectoryBufferSim {
         m_queue.clear();
         m_live = false;
         m_planTrust = false;
+        m_orbHelpHold = false;
+        m_orbHelpRing = nullptr;
+        m_routeHold = false;
     }
 
     // Still on the planned path? Checked on tick boundaries only (a CBF sub-step
@@ -2963,6 +4597,28 @@ private:
             }
         }
 
+        // Level scan (2.1): gamemode portals switch the hidden player with its
+        // own toggles, and it remembers the portal (where GD keeps it per
+        // player). Normal predictions still stop at them.
+        if (m_scanSim) {
+            int const pm = portalMode(type);
+            if (pm >= 0) {
+                if (overlapping && markUsed(obj)) {
+                    m_objRestore.emplace_back(obj, obj->m_isActivated);
+                    // What GD does on a real portal first (switchToFlyMode etc.):
+                    // the player's own "switched to mode" step (speed / velocity
+                    // changes on entry), then the mode toggle. Only on an actual
+                    // change - the portal is touched again on the next steps.
+                    if (modeCode(player) != pm) player->switchedToMode(type);
+                    setSimMode(player, pm);
+                    player->m_lastPortalPos = obj->getPosition();
+                    player->m_lastActivatedPortal = obj;
+                    m_scanModeSwitches++;
+                }
+                return;
+            }
+        }
+
         // Size portals (1.25.1): applied to the hidden sim player only, by
         // setting its size directly - no GD portal code, nothing on the real
         // portal object changes (1.20.0 called GD's toggles and broke real
@@ -2983,7 +4639,7 @@ private:
         // Pads and speed / gravity portals fire on contact, no click involved,
         // so the sim can apply them itself. Anything the player was already
         // touching when the input arrived has been applied by the game.
-        if (m_padPredict && gapStart > 0.f) {
+        if ((m_padPredict || m_scanSim) && gapStart > 0.f) {
             if (isModelledPad(type)) {
                 float bump = 0.f;
                 if (padStrength(type, bump)) {
@@ -3000,12 +4656,22 @@ private:
                     if (overlapping && markUsed(obj)) player->m_playerSpeed = speed;
                     return;
                 }
+                // level scan: a trigger (not a speed portal) - it can't run
+                // triggers anyway, so it doesn't stop at them
+                if (m_scanSim) return;
             } else if (isGravityPortal(type)) {
                 if (overlapping && markUsed(obj)) {
                     bool const want = type == GameObjectType::InverseGravityPortal ? true
                                     : type == GameObjectType::NormalGravityPortal  ? false
                                     : !player->m_isUpsideDown;
-                    if (want != player->m_isUpsideDown) player->flipGravity(want, true);
+                    if (want != player->m_isUpsideDown) {
+                        player->flipGravity(want, true);
+                        if (m_scanSim && m_scanPortalTraces < 40) {
+                            m_scanPortalTraces++;
+                            trace(fmt::format("scan: gravity {} at ({:.1f},{:.1f})", want ? "up" : "down",
+                                              player->getPositionX(), player->getPositionY()));
+                        }
+                    }
                 }
                 return;
             }
@@ -3064,10 +4730,16 @@ private:
         m_simDtCur = dt;
         m_objRestore.clear();
         m_simUsed.clear();
+        m_scanClr = 1e9f;
         if (m_recordPath) m_path.clear();
 
         syncSimPlayer(s1, realP1);
         if (s2) syncSimPlayer(s2, realP2);
+        if (m_simSnap) {
+            setSimMode(s1, m_simSnap->mode); // the scan may be past a gamemode portal
+            applySnap(s1, *m_simSnap); // level scan: a saved state on top of the real player's
+            m_simStartY = s1->getPositionY();
+        }
         m_simHeld = m_gameHolding; // until the action lands, the button keeps the game's current state
 
         m_track[0] = SimTrack{s1->getPositionX(), 1.f, 0.f};
@@ -3128,6 +4800,7 @@ private:
             resetCollisionLog(s1);
             pl->checkCollisions(s1, dt, false);
             if (m_simDead) { out.end = SimEnd::Died; break; }
+            m_scanClr = std::min(m_scanClr, m_tickClr);
             m_prevRing[0] = m_tickRing[0]; // what it touches now = "already touching" next step
             applyGdRing(s1, 0);
 
@@ -3174,7 +4847,7 @@ private:
 
             if (m_recordPath) m_path.push_back(ibcore::Point2{s1->getPositionX(), s1->getPositionY(), s1->getRotation()});
 
-            if (m_simTrunc.valid) {
+            if (m_simTrunc.valid && !m_scanNoclip) {
                 out.end = SimEnd::Truncated;
                 out.trunc = m_simTrunc;
                 break;
@@ -3242,16 +4915,23 @@ private:
                     text = fmt::format("{}, checking every tick (up to +{}t){}", act, n.windowTicks, mode);
                     return true;
                 }
+                if (n.route) {
+                    tag = "SNAP";
+                    text = fmt::format("{} +{}t to the scanned input{}", act, n.delay, mode);
+                    return true;
+                }
+                if (n.orbHelp) {
+                    tag = "ORB";
+                    text = fmt::format("press waits for the orb (+{}t){}", n.delay, mode);
+                    return true;
+                }
                 if (n.stream && !c.hudVerbose) return false; // spam: one line per stream is enough
                 tag = "BUFFER";
                 text = fmt::format("{} +{}t ({:.1f}ms){}{}", act, n.delay, ticksToMs(n.delay, dt),
                                    n.stream ? ", spam kept steady" : "", mode);
                 return true;
             case Decision::Queued:
-                tag = "QUEUED";
-                text = fmt::format("{}, keeps your spacing", act);
-                color = COL_GREY;
-                return true;
+                return false; // inputs behind a held one: no line (2.1)
             case Decision::PassTruncated:
                 tag = "RAW";
                 text = fmt::format("{}, {}", act, describeTrunc(n.r0.trunc));
@@ -3280,17 +4960,8 @@ private:
                 text = fmt::format("{}, out of CPU time", act);
                 return true;
             case Decision::PassEscapable:
-                if (!c.hudVerbose) return false;
-                tag = "OK";
-                text = fmt::format("{}, your next click saves it", act);
-                color = COL_GREY;
-                return true;
             case Decision::PassSafe:
-                if (!c.hudVerbose) return false;
-                tag = "OK";
-                text = fmt::format("{}, safe", act);
-                color = COL_GREY;
-                return true;
+                return false; // on time, nothing changed: no line (2.1)
             case Decision::PassRelease:
                 return false; // releases that do nothing: never worth a line (1.25.2)
             case Decision::PassModeOff:
@@ -3348,6 +5019,17 @@ private:
                        n.horizon, n.us, n.evals, simEndName(n.r0.end), n.r0.ticks, n.delay,
                        n.orb ? " orb" : "", extra);
         }
+        {
+            // Report trace (2.1): every decision, shown or not.
+            PlayLayer* tpl = PlayLayer::get();
+            PlayerObject* tp = tpl ? tpl->m_player1 : nullptr;
+            trace(fmt::format("click {} {} {} delay={} win={}t h={} f0={}/{} us={} at=({:.1f},{:.1f}){}{}",
+                              modeName, n.push ? "press" : "release", decisionName(n.d), n.delay, n.windowTicks,
+                              n.horizon, simEndName(n.r0.end), n.r0.ticks, n.us, tp ? tp->getPositionX() : 0.f,
+                              tp ? tp->getPositionY() : 0.f, extra.empty() ? "" : " ", extra));
+            if (n.d != Decision::PassRelease && n.d != Decision::Queued) { m_lvlStats.clicks++; m_lifeStats.clicks++; }
+            if (n.d == Decision::Buffered) { m_lvlStats.buffered++; m_lifeStats.buffered++; }
+        }
         if (c.csv) {
             m_csv.row(fmt::format("CLICK,{:.1f},{},{},{},{},{},{},{},{},{},{},{}",
                                   levelMs(), modeName, n.push ? "press" : "release", tps, n.windowTicks,
@@ -3385,6 +5067,7 @@ private:
     }
 
     void pushTagged(std::string tag, std::string text, ccColor3B color, bool minor = false) {
+        trace(fmt::format("log {} {}", tag, text));
         m_logVersion++;
         float const t = levelMs() / 1000.f;
         if (!m_history.empty() && m_history.back().text == text && m_history.back().tag == tag) {
@@ -3573,6 +5256,8 @@ public:
         m_simStepsTotal = m_simUsTotal = 0;
         m_cheapClicks = 0;
         m_inputsSeen = m_hookMissing = 0;
+        m_followOnTime = m_followSpacing = 0;
+        m_routeHits = m_routeSnaps = 0;
         m_oneStep.clear();
         m_osPending = false;
         m_lastLiveAt = -1e9;
@@ -3581,6 +5266,8 @@ public:
         m_lastDeathTick = -1;
         m_spots.clear();   // a new level: load what earlier sessions learned on it
         loadSpots(pl);
+        releaseScan();
+        loadLevelExtras(pl);
         m_outcome.clear();
         m_spotFires = m_spotBlocks = m_spotSaves = 0;
         m_p1LastT = -1.0;
@@ -3619,8 +5306,14 @@ public:
         }
         m_csv.close();
         m_outcome.clear(); // leaving: the last input is neither proven nor blamed
+        if (m_realScan) realScanAbort(nullptr, "left the level", false);
+        releaseScanView();
+        saveAnchors();
         saveSpots();
         m_spotFile.clear();
+        saveLevelStats();
+        releaseGuide();
+        releaseScan();
         savePersisted();
         releaseSimPlayers();
         releaseOverlay();
@@ -3892,7 +5585,12 @@ public:
     }
 
     void onReset() {
+        commitAnchors(m_attemptLastX, false);
+        if (!scanning()) releaseScanView();
         m_deathReported = false;
+        m_osPending = false; // a check from the last attempt vs. the new spawn isn't a check
+        m_routeOff = 0;
+        m_attemptPending = true;
         clearBuffer();
         m_lastPressAt = m_lastReleaseAt = -1.0; // a respawn breaks the rhythm
         m_tracker.invalidate();
@@ -4039,7 +5737,9 @@ public:
     // True if `player` is one of our sim players (their "death" is swallowed).
     bool checkSimulationDeath(PlayerObject* player, GameObject* killer = nullptr) {
         if (m_simulating && (player == m_simPlayer1.data() || player == m_simPlayer2.data())) {
+            if (m_scanNoclip) return true; // scan "going through" a spot: deaths don't count
             if (!m_simDead) {
+                m_simKillPos = killer ? killer->getPosition() : player->getPosition();
                 m_simKillType = killer ? static_cast<int>(killer->m_objectType) : -1;
                 m_simKillMover = false;
                 m_simKillDy = player->getPositionY() - m_simStartY;
@@ -4056,6 +5756,16 @@ public:
     void onRealDeath() {
         if (m_deathReported) return;
         m_deathReported = true;
+        if (PlayLayer* dpl = PlayLayer::get()) {
+            m_lvlStats.deaths++;
+            m_lifeStats.deaths++;
+            if (!dpl->m_isPracticeMode) m_lvlStats.best = std::max(m_lvlStats.best, dpl->getCurrentPercent());
+            if (PlayerObject* dp = dpl->m_player1) {
+                trace(fmt::format("death at ({:.1f},{:.1f}) {:.1f}%", dp->getPositionX(), dp->getPositionY(),
+                                  dpl->getCurrentPercent()));
+            }
+            saveLevelStats();
+        }
         if (cfg().learnSpots) {
             finishOutcome(m_outcome.death(m_gameTime, m_outcomeWindow));
             saveSpots(); // a death is a natural pause: write what was learned
@@ -4141,7 +5851,7 @@ public:
                 moved = true;
             }
         }
-        if (!moved && !m_simModern) return false; // static hazard: GD's own test (no clearance outside mini cube)
+        if (!moved && !m_simModern && !m_scanSim) return false; // static hazard: GD's own test (no clearance outside mini cube / scan)
         ibcore::Box hb = toBox(obj->getObjectRect());
         hb.x += dx;
         hb.y += dy;
@@ -4152,7 +5862,7 @@ public:
             return false;
         }
         m_simMover = true;
-        if (gap < 0.f && !m_simDead) {      // touches it where it will be
+        if (gap < 0.f && !m_simDead && !m_scanNoclip) { // touches it where it will be
             m_simDead = true;
             m_simKillType = static_cast<int>(obj->m_objectType);
             m_simKillMover = true;
@@ -4379,6 +6089,13 @@ public:
     }
 
     // Called once per rendered frame: smoothed wall-clock frame time for the auto budget.
+    // Once per rendered frame of a running level: counts frames without a physics
+    // step (the real "hook isn't running" signal).
+    void noteFrame(PlayLayer* pl) {
+        if (!pl || pl->m_isPaused || !pl->m_player1 || pl->m_player1->m_isDead) { m_framesSinceStep = 0; return; }
+        if (m_framesSinceStep < 1000000) m_framesSinceStep++;
+    }
+
     void onFrame() {
         auto const now = Clock::now();
         if (m_haveFrame || m_lastFrameAt.time_since_epoch().count() != 0) {
@@ -4397,13 +6114,15 @@ public:
     // ------------------------------------------------------------------------
     // Set the stage (0 = off, 1-4, 5 = extreme). Written into the setting, so
     // the settings screen, F6 and the window always agree.
-    void setStage(int stage) {
+    // notify: the "Input Buffer - Stage 3 ..." banner - only for the F6 key
+    // (2.1); the window shows the stage itself.
+    void setStage(int stage, bool notify = false) {
         stage = std::clamp(stage, 0, STAGE_COUNT - 1);
         Mod::get()->setSettingValue<std::string>("stage", STAGES[stage].setting);
         invalidateCfg();
         refreshFlags();
         clearBuffer();
-        Notification::create(fmt::format("Input Buffer - {}", STAGES[stage].name), NotificationIcon::None, 1.2f)->show();
+        if (notify) Notification::create(fmt::format("Input Buffer - {}", STAGES[stage].name), NotificationIcon::None, 1.2f)->show();
         log::info("[InputBuffer] {}", STAGES[stage].name);
         refreshHud(PlayLayer::get(), true);
     }
@@ -4415,7 +6134,7 @@ public:
     void cyclePreset() {
         int const cur = Config::load().stage;
         int const next = (cur == STAGE_COUNT - 1) ? 0 : cur + 1;
-        setStage(next);
+        setStage(next, true);
     }
 
     // ------------------------------------------------------------------------
@@ -4565,7 +6284,7 @@ public:
                 bool const holdW = w == W_SHIP || w == W_SHIP_REL || w == W_WAVE || w == W_WAVE_REL;
                 f = std::max(f, static_cast<float>(holdW ? c.extremeHoldCap : c.extremeWindow) * BASE_DT);
                 // wave releases: short cap (2.1), same math as windowTicks
-                if (w == W_WAVE_REL) f = std::min(f, std::max(WAVE_RELEASE_MAX_BASE * BASE_DT, e.window[w]));
+                if (w == W_WAVE_REL || w == W_SHIP_REL) f = std::min(f, std::max(WAVE_RELEASE_MAX_BASE * BASE_DT, e.window[w]));
             }
             kv(fmt::format("  {}", winLabel(w)), fmt::format("{:g}f{}", std::round(f * 100.f) / 100.f, autoOn ? " (auto)" : ""),
                autoOn ? COL_GREEN : COL_WHITE);
@@ -4592,6 +6311,12 @@ public:
             kv("Held clicks fired on plan", fmt::format("{} ({} re-checked)", m_planFires, m_planDrifts),
                m_planDrifts > m_planFires ? COL_YELLOW : COL_GREEN);
         }
+        if (!m_route.empty()) {
+            kv("Scanned route", fmt::format("{} inputs; {} clicks in a window, {} snapped", m_route.size(), m_routeHits, m_routeSnaps));
+        }
+        if (m_followOnTime + m_followSpacing > 0) {
+            kv("Wave / ship follow-ups", fmt::format("{} on time, {} kept spacing", m_followOnTime, m_followSpacing));
+        }
         if (m_cheapClicks > 0) kv("Clicks finished with quick checks", fmt::format("{}", m_cheapClicks), COL_YELLOW);
         if (m_watchdogFires > 0) kv("Inputs released by the watchdog", fmt::format("{}", m_watchdogFires), COL_ORANGE);
         if (m_directFires > 0 || m_directMode) kv("Applied directly (another input mod)", fmt::format("{}", m_directFires), COL_YELLOW);
@@ -4614,9 +6339,9 @@ public:
         }
 
         // ---- details (debugging), only with "Log: show safe clicks"
-        if (!c.hudVerbose) {
+        if (!c.hudVerbose && !m_forceDetails) {
             rows.emplace_back("", COL_GREY);
-            note("More detail: turn on \"Log: show safe clicks\" (Stage tab).", COL_DIM);
+            note("More detail: turn on \"Log: more detail\" (Stage tab).", COL_DIM);
             return rows;
         }
         rows.emplace_back("", COL_GREY);
@@ -4681,6 +6406,7 @@ public:
         invalidateCfg();
         refreshFlags();
         clearBuffer();
+        if (PlayLayer* gpl = PlayLayer::get()) drawGuide(gpl);
         if (PlayLayer* pl = PlayLayer::get()) refreshHud(pl, true);
     }
 
@@ -4705,7 +6431,90 @@ public:
         bool  landRule = false;
         int   window = 0;   // stage window for this input, ticks
         bool  modern = false; // current engine (mini cube) vs 1.10.2 behaviour
+        int   waveCommit = 0; // wave (2.1): a death within this many ticks is the input's fault
     };
+
+    // Wave / ship: how long an input answers for the path - until your next
+    // input at your own rhythm plus a short grace (wave), or 100 ms (ship).
+    int holdCommit(ModeInfo const& m, bool push, float dt, float s) const {
+        if (m.wave && !(m.ship || m.ufo || m.swing || m.robot || m.cubeLike)) {
+            WinIdx const g = primaryWin(m, true);
+            float const nextFrames = push ? rhythm(m_holdLen[g], DEFAULT_TAP_FRAMES)
+                                          : rhythm(m_gapLen[g], DEFAULT_GAP_FRAMES);
+            int const next = std::max(1, static_cast<int>(std::lround(nextFrames / dt)));
+            return std::clamp(next + scaleTicks(WAVE_GRACE_BASE, s), scaleTicks(6, s), scaleTicks(ESCAPE_COMMIT_BASE, s));
+        }
+        return scaleTicks(ESCAPE_COMMIT_BASE, s);
+    }
+
+    // Wave / ship (2.1): an input that arrives while the one before it is held
+    // (or after it fired late) - e.g. your release behind a buffered press. It
+    // can go in on time (as you made it) or keep your spacing (moved by the
+    // same delay). Spacing used to be automatic: a +18t press moved its release
+    // 18t too, and in a tight mini wave / ship gap that was the death. Both are
+    // tested from the real state now; on time wins when it's safe (less lag),
+    // else spacing, else whichever survives longer. Returns the time to use.
+    double pickFollowUpTime(PlayLayer* pl, Config const& c, bool push, double minGap) {
+        double const spacing = m_gameTime + m_queue.shift();
+        bool const headPending = m_queue.pending();
+        if (headPending && m_queue.size() != 1) return spacing; // a longer chain: keep it simple
+        double const prevAt = headPending ? m_queue.nextAt() : m_queue.lastAt();
+        double const onTime = std::max(m_gameTime, prevAt + minGap);
+        Ctx x;
+        bool const headPush = headPending ? m_queue.nextPush() : push;
+        if (!makeCtx(pl, headPush, c, x)) return spacing;
+        if (!(x.mode.wave || x.mode.ship) || x.modern) return spacing;
+        float const dt = x.dt;
+        if (spacing - onTime < 0.5 * static_cast<double>(dt)) return spacing; // the same tick anyway
+        double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+        auto ticksAt = [&](double t) {
+            return std::max(0, static_cast<int>(std::ceil((t - gridStart) / static_cast<double>(dt) - 1e-3)));
+        };
+        int const commit = holdCommit(x.mode, push, dt, x.s);
+        int const budget = clickBudgetUs(c);
+        m_hasDeadline = budget > 0;
+        if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
+        bool const rec = m_recordPath;
+        m_recordPath = false;
+        constexpr int SAFE = 1 << 30;
+        // ticks it survives after the follow-up (SAFE: through its commit time; -1: unknown)
+        auto test = [&](double at) -> int {
+            SimResult r;
+            int follow = 0;
+            if (headPending) {
+                int const dh = ticksAt(prevAt);
+                follow = std::max(dh + 1, ticksAt(at));
+                FollowUp f;
+                f.at[0] = follow;
+                f.held[0] = push;
+                Ctx y = x;
+                y.horizon = std::clamp(follow + commit + 1 - dh, MIN_HORIZON, MAX_SIM_STEPS);
+                r = runSim(y, dh, f);
+            } else {
+                follow = ticksAt(at);
+                Ctx y;
+                if (!makeCtx(pl, push, c, y)) return -1;
+                y.horizon = std::clamp(commit + 1, MIN_HORIZON, MAX_SIM_STEPS);
+                r = runSim(y, follow);
+            }
+            if (r.end == SimEnd::OutOfBudget) return -1;
+            if (r.end != SimEnd::Died) return SAFE;
+            return std::max(0, r.deathStep - follow);
+        };
+        double pick = spacing;
+        int const a = test(onTime);
+        if (a == SAFE) {
+            pick = onTime;
+        } else {
+            int const b = test(spacing);
+            if (b != SAFE && a >= 0 && b >= 0 && a > b) pick = onTime;
+        }
+        m_recordPath = rec;
+        m_hasDeadline = false;
+        if (pick == onTime) m_followOnTime++;
+        else m_followSpacing++;
+        return pick;
+    }
 
     bool makeCtx(PlayLayer* pl, bool push, Config const& c, Ctx& x) {
         x = Ctx{};
@@ -4747,6 +6556,19 @@ public:
         // again; a death after that landing is your next jump's job.
         x.landRule = !x.noLanding;
         x.modern = modernEngine(x.mode);
+
+        // Wave (2.1): a wave input only answers for the stretch until your next
+        // input (your own rhythm) plus a short grace - after that, where you go
+        // is the next input's job (same rule savableLater uses). So the
+        // lookahead only needs to reach a bit past that: 2x the commit time,
+        // at least 26 base ticks (the accuracy check reads 24). Was 65 base
+        // ticks (50 mini) every test - most of the work, and the frame-time
+        // spikes while spamming.
+        if (x.mode.wave && !(x.mode.ship || x.mode.ufo || x.mode.swing || x.mode.robot || x.mode.cubeLike)) {
+            x.waveCommit = holdCommit(x.mode, push, x.dt, x.s);
+            int const want = std::max({2 * x.waveCommit, x.waveCommit + scaleTicks(8, x.s), scaleTicks(26, x.s)});
+            x.horizon = std::clamp(want, MIN_HORIZON, x.horizon);
+        }
         return true;
     }
 
@@ -4917,25 +6739,30 @@ public:
             m_gameHolding = push;
             return true;
         }
-        // The hook that fires held inputs isn't running (another mod replaced
-        // it, or the game is stalled): never hold an input we couldn't re-send.
-        if (!stepsRunning()) {
-            if (m_queue.pending()) flushQueue(pl);
-            clearBuffer();
-            m_gameHolding = push;
-            if (m_hookMissing++ == 0) {
-                pushLog("NOTE: the physics hook isn't running, so the buffer can't hold inputs - they go straight "
-                        "through. Another mod (TPS / physics bypass, speedhack) is probably replacing it.",
-                        COL_ORANGE, false);
-            }
-            return true;
-        }
-
+        // Dead (death animation, respawn): straight through, nothing to check.
+        // (2.1: before the hook check - clicks while dead looked like a
+        // missing physics hook.)
         PlayerObject* p1 = pl->m_player1;
         PlayerObject* p2 = isDual ? pl->m_player2 : nullptr;
         if (!p1 || p1->m_isDead) {
             clearBuffer();
             m_gameHolding = push;
+            return true;
+        }
+
+        // The hook that fires held inputs isn't running (another mod replaced
+        // it, or the game is stalled): never hold an input we couldn't re-send.
+        // Only reported when frames keep running without physics steps while
+        // you're alive (2.1) - not for the moment after a respawn / unpause.
+        if (!stepsRunning()) {
+            if (m_queue.pending()) flushQueue(pl);
+            clearBuffer();
+            m_gameHolding = push;
+            if (m_framesSinceStep >= STALL_FRAMES && m_hookMissing++ == 0) {
+                pushLog("NOTE: the physics hook isn't running, so the buffer can't hold inputs - they go straight "
+                        "through. Another mod (TPS / physics bypass, speedhack) is probably replacing it.",
+                        COL_ORANGE, false);
+            }
             return true;
         }
 
@@ -5001,7 +6828,35 @@ public:
         // 1. An input is already held back: queue this one behind it so taps are never eaten.
         if (m_queue.active()) {
             // Keep order and spacing: replay it after the held input with the same shift.
-            m_queue.push(push, m_gameTime, static_cast<double>(dt) * 0.999);
+            // Wave / ship (2.1): on time instead, when that's the safe one.
+            double const minGap = static_cast<double>(dt) * 0.999;
+            bool placed = false;
+            bool snapped = false;
+            // Snap to scan (2.1): the input that ends a gesture - the release
+            // after a press that snapped to a cyan dot - snaps to ITS scanned
+            // spot (pink dot) too. It used to just keep the press's delay (or go
+            // on time), so presses lined up with the guide and releases didn't.
+            if (c.routeSnap && !m_route.empty() && windowTicks > 0 && push != m_queue.lastPush()) {
+                float tx = 0.f;
+                int const m = routeMatch(pl, push, mode, windowTicks, dt, tx);
+                float const step = m_p1Speed * dt;
+                if (m == 1) {
+                    placed = m_queue.pushAt(push, m_gameTime, m_gameTime, minGap);
+                } else if (m == 2 && step > 0.01f) {
+                    int const k = std::clamp(static_cast<int>(std::ceil(std::fabs(tx - p1->getPositionX()) / step)), 1,
+                                             windowTicks);
+                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+                    placed = m_queue.pushAt(push, gridStart + static_cast<double>(k) * dt, m_gameTime, minGap);
+                }
+                if (placed) {
+                    snapped = true;
+                    m_routeSnaps++;
+                }
+            }
+            if (!placed && push != m_queue.lastPush() && mode.holdBased() && !modernEngine(mode)) {
+                placed = m_queue.pushAt(push, pickFollowUpTime(pl, c, push, minGap), m_gameTime, minGap);
+            }
+            if (!placed) m_queue.push(push, m_gameTime, minGap);
             // e.g. the release of a press that already fired: it gets the live check too
             if (!m_live && m_queue.pending()) {
                 m_live = true;
@@ -5010,6 +6865,7 @@ public:
             m_lastInputTime = m_gameTime;
             ClickNote n = base;
             n.d = Decision::Queued;
+            n.route = snapped;
             n.delay = m_queue.pending()
                 ? std::max(0, static_cast<int>(std::ceil((m_queue.nextAt() - m_gameTime) / dt - 1e-3)))
                 : static_cast<int>(std::lround(m_queue.shift() / dt));
@@ -5026,6 +6882,112 @@ public:
         // 2. Releases only matter in hold-based modes (and don't count as spam elsewhere).
         if (!push && !mode.releaseMatters()) {
             return pass(Decision::PassRelease);
+        }
+
+        // 2.0 Scanned route (2.1, Tools tab): an input that matches one the level
+        //     scan found is decided from the scan - no prediction (cheap, and
+        //     the scan already knows that spot). Inside its window: as made.
+        //     Early (within your stage window): held until the window starts.
+        if (c.routeSnap && !m_route.empty() && windowTicks > 0) {
+            float tx = 0.f;
+            int const m = routeMatch(pl, push, mode, windowTicks, dt, tx);
+            if (m == 1) {
+                m_routeHits++;
+                if (mode.wave) m_streamShift = 0.0;
+                return pass(Decision::PassSafe);
+            }
+            float const step = m_p1Speed * dt;
+            if (m == 2 && step > 0.01f) {
+                int const k = std::clamp(static_cast<int>(std::ceil(std::fabs(tx - p1->getPositionX()) / step)), 1, windowTicks);
+                double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+                auto at = [&](double ticks) { return gridStart + ticks * dt; };
+                m_planTrust = false;
+                m_liveRescue = false;
+                m_orbHelpHold = false;
+                m_liveSpotHold = false;
+                m_routeHold = true;
+                m_spotTargetX = tx;
+                m_spotTargetDir = m_p1Dir < 0.f ? -1.f : 1.f;
+                m_queue.start(push, m_gameTime, std::max(0.0, at(k) - m_gameTime));
+                m_live = true;
+                m_liveState.startClick(m_gameTime, dt, at(k), at(k + scaleTicks(2, s)) + TIME_EPS,
+                                       at(k + scaleTicks(1, s)) + TIME_EPS);
+                m_liveArrive = m_gameTime;
+                m_livePlanTicks = k;
+                m_liveWaited = false;
+                m_liveWaitWhy = 0;
+                for (int& v : m_refuse) v = 0;
+                m_refuseHave = false;
+                m_last.liveTicks = -1;
+                m_last.liveReason = ibcore::FireReason::None;
+                m_trackPending = false;
+                m_routeSnaps++;
+                ClickNote n = base;
+                n.d = Decision::Buffered;
+                n.delay = k;
+                n.route = true;
+                note(c, mode, dt, n);
+                return false;
+            }
+        }
+
+        // 2a. Orb helper (2.1, Tools tab): a press made a little before an orb
+        //     waits for the orb and goes in the tick you touch it - for orb
+        //     double-clicks and UFO / swing orbs that need a fresh click. Only
+        //     when not pressing until then is safe, and the orb press is too.
+        if (push && c.orbHelper && !mode.wave && !touchingOrb(p1)) {
+            Ctx ox;
+            if (makeCtx(pl, true, c, ox)) {
+                int const look = scaleTicks(ORB_HELP_BASE, s);
+                int const budget = clickBudgetUs(c);
+                m_hasDeadline = budget > 0;
+                if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
+                bool const rec = m_recordPath;
+                m_recordPath = false;
+                int k = -1;
+                RingObject* ring = nullptr;
+                SimResult const idle = runSim(ox, look + 1, FollowUp{}, 1); // no press within `look`
+                if (idle.end != SimEnd::OutOfBudget && idle.firstRing && idle.firstRingTick >= 1 &&
+                    idle.firstRingTick <= look &&
+                    !(idle.end == SimEnd::Died && idle.deathStep >= 0 && idle.deathStep <= idle.firstRingTick)) {
+                    k = idle.firstRingTick;
+                    ring = idle.firstRing;
+                    SimResult const atOrb = runSim(ox, k);
+                    bool bh = false;
+                    ibcore::Verdict const v = verdictFor(ox, k, atOrb, -1000000, bh);
+                    if (!(v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial)) k = -1;
+                }
+                m_recordPath = rec;
+                m_hasDeadline = false;
+                if (k > 0 && ring) {
+                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+                    auto at = [&](double ticks) { return gridStart + ticks * dt; };
+                    m_planTrust = false;
+                    m_liveSpotHold = false;
+                    m_liveRescue = false;
+                    m_orbHelpHold = true;
+                    m_orbHelpRing = ring;
+                    m_routeHold = false;
+                    m_queue.start(true, m_gameTime, std::max(0.0, at(k) - m_gameTime));
+                    m_live = true;
+                    m_liveState.startClick(m_gameTime, dt, at(k), at(k + scaleTicks(2, s)) + TIME_EPS, at(k) + TIME_EPS);
+                    m_liveArrive = m_gameTime;
+                    m_livePlanTicks = k;
+                    m_liveWaited = false;
+                    m_liveWaitWhy = 0;
+                    for (int& v : m_refuse) v = 0;
+                    m_refuseHave = false;
+                    m_last.liveTicks = -1;
+                    m_last.liveReason = ibcore::FireReason::None;
+                    m_trackPending = false;
+                    ClickNote n = base;
+                    n.d = Decision::Buffered;
+                    n.delay = k;
+                    n.orbHelp = true;
+                    note(c, mode, dt, n);
+                    return false;
+                }
+            }
         }
 
         // 2b. Wave spam: keep ONE steady shift for the whole stream. Jitter came
@@ -5090,7 +7052,16 @@ public:
 
         // 4. Window shorter than one physics tick (e.g. 0.5f at 60 TPS): nothing to do.
         if (windowTicks <= 0) return pass(Decision::PassNoWindow);
-        int const maxDelay = windowTicks;
+        int maxDelay = windowTicks;
+        // Wave / ship (2.1): never hold an input longer than most of the gesture
+        // it starts (your usual hold / gap) - see HOLD_DELAY_FRAC.
+        if (mode.holdBased() && !modernEngine(mode)) {
+            WinIdx const g = primaryWin(mode, true);
+            float const opp = push ? rhythm(m_holdLen[g], DEFAULT_TAP_FRAMES) : rhythm(m_gapLen[g], DEFAULT_GAP_FRAMES);
+            int const cap = std::max(scaleTicks(HOLD_DELAY_MIN_BASE, s),
+                                     static_cast<int>(std::lround(HOLD_DELAY_FRAC * opp / dt)));
+            maxDelay = std::min(maxDelay, cap);
+        }
 
         // CPU budget: the manual cap, further capped to a share of the frame time
         // when Auto is on (extreme gets a bigger share since it searches more).
@@ -5106,6 +7077,7 @@ public:
 
         Ctx x;
         if (!makeCtx(pl, push, c, x)) return pass(Decision::PassNoWindow);
+        base.horizon = x.horizon; // wave: the shorter lookahead (2.1)
         bool budgetHit = false;
         auto sim = [&](int delay, FollowUp const& f = FollowUp{}, int h = -1) { return runSim(x, delay, f, h); };
         auto escapable = [&](int delay, SimResult const& r, int samples) { return savableLater(x, delay, r, samples, budgetHit); };
@@ -5400,6 +7372,8 @@ public:
             // Held for a learned spot: fire on the spot, or 2 ticks after its
             // estimated arrival at the latest (the estimate uses your speed).
             m_liveSpotHold = (spotNote == 2);
+            m_orbHelpHold = false;
+            m_routeHold = false;
             if (spotNote == 2) latest = at(bestDelay + scaleTicks(2, s)) + TIME_EPS;
             if (rescue) {
                 // No plan to fall back on: the whole window is checked tick by
@@ -5463,7 +7437,9 @@ public:
         auto check = [&](bool push) -> ibcore::LiveVerdict {
             // Following the plan: on the predicted path, just wait for the plan
             // tick (it fires there through m_liveState.latest) - no prediction.
-            if (push && m_planTrust && m_liveState.first) {
+            // Presses and releases (2.1 - a held wave release was re-predicted
+            // every tick: the per-tick cost while you spam).
+            if (m_planTrust && m_liveState.first) {
                 if (!planDrifted(pl, now, dt)) {
                     m_planTicksSaved++;
                     return ibcore::LiveVerdict::Unsafe; // "not yet"; the plan tick fires it
@@ -5479,6 +7455,18 @@ public:
             waveMode = x.mode.wave;
             if (!push && !x.mode.releaseMatters()) return ibcore::LiveVerdict::OnSchedule;
             bool const head = m_liveState.first;
+            // Scanned route (2.1): fire when you reach the window (by position).
+            if (head && m_routeHold) {
+                float const px = pl->m_player1->getPositionX();
+                if ((px - m_spotTargetX) * m_spotTargetDir >= -spotTol().x) return ibcore::LiveVerdict::Proven;
+                return ibcore::LiveVerdict::Unsafe;
+            }
+            // Orb helper (2.1): fire the moment you touch the orb (or on the
+            // predicted tick through m_liveState.latest).
+            if (head && push && m_orbHelpHold) {
+                if (m_orbHelpRing && overlapsNow(pl->m_player1, m_orbHelpRing)) return ibcore::LiveVerdict::Proven;
+                return ibcore::LiveVerdict::Unsafe;
+            }
             // Held for a learned spot: fire exactly when you reach it (no
             // prediction - it may be blind there), else keep waiting.
             if (head && push && m_liveSpotHold) {
@@ -5632,6 +7620,7 @@ public:
         if (c.overlay && !path.empty()) drawPreview(pl, path, previewColor(testedEnd));
         if (fired) {
             fireButton(pl, *fired);
+            if (wasFirst) { m_orbHelpHold = false; m_orbHelpRing = nullptr; m_routeHold = false; }
             if (wasFirst) {
                 int const firedTicks = static_cast<int>(std::lround((now - m_liveArrive) / dt));
                 m_last.liveTicks = firedTicks;
@@ -5702,6 +7691,29 @@ public:
     void onPlayerUpdate(PlayLayer* pl, PlayerObject* player) {
         if (player != pl->m_player1) return;
         m_tick++;
+        m_framesSinceStep = 0;
+        // Report trace (2.1): where the REAL player switches gamemode and what
+        // GD keeps for it (portal position, level portal height) - to check the
+        // scan's portal handling against the real game.
+        {
+            int const mc = modeCode(player);
+            if (mc != m_lastRealMode) {
+                if (m_lastRealMode >= 0) {
+                    trace(fmt::format("real mode {} -> {} at ({:.1f},{:.1f}) lastPortalPos=({:.1f},{:.1f}) portalY={:.1f}",
+                                      m_lastRealMode, mc, player->getPositionX(), player->getPositionY(),
+                                      player->m_lastPortalPos.x, player->m_lastPortalPos.y, pl->m_gameState.m_portalY));
+                }
+                m_lastRealMode = mc;
+            }
+        }
+        if (m_attemptPending && !player->m_isDead) {
+            // First step of an attempt (2.1): count it, and the click guide
+            // starts recording from here.
+            m_attemptPending = false;
+            m_lvlStats.attempts++;
+            m_lifeStats.attempts++;
+            trace(fmt::format("attempt start at x={:.1f}{}", player->getPositionX(), pl->m_isPracticeMode ? " (practice)" : ""));
+        }
         m_lastStepWall = Clock::now();
 
         // Dead (and not reported through the hook): report once. Alive again
@@ -5711,6 +7723,8 @@ public:
             return;
         }
         if (m_deathReported) m_deathReported = false;
+        routeCheck(pl, player);
+        recordAnchor(pl, player);
 
         // Housekeeping a few times per frame, not every step.
         if ((m_tick & 7) == 0) {
@@ -5854,7 +7868,7 @@ constexpr char const* AUTHOR_DISCORD = "alquerez23";
 
 class BufferWindow : public CCLayer {
 public:
-    enum Tab { TAB_LOG, TAB_STATS, TAB_SETTINGS, TAB_MODES, TAB_COUNT };
+    enum Tab { TAB_LOG, TAB_STATS, TAB_SETTINGS, TAB_MODES, TAB_TOOLS, TAB_COUNT };
     static bool isList(Tab t) { return t == TAB_LOG || t == TAB_STATS; }
 
     static BufferWindow* instance() { return s_instance; }
@@ -6386,7 +8400,7 @@ protected:
 
     void buildTabs() {
         m_tabMenu->removeAllChildren();
-        char const* names[TAB_COUNT] = {"Log", "Stats", "Stage", "Modes"};
+        char const* names[TAB_COUNT] = {"Log", "Stats", "Stage", "Modes", "Tools"};
         float const y = H - TITLE_H - TABS_H / 2.f - 1.f;
         for (int i = 0; i < TAB_COUNT; i++) {
             bool const sel = i == static_cast<int>(m_tab);
@@ -6426,12 +8440,14 @@ protected:
         m_settingsMenu->setVisible(!list);
         m_settingsLabels->setVisible(!list);
         m_cards->setVisible(!list);
+        m_scanLabel = nullptr; // its label goes with m_settingsLabels
         m_listMenu->removeAllChildren();
         m_settingsMenu->removeAllChildren();
         m_settingsLabels->removeAllChildren();
         m_cards->removeAllChildren();
         if (list) buildListButtons();
         else if (t == TAB_MODES) buildModes();
+        else if (t == TAB_TOOLS) buildTools();
         else buildSettings();
         refresh();
     }
@@ -6495,6 +8511,15 @@ protected:
                 platW = m_platform->getContentSize().width * m_platform->getScale() + 8.f;
             }
             limitNodeWidth(m_footer, std::max(40.f, right - platW - (PAD + 2.f)), 0.2f, 0.12f);
+        }
+        if (m_tab == TAB_TOOLS && m_scanLabel) {
+            std::string const st = s_sim.scanStatus();
+            if (st != m_scanShown) {
+                m_scanShown = st;
+                m_scanLabel->setString(st.c_str());
+                m_scanLabel->setScale(0.42f);
+                limitNodeWidth(m_scanLabel, W - PAD - 6.f - (PAD + 88.f), 0.42f, 0.25f);
+            }
         }
         if (!isList(m_tab)) return;
         if (m_tab == TAB_LOG) {
@@ -6707,7 +8732,7 @@ protected:
         });
         addToggle(colL, 55.f, "Show paths", "show-paths", false);
         addToggle(colR, 55.f, "Learn from attempts", "learn-spots", true);
-        addToggle(colL, 39.f, "Log: show safe clicks", "log-safe-clicks", false);
+        addToggle(colL, 39.f, "Log: more detail", "log-safe-clicks", false);
         addToggle(colR, 39.f, "Small while playing", "compact-play", true);
 
         // -- Discord (2.1): a violet pill like the version badge, white bold text,
@@ -6778,6 +8803,83 @@ protected:
         hint->setAnchorPoint({1.f, 0.5f});
         hint->setPosition({W - PAD - 4.f, by});
         m_settingsLabels->addChild(hint);
+    }
+
+    // ---- Tools tab (2.1) ----------------------------------------------------------------
+    //  ASSISTS     Orb helper, Click guide (toggles + one line each)
+    //  YOUR STATS  this level / all levels, saved between sessions
+    //  REPORT      export everything to a file (and the clipboard) to send
+    void toolsLine(float x, float y, std::string const& text, ccColor3B col, float maxW, float scale = 0.42f) {
+        auto* l = CCLabelBMFont::create(text.c_str(), "chatFont.fnt");
+        l->setScale(scale);
+        l->setColor(col);
+        l->setAnchorPoint({0.f, 0.5f});
+        limitNodeWidth(l, maxW, scale, scale * 0.6f);
+        l->setPosition({x, y});
+        m_settingsLabels->addChild(l);
+    }
+    CCLabelBMFont* m_scanLabel = nullptr; // Tools tab: scan status (refreshed while shown)
+    std::string    m_scanShown;
+
+    void buildTools() {
+        float const cx = PAD, cw = W - 2.f * PAD;
+        ccColor3B const white{255, 255, 255};
+        float const bx = cx + 104.f, bw = W - PAD - 6.f - bx;
+
+        // ASSISTS (118..176)
+        card(cx, 118.f, cw, 58.f, "ASSISTS");
+        addToggle(cx + 4.f, 156.f, "Orb helper", "orb-helper", false);
+        toolsLine(bx, 156.f, "an early click waits for the next orb (up to 5 frames)", white, bw);
+        addToggle(cx + 4.f, 141.f, "Click guide", "click-guide", false);
+        toolsLine(bx, 141.f, "dots where the level scan's inputs go", white, bw);
+        addToggle(cx + 4.f, 126.f, "Snap to scan", "route-snap", false);
+        toolsLine(bx, 126.f, "early clicks wait for the scanned input (within your stage)", white, bw);
+
+        // LEVEL SCAN (64..114)
+        card(cx, 64.f, cw, 50.f, "LEVEL SCAN");
+        addToggle(cx + 4.f, 74.f, "Show scan", "scan-view", true);
+        addToggle(cx + cw * 0.36f, 74.f, "Real game (practice)", "real-scan", false);
+        boxButton(m_settingsMenu, "scan level", {cx + 44.f, 92.f}, 76.f, 14.f, C_BTN_SEL, white, 0.24f, [this] {
+            s_sim.startScan(PlayLayer::get());
+            m_scanShown.clear();
+            refresh();
+        });
+        m_scanLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_scanLabel->setScale(0.42f);
+        m_scanLabel->setColor(white);
+        m_scanLabel->setAnchorPoint({0.f, 0.5f});
+        m_scanLabel->setPosition({cx + 88.f, 92.f});
+        m_settingsLabels->addChild(m_scanLabel);
+        m_scanShown.clear();
+        toolsLine(cx + 88.f, 104.f, "play it once as far as you can, then pause + scan (stay paused)", C_MUTED,
+                  W - PAD - 6.f - (cx + 88.f), 0.36f);
+
+        // YOUR STATS + report (18..60)
+        card(cx, 18.f, cw, 42.f, "YOUR STATS");
+        boxButton(m_settingsMenu, "export report", {W - PAD - 42.f, 53.f}, 76.f, 11.f, C_BTN_SEL, white, 0.21f, [] {
+            std::string const text = s_sim.buildReport();
+            auto const file = s_sim.saveReport(text);
+            bool const copied = geode::utils::clipboard::write(text);
+#ifdef GEODE_IS_DESKTOP
+            (void)geode::utils::file::openFolder(file.parent_path());
+#endif
+            Notification::create(fmt::format("Report saved{} - {}", copied ? " and copied" : "", file.filename().string()),
+                                 NotificationIcon::None, 2.5f)->show();
+        });
+        auto const lv = s_sim.levelStats();
+        auto const life = s_sim.lifeStats();
+        std::string const name = s_sim.levelName();
+        toolsLine(cx + 6.f, 43.f,
+                  name.empty() ? std::string("This level: play one to start counting")
+                               : fmt::format("{}:  {} attempts  -  {} deaths  -  best {:.0f}%  -  {} clicks buffered",
+                                             name, lv.attempts, lv.deaths, lv.best, lv.buffered),
+                  white, cw - 12.f);
+        toolsLine(cx + 6.f, 33.f,
+                  fmt::format("All levels:  {} attempts  -  {} deaths  -  {} completions  -  {} clicks buffered",
+                              life.attempts, life.deaths, life.completions, life.buffered),
+                  white, cw - 12.f);
+        toolsLine(cx + 6.f, 23.f, "export report: Log, Stats, settings and system in one file (also copied) - send it over",
+                  C_MUTED, cw - 12.f, 0.36f);
     }
 
     // ---- custom stage row ------------------------------------------------------------
@@ -6929,6 +9031,24 @@ void windowEnsure() { BufferWindow::ensure(); }
 
 } // namespace
 
+// Level scan runner (2.1): one slice of the scan per frame while it runs. On
+// Geode's overlay so it keeps going while the level is paused.
+class ScanRunner : public CCNode {
+public:
+    static ScanRunner* create() {
+        auto* p = new ScanRunner();
+        if (p->init()) { p->autorelease(); return p; }
+        delete p;
+        return nullptr;
+    }
+    bool init() override {
+        if (!CCNode::init()) return false;
+        scheduleUpdate();
+        return true;
+    }
+    void update(float) override { s_sim.scanSlice(); }
+};
+
 #ifdef GEODE_IS_WINDOWS
 // Window Key on Windows: read the key itself every frame. Input mods (Click
 // Between Frames) take over the keyboard and Shift on its own never reaches
@@ -7069,6 +9189,9 @@ $on_mod(Loaded) {
         if (auto* p = WindowKeyPoller::create()) OverlayManager::get()->addChild(p);
     });
 #endif
+    queueInMainThread([] {
+        if (auto* p = ScanRunner::create()) OverlayManager::get()->addChild(p);
+    });
     log::info("[InputBuffer] loaded");
 }
 
@@ -7098,16 +9221,17 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        s_sim.onReset();
+        if (!s_sim.realScanning()) s_sim.onReset(); // the scan's own practice respawns aren't attempts
     }
 
     void pauseGame(bool p0) {
-        s_sim.onPause(this);
+        if (!s_sim.realScanning()) s_sim.onPause(this);
         PlayLayer::pauseGame(p0);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* gameObject) {
         if (s_sim.checkSimulationDeath(player, gameObject)) return;
+        if (s_sim.realScanDeath(this, player)) return; // real-game scan: it backs up instead
         bool const wasDead = player && player->m_isDead;
         PlayLayer::destroyPlayer(player, gameObject);
         // Only a real death counts: noclip-style mods and repeated calls while
@@ -7120,6 +9244,8 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void playEndAnimationToPos(cocos2d::CCPoint p0) {
         if (s_sim.isSimulating()) return;
+        if (s_sim.realScanEnd()) return; // real-game scan reached the end: not a completion
+        s_sim.onLevelEnd(this);
         PlayLayer::playEndAnimationToPos(p0);
     }
 
@@ -7222,7 +9348,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void update(float dt) {
-        if (s_sim.isSimulating()) {
+        if (s_sim.isSimulating() || s_sim.realScanning()) {
             PlayerObject::update(dt);
             return;
         }
@@ -7243,7 +9369,7 @@ class $modify(BufPlayerObject, PlayerObject) {
             if (!s_sim.isSimPlayer(this)) return;
         } else {
             PlayLayer* pl = PlayLayer::get();
-            if (pl && (this == pl->m_player1 || this == pl->m_player2)) s_sim.learnPad(objectType, bumpMod);
+            if (pl && !s_sim.realScanning() && (this == pl->m_player1 || this == pl->m_player2)) s_sim.learnPad(objectType, bumpMod);
         }
         PlayerObject::bumpPlayer(bumpMod, objectType, noEffects, object);
     }
@@ -7251,7 +9377,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     void ringJump(RingObject* p0, bool p1) {
         // During a test only our sim players may use orbs (that's the orb prediction).
         if (s_sim.isSimulating() && !s_sim.isSimPlayer(this)) return;
-        if (s_sim.isSimulating()) {
+        if (s_sim.isSimulating() || s_sim.realScanning()) {
             PlayerObject::ringJump(p0, p1);
             return;
         }
@@ -7286,8 +9412,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     // Once per rendered frame: feeds the frame-time meter used by the auto CPU budget.
     void update(float dt) {
         PlayLayer* pl = PlayLayer::get();
-        bool const mine = pl && static_cast<GJBaseGameLayer*>(pl) == this;
-        if (mine) s_sim.onFrame();
+        bool const mine = pl && static_cast<GJBaseGameLayer*>(pl) == this && !s_sim.realScanning();
+        if (mine) {
+            s_sim.onFrame();
+            s_sim.noteFrame(pl);
+        }
         GJBaseGameLayer::update(dt);
         if (mine) s_sim.watchdog(pl);
     }
@@ -7313,6 +9442,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        if (s_sim.realScanning()) {
+            // real-game scan: only its own inputs, untouched by the buffer
+            if (s_sim.realInputNow()) GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
         if (button == 1 && !s_sim.isSimulating() && !s_sim.isFiringBuffered()) {
             PlayLayer* pl = PlayLayer::get();
             if (pl && static_cast<GJBaseGameLayer*>(pl) == this) {
@@ -7329,7 +9463,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             GJBaseGameLayer::collisionCheckObjects(player, &filtered, static_cast<int>(filtered.size()), dt);
             return;
         }
-        if (PlayLayer* pl = PlayLayer::get(); pl && static_cast<GJBaseGameLayer*>(pl) == this) {
+        if (PlayLayer* pl = PlayLayer::get(); pl && static_cast<GJBaseGameLayer*>(pl) == this && !s_sim.realScanning()) {
             s_sim.sampleMovers(pl, player, vec, objectsCount);
         }
         GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);

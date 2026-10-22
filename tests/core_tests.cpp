@@ -1,3 +1,4 @@
+#include <optional>
 // Unit tests for src/BufferCore.hpp (no game needed).
 //   g++ -std=c++20 -O2 -I ../src core_tests.cpp -o core_tests && ./core_tests
 //
@@ -438,6 +439,14 @@ static void testLiveRetime() {
     auto b = q.poll((6 + 7 + 2) * TICK, 1e-6);
     CHECK(b && *b == false, "release not fired after postponing");
     CHECK(q.nextPush() == true && q.pending(), "queued press lost");
+    // the release behind a held press is visible to the live check
+    {
+        InputQueue h;
+        h.start(true, 0.0, 6 * TICK);
+        CHECK(h.nextOppositeAt() < 0.0, "no release yet");
+        h.push(false, 3 * TICK, TICK * 0.999);
+        CHECK(std::fabs(h.nextOppositeAt() - 9 * TICK) < 1e-9, "release at %.3f", h.nextOppositeAt());
+    }
     // never before notBefore
     InputQueue r;
     r.start(true, 5.0, 2.0);
@@ -608,7 +617,364 @@ static void testCalibrator() {
     CHECK(c.count() == Calibrator::MAX_SAMPLES, "accepted invalid sample");
 }
 
+
+// ---------------------------------------------------------------------------
+//  Clearance / moving hazards (v1.11)
+// ---------------------------------------------------------------------------
+static void testClearance() {
+    std::printf("clearance\n");
+    Box a{0, 0, 10, 10};
+    CHECK(boxGap(a, Box{5, 5, 10, 10}) < 0.f, "overlap not seen");
+    CHECK(std::fabs(boxGap(a, Box{13, 0, 5, 5}) - 3.f) < 1e-4f, "x gap");
+    CHECK(std::fabs(boxGap(a, Box{0, -6, 5, 4}) - 2.f) < 1e-4f, "y gap below");
+    CHECK(std::fabs(boxGap(a, Box{13, 14, 5, 5}) - 5.f) < 1e-4f, "corner gap (3,4,5)");
+    CHECK(boxGap(a, Box{10, 0, 5, 5}) == 0.f, "touching = 0");
+
+    CHECK(clearanceTarget(3, 30.0, 8, 1.5f, 1.f, 4.f, 1.25f) == 1.5f, "default before enough checks");
+    CHECK(std::fabs(clearanceTarget(10, 16.0, 8, 1.5f, 1.f, 4.f, 1.25f) - 2.0f) < 1e-4f, "1.6 avg -> 2.0");
+    CHECK(clearanceTarget(10, 1.0, 8, 1.5f, 1.f, 4.f, 1.25f) == 1.f, "clamped low");
+    CHECK(clearanceTarget(10, 100.0, 8, 1.5f, 1.f, 4.f, 1.25f) == 4.f, "clamped high");
+
+    MoverTrack m;
+    // steady 8 px/frame right, sampled every 0.25 frame
+    for (int i = 0; i <= 12; i++) m.sample(100 + 8.0 * 0.25 * i, 50, 1.0 + 0.25 * i, 3.0, 200.f);
+    CHECK(m.moving(4.0, 2.0, 0.05f), "steady mover not trusted (ok=%d)", m.ok);
+    CHECK(std::fabs(m.vx - 8.f) < 1e-3f && std::fabs(m.vy) < 1e-3f, "v=%.3f,%.3f", m.vx, m.vy);
+    float dx, dy;
+    m.offsetAt(m.t + 0.5, dx, dy);
+    CHECK(std::fabs(dx - 4.f) < 0.05f && std::fabs(dy) < 1e-3f, "offset %.3f,%.3f", dx, dy);
+    CHECK(!m.moving(m.t + 5.0, 2.0, 0.05f), "stale velocity used");
+
+    // moves on every other step only (uneven steps): average speed, trusted
+    MoverTrack u;
+    double xx = 0;
+    for (int i = 0; i <= 24; i++) { if (i % 2) xx += 4.0; u.sample(xx, 0, 0.25 * i, 3.0, 200.f); }
+    CHECK(u.moving(6.0, 2.0, 0.05f) && std::fabs(u.vx - 8.f) < 1.6f, "uneven mover v=%.2f ok=%d", u.vx, u.ok);
+
+    // eased move (ease-in-out over 12 frames, 120 px): trusted, and the
+    // prediction 0.5 frame ahead is within 3 px most of the time
+    {
+        MoverTrack e;
+        auto posAt = [](double tt) { // smoothstep 0..12 -> 0..120
+            double const k = std::clamp(tt / 12.0, 0.0, 1.0);
+            return 120.0 * k * k * (3.0 - 2.0 * k);
+        };
+        int good = 0, total = 0;
+        bool trusted = false;
+        for (int i = 0; i <= 48; i++) {
+            double const tt = 0.25 * i;
+            e.sample(posAt(tt), 0, tt, 3.0, 200.f);
+            if (e.moving(tt, 2.0, 0.05f)) {
+                trusted = true;
+                float ox, oy;
+                e.offsetAt(tt + 2.0, ox, oy);
+                double const real = posAt(tt + 2.0);
+                total++;
+                if (std::fabs(e.x + ox - real) < 4.0) good++;
+            }
+        }
+        CHECK(trusted, "eased mover never trusted");
+        CHECK(total > 0 && good * 10 >= total * 7, "eased prediction 2f ahead: %d/%d within 4px", good, total);
+    }
+
+    // slowing to a stop: predicted to stop, never reverse
+    {
+        MoverTrack d;
+        // v(t) = 10 - 2t px/frame, stops at t=5 (25 px)
+        auto posAt = [](double tt) { double const k = std::min(tt, 5.0); return 10.0 * k - k * k; };
+        for (int i = 0; i <= 12; i++) d.sample(posAt(0.25 * i), 0, 0.25 * i, 3.0, 200.f);
+        float ox, oy;
+        d.offsetAt(d.t + 20.0, ox, oy);
+        CHECK(d.x + ox <= 26.5 && d.x + ox >= d.x - 0.01, "decelerating mover overshot/reversed: %.2f", d.x + ox);
+    }
+
+    // erratic object (jumps back and forth): not trusted for long
+    {
+        MoverTrack er;
+        double ex[] = {0, 0, 10, 10, 0, 0, 12, 12, 0, 0, 10, 10, 0, 0, 11, 11, 0, 0, 10, 10, 0};
+        int trustedTicks = 0;
+        for (int i = 0; i < 21; i++) {
+            er.sample(ex[i], 0, 0.5 * i, 3.0, 200.f);
+            if (er.moving(0.5 * i, 2.0, 0.05f)) trustedTicks++;
+        }
+        CHECK(trustedTicks <= 4, "erratic object trusted %d times", trustedTicks);
+    }
+
+    // static object: not moving
+    MoverTrack st;
+    for (int i = 0; i < 12; i++) st.sample(5, 5, 0.25 * i, 3.0, 200.f);
+    CHECK(!st.moving(3.0, 2.0, 0.05f), "static object moving");
+
+    // teleport resets
+    MoverTrack tp;
+    for (int i = 0; i <= 12; i++) tp.sample(8.0 * 0.25 * i, 0, 0.25 * i, 3.0, 200.f);
+    tp.sample(5000, 0, 3.25, 3.0, 200.f);
+    tp.sample(5000, 0, 4.25, 3.0, 200.f);
+    CHECK(!tp.moving(4.25, 2.0, 0.05f), "teleport counted as motion");
+
+    // cleaner moment ahead
+    auto probeFrom = [](std::vector<CleanProbe> v) {
+        return [v](int k) { return k - 1 < static_cast<int>(v.size()) ? v[k - 1] : CleanProbe{true, false, 0}; };
+    };
+    CHECK(cleanerAhead(2.5f, 2.0f, 0.5f, 4, probeFrom({})) == 0, "already clean waits");
+    CHECK(cleanerAhead(0.3f, 2.0f, 0.5f, 4, probeFrom({{false, true, 0.8f}, {false, true, 2.4f}})) == 2, "should wait 2");
+    CHECK(cleanerAhead(0.3f, 2.0f, 0.5f, 4, probeFrom({{false, false, 9.f}, {false, true, 1.0f}})) == 0, "bad path counted");
+    CHECK(cleanerAhead(0.3f, 2.0f, 0.5f, 1, probeFrom({{false, true, 0.5f}, {false, true, 3.0f}})) == 0, "looked past limit");
+    CHECK(cleanerAhead(0.3f, 2.0f, 0.5f, 4, probeFrom({{true, true, 3.f}})) == 0, "stop ignored");
+    CHECK(cleanerAhead(1.8f, 2.0f, 0.5f, 4, probeFrom({{false, true, 2.1f}})) == 0, "gain rule ignored");
+}
+
+// ---------------------------------------------------------------------------
+//  Spot memory (v1.12)
+// ---------------------------------------------------------------------------
+static void testSpots() {
+    std::printf("spot memory\n");
+    SpotTol tol;
+    SpotMemory m;
+    Spot a{100.f, 50.f, 0.f, 7};
+    m.add(a, true, tol);
+    CHECK(m.at(100.4f, 51.f, 0.3f, 7, tol) == SpotHit::Good, "good spot not found");
+    CHECK(m.at(100.4f, 51.f, 0.3f, 8, tol) == SpotHit::None, "other mode matched");
+    CHECK(m.at(102.f, 50.f, 0.f, 7, tol) == SpotHit::None, "too far matched");
+    CHECK(m.at(100.f, 70.f, 0.f, 7, tol) == SpotHit::None, "other route matched");
+    CHECK(m.at(100.f, 50.f, 5.f, 7, tol) == SpotHit::None, "other jump phase matched");
+    m.add(Spot{100.2f, 50.f, 0.f, 7}, false, tol);
+    CHECK(m.size() == 1, "same spot stored twice");
+    CHECK(m.at(100.f, 50.f, 0.f, 7, tol) == SpotHit::Bad, "tie should be bad");
+    m.add(a, true, tol);
+    CHECK(m.at(100.f, 50.f, 0.f, 7, tol) == SpotHit::Good, "2 good vs 1 bad should be good");
+    m.add(Spot{103.f, 50.f, 0.f, 7}, false, tol);
+    CHECK(m.at(103.f, 50.f, 0.f, 7, tol) == SpotHit::Bad, "bad spot missing");
+    CHECK(m.goodCount() == 1 && m.badCount() == 1, "counts %d %d", m.goodCount(), m.badCount());
+
+    float d = m.goodAhead(95.f, 50.f, 7, 1.f, 20.f, tol);
+    CHECK(std::fabs(d - 5.f) < 1e-4f, "good ahead %.2f", d);
+    CHECK(m.goodAhead(95.f, 50.f, 7, 1.f, 4.f, tol) < 0.f, "beyond reach");
+    CHECK(m.goodAhead(105.f, 50.f, 7, 1.f, 20.f, tol) < 0.f, "behind counted as ahead");
+    CHECK(m.goodAhead(105.f, 50.f, 7, -1.f, 20.f, tol) > 0.f, "reverse direction");
+    CHECK(m.goodAhead(99.5f, 50.f, 7, 1.f, 20.f, tol) < 0.f, "spot we're on counted as ahead");
+
+    {
+        SpotMemory r;
+        r.deserialize(m.serialize());
+        CHECK(r.size() == m.size(), "round trip size %zu vs %zu", r.size(), m.size());
+        CHECK(r.at(100.f, 50.f, 0.f, 7, tol) == SpotHit::Good && r.at(103.f, 50.f, 0.f, 7, tol) == SpotHit::Bad,
+              "round trip lost outcomes");
+        r.deserialize("IBSPOTS 1\ngarbage\n1 2\n5 6 0 9 1 0\nnan 1 1 1 1 1\n7 8 0 9 0 0\n");
+        CHECK(r.size() == 1, "bad lines not skipped: %zu", r.size());
+        r.deserialize("");
+        CHECK(r.size() == 0, "empty file");
+    }
+
+    {
+        // a good spot recorded in another gamemode, found through anyKey
+        SpotMemory x;
+        Spot u{300.f, 80.f, 0.f, 11};
+        u.anyKey = 99;
+        x.add(u, true, tol);
+        CHECK(x.goodAhead(280.f, 60.f, 22, 1.f, 50.f, tol) < 0.f, "other mode matched without anyKey");
+        CHECK(std::fabs(x.goodAhead(280.f, 70.f, 22, 1.f, 50.f, tol, 99) - 20.f) < 1e-4f, "anyKey not used");
+        CHECK(x.goodAhead(280.f, 60.f, 22, 1.f, 50.f, tol, 98) < 0.f, "wrong anyKey matched");
+        SpotMemory y;
+        y.deserialize(x.serialize());
+        CHECK(std::fabs(y.goodAhead(280.f, 70.f, 22, 1.f, 50.f, tol, 99) - 20.f) < 1e-4f, "anyKey lost in file");
+        y.deserialize("IBSPOTS 1\n5 6 0 9 1 0\n");
+        CHECK(y.size() == 1, "old 6-column line rejected");
+    }
+
+    OutcomeTracker o;
+    CHECK(!o.input(a, 10.0), "first input returned something");
+    auto r = o.input(Spot{200.f, 0.f, 0.f, 7}, 12.0);
+    CHECK(r && r->good && r->spot.x == 100.f, "previous input not credited");
+    auto dd = o.death(20.0, 30.0);
+    CHECK(dd && !dd->good && dd->spot.x == 200.f, "death not blamed");
+    CHECK(!o.death(21.0, 30.0), "blamed twice");
+    o.input(a, 0.0);
+    CHECK(!o.poll(10.0, 30.0), "too early");
+    auto p = o.poll(31.0, 30.0);
+    CHECK(p && p->good, "survived window not good");
+    o.input(a, 0.0);
+    auto late = o.death(40.0, 30.0);
+    CHECK(late && late->good, "late death blamed on old input");
+
+    // live: a proven spot fires at once, even on the first check
+    InputQueue q;
+    LiveState st;
+    q.start(true, 0.0, 4.0);
+    st.startClick(0.0, 0.25, 4.0, 10.0);
+    auto f = liveStep(q, st, 0.25, 1e-4, [](bool) { return LiveVerdict::Proven; },
+                      [](bool) { return 2; }, [](bool) { return 10.0; });
+    CHECK(f && *f, "proven spot didn't fire");
+    CHECK(st.reason == FireReason::Proven, "reason not proven");
+
+    // fire reasons: deadline and safe
+    InputQueue q2;
+    LiveState s2;
+    q2.start(true, 0.0, 1.0);
+    s2.startClick(0.0, 0.25, 1.0, 2.0);
+    std::optional<bool> g;
+    for (double t = 0.25; t < 3.0 && !g; t += 0.25)
+        g = liveStep(q2, s2, t, 1e-4, [](bool) { return LiveVerdict::Unsafe; }, [](bool) { return 1; }, [](bool) { return 2.0; });
+    CHECK(g && s2.reason == FireReason::Deadline, "deadline reason");
+    InputQueue q3;
+    LiveState s3;
+    q3.start(true, 0.0, 1.0);
+    s3.startClick(0.0, 0.25, 1.0, 5.0);
+    auto h = liveStep(q3, s3, 0.25, 1e-4, [](bool) { return LiveVerdict::Safe; }, [](bool) { return 1; }, [](bool) { return 5.0; });
+    CHECK(h && s3.reason == FireReason::Safe, "safe reason");
+
+    // plan fallback: live refuses forever, the click still goes in at `latest`
+    InputQueue q4;
+    LiveState s4;
+    q4.start(true, 0.0, 2.0);
+    s4.startClick(0.0, 0.25, 2.0, 8.0, 2.5);
+    std::optional<bool> k;
+    double firedAt = -1;
+    for (double t = 0.25; t < 9.0 && !k; t += 0.25) {
+        k = liveStep(q4, s4, t, 1e-4, [](bool) { return LiveVerdict::Unsafe; }, [](bool) { return 2; }, [](bool) { return 8.0; });
+        if (k) firedAt = t;
+    }
+    CHECK(k && s4.reason == FireReason::Plan && std::fabs(firedAt - 2.5) < 1e-6, "plan fallback at %.2f", firedAt);
+    // a queued follower doesn't inherit it
+    q4.start(true, 0.0, 1.0);
+    q4.push(false, 0.5, 0.25);
+    s4.startClick(0.0, 0.25, 1.0, 8.0, 1.0);
+    auto first = liveStep(q4, s4, 1.0, 1e-4, [](bool) { return LiveVerdict::Unsafe; }, [](bool) { return 1; }, [](bool) { return 8.0; });
+    CHECK(first && *first, "head not fired on plan");
+    CHECK(s4.needInit, "follower not next");
+    liveStep(q4, s4, 1.25, 1e-4, [](bool) { return LiveVerdict::Unsafe; }, [](bool) { return 1; }, [](bool) { return 8.0; });
+    CHECK(s4.latest < 0.0, "follower inherited the plan fallback");
+}
+
+// Orb aim: a synthetic orb. Ticks [orbLo, orbHi] use the orb; [okLo, okHi] get you through.
+// SearchResult::guarded = after the CBF guard, before margin / aim.
+static void testGuarded() {
+    using namespace ibcore;
+    // Good on 5..20 except 6 (a 1-tick island at 5): earliest 5, guarded 7 (7 and 8 Good).
+    auto eval = [](int d) { return (d >= 5 && d <= 20 && d != 6) ? Verdict::Good : Verdict::Bad; };
+    SearchParams p;
+    p.maxDelay = 40;
+    p.dense = 12;
+    p.guard = true;
+    p.aim = 0.5f;
+    SearchResult r = searchDelay(p, eval);
+    CHECK(r.earliest == 5, "earliest %d", r.earliest);
+    CHECK(r.guarded == 7, "guarded %d", r.guarded);
+    CHECK(r.delay > r.guarded, "aim should go deeper: %d", r.delay);
+    p.aim = 0.f;
+    p.margin = 0;
+    SearchResult r2 = searchDelay(p, eval);
+    CHECK(r2.guarded == 7 && r2.delay == 7, "no aim: %d %d", r2.guarded, r2.delay);
+}
+
+static void testSpotFilter() {
+    using namespace ibcore;
+    SpotMemory m;
+    SpotTol tol;
+    for (int i = 0; i < 6; i++) {
+        Spot sp; sp.x = 100.f * i; sp.y = 0.f; sp.vy = 0.f; sp.key = (i % 2) ? 7u : 9u;
+        m.add(sp, true, tol);
+    }
+    size_t const gone = m.keepIf([](Spot const& sp) { return sp.key == 9u; });
+    CHECK(gone == 3 && m.size() == 3, "keepIf: gone %zu left %zu", gone, m.size());
+}
+
+static void testOrbAim() {
+    using namespace ibcore;
+    auto run = [](int lo, int hi, int orbLo, int orbHi, int okLo, int okHi, int maxTests = 64) {
+        int calls = 0;
+        auto pr = [&](int d) -> std::optional<AimProbe> {
+            calls++;
+            AimProbe a;
+            a.orb = d >= orbLo && d <= orbHi;
+            a.ok = a.orb && d >= okLo && d <= okHi;
+            // survival grows towards the working window (paths that almost clear it)
+            int dist = d < okLo ? okLo - d : (d > okHi ? d - okHi : 0);
+            a.dies = a.ok ? -1 : std::max(1, 20 - dist);
+            return a;
+        };
+        AimPick p = pickOrbTick(lo, hi, 24, maxTests, pr);
+        return p;
+    };
+    // short overlap: every tick, middle of the window
+    { auto p = run(0, 10, 0, 10, 4, 6); CHECK(p.best == 5 && p.runLo == 4 && p.runHi == 6, "short: best %d run %d..%d", p.best, p.runLo, p.runHi); }
+    // a 1-tick window anywhere in a long overlap (coarse step 3): always found
+    for (int w = 1; w <= 50; w++) {
+        auto p = run(0, 50, 0, 50, w, w);
+        CHECK(p.best == w, "1-tick window at %d: got %d (tested %d)", w, p.best, p.tested);
+        CHECK(p.tested <= 64, "too many tests: %d", p.tested);
+    }
+    // 1-tick window on the orb's LAST usable tick, survival flat (no gradient to follow)
+    for (int e = 3; e <= 50; e++) {
+        int calls = 0;
+        auto pr = [&](int d) -> std::optional<AimProbe> {
+            calls++;
+            AimProbe a;
+            a.orb = d <= e;
+            a.ok = d == e;
+            a.dies = a.ok ? -1 : 7;
+            return a;
+        };
+        AimPick p = pickOrbTick(0, 55, 24, 36, pr);
+        CHECK(p.best == e, "edge window at %d: got %d", e, p.best);
+    }
+    // 1-tick window with NO survival gradient anywhere in a long overlap
+    // (nothing hints where it is): found by the exhaustive fill
+    for (int w = 0; w <= 50; w++) {
+        auto pr = [&](int d) -> std::optional<AimProbe> {
+            AimProbe a; a.orb = true; a.ok = d == w; a.dies = a.ok ? -1 : 7; return a;
+        };
+        AimPick p = pickOrbTick(0, 50, 24, 64, pr);
+        CHECK(p.best == w, "flat 1-tick window at %d: got %d", w, p.best);
+    }
+    // 2-tick window: the middle rounds down (earlier tick)
+    { auto p = run(0, 40, 0, 40, 20, 21); CHECK(p.best == 20 && p.runHi == 21, "2-tick: %d", p.best); }
+    // wide window: middle of it
+    { auto p = run(0, 60, 0, 60, 10, 30); CHECK(p.runLo == 10 && p.runHi == 30 && p.best == 20, "wide: %d..%d best %d", p.runLo, p.runHi, p.best); }
+    // nothing works: no pick
+    { auto p = run(0, 40, 0, 40, 100, 100); CHECK(p.best == -1, "none: %d", p.best); }
+    // flaps only (orb never used): no pick
+    { auto p = run(0, 40, 100, 120, 100, 120); CHECK(p.best == -1, "no orb: %d", p.best); }
+    // out of time after 5 tests: stops, keeps what it has
+    {
+        int n = 0;
+        auto pr = [&](int d) -> std::optional<AimProbe> {
+            if (n++ >= 5) return std::nullopt;
+            AimProbe a; a.orb = true; a.ok = d == 3; a.dies = a.ok ? -1 : 5; return a;
+        };
+        AimPick p = pickOrbTick(0, 10, 24, 36, pr);
+        CHECK(p.outOfTime && p.tested == 5 && p.best == 3, "budget: tested %d best %d", p.tested, p.best);
+    }
+}
+
+// pushAt (2.1): a follow-up placed on time instead of keeping the held input's
+// spacing; never before the previous input + minGap; later inputs keep its spacing.
+static void testPushAt() {
+    std::printf("[pushAt]\n");
+    InputQueue q;
+    q.start(true, 1.0, 2.0);                 // press held to 3.0
+    CHECK(q.pushAt(false, 1.5, 1.5, 0.25), "pushAt refused");
+    CHECK(q.size() == 2, "size %zu", q.size());
+    CHECK(std::fabs(q.lastAt() - 3.25) < 1e-9, "release clamped after the press: %.3f", q.lastAt());
+    CHECK(!q.pushAt(false, 4.0, 1.6, 0.25), "same direction twice accepted");
+    CHECK(q.pushAt(true, 1.7, 1.7, 0.25), "second press refused");
+    CHECK(std::fabs(q.lastAt() - 3.5) < 1e-9, "second press %.3f", q.lastAt());
+    q.poll(3.0); q.poll(3.25); q.poll(3.5);
+    CHECK(!q.pending(), "still pending");
+    InputQueue r;
+    r.start(true, 1.0, 1.0);                 // press at 2.0
+    auto f = r.poll(2.0);
+    CHECK(f && *f, "press not fired");
+    CHECK(r.active() && !r.pending(), "gesture should stay open");
+    CHECK(r.pushAt(false, 2.5, 2.5, 0.25), "release refused");
+    CHECK(std::fabs(r.nextAt() - 2.5) < 1e-9, "on-time release at %.3f", r.nextAt());
+    CHECK(std::fabs(r.shift()) < 1e-9, "shift %.3f", r.shift());
+    auto g = r.poll(2.5);
+    CHECK(g && !*g && !r.active(), "gesture not closed");
+}
+
 int main() {
+    testPushAt();
     testSearch();
     testSearchExtras();
     testNarrowWindows();
@@ -619,6 +985,11 @@ int main() {
     testEscape();
     testQueue();
     testAddedDelay();
+    testClearance();
+    testSpots();
+    testOrbAim();
+    testSpotFilter();
+    testGuarded();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

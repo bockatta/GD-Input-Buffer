@@ -254,6 +254,21 @@ public:
         return true;
     }
 
+    // Like push(), but at an explicit time (2.1: a wave / ship follow-up can go
+    // in on time instead of keeping the held input's spacing). Never before the
+    // previous input + minGap. Later inputs keep the spacing of this one.
+    bool pushAt(bool pushDown, double at, double now, double minGap) {
+        if (!active()) return false;
+        if (pushDown == m_lastPush) return false;
+        if (m_events.size() >= MAX_EVENTS) { m_dropped++; return false; }
+        double const t = std::max(at, m_last + minGap);
+        m_events.push_back(Event{pushDown, t});
+        m_last = t;
+        m_lastPush = pushDown;
+        m_shift = std::max(0.0, t - now);
+        return true;
+    }
+
     std::optional<bool> poll(double now, double eps = 1e-6) {
         if (m_events.empty()) return std::nullopt;
         if (now + eps < m_events.front().at) return std::nullopt;
@@ -300,6 +315,9 @@ public:
         m_shift += delta;
     }
     bool   lastPush() const { return m_lastPush; }
+    // When the last input in the queue fires / fired (the held one, or the
+    // last one queued behind it).
+    double lastAt() const { return m_last; }
     int    dropped() const { return m_dropped; }
 
 private:

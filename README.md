@@ -42,8 +42,9 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 
 - **Log**: what the buffer did with each click: buffered, fired, raw, deaths.
 - **Stats**: prediction accuracy, your rhythm, windows, performance, and your system.
-- **Stage**: pick the stage, set Custom frames, and the options (Show paths, Learn from attempts, Log: show safe clicks, Small while playing).
+- **Stage**: pick the stage, set Custom frames, and the options (Show paths, Learn from attempts, Log: more detail, Small while playing).
 - **Modes**: switch the buffer on or off per gamemode.
+- **Tools**: Orb helper, Level scan (finds the inputs for the whole level while paused, never stops before the end), Show scan (watch it work), Real game (practice, experimental: the scan uses the real level where its own prediction can't get through), Click guide (dots for those inputs), Snap to scan (your clicks use the scan, off by default), your saved stats, and Export report (one file with everything, to send when something's off).
 
 ## Versions
 
@@ -75,7 +76,9 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 - New **System** section in Stats: OS version, device, Geometry Dash, Geode and mod versions.
 - Phones: a GD-style green pause-menu button, and a 1.5x bigger window.
 - Fixed the crash on iOS / Apple Silicon Mac when touching an orb.
+- Wave / ship: your second input is checked (on time vs. keeping spacing), holds are capped by your own rhythm, ship releases on Extreme capped at 5 frames.
+- New Tools tab: Orb helper, Level scan + Show scan + Real game + Click guide + Snap to scan, saved stats, Export report.
 - New purple logo.
-- Wave releases on Extreme: held at most 5 frames (was 12), and releases near orbs / portals no longer come out late.
+- Wave overhaul: much lighter predictions (shorter lookahead, held releases follow their plan), Extreme releases held at most 5 frames (was 12), and releases near orbs / portals no longer come out late.
 
 Every version's full changes are in [changelog.md](changelog.md).

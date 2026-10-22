@@ -36,6 +36,7 @@ How early a click can be and still get saved (60fps frames, 1 frame = 16.7 ms):
 - **Stats:** accuracy, your rhythm, windows, performance, your system
 - **Stage:** stage, Custom frames, options
 - **Modes:** buffer on / off per gamemode
+- **Tools:** Orb helper, Level scan, Show scan, Real game (practice), Click guide, Snap to scan, your saved stats, Export report
 
 ## Platforms
 
