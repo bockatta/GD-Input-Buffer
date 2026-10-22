@@ -898,6 +898,8 @@
 #include <Geode/modify/CCMouseDispatcher.hpp>
 #endif
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/GameManager.hpp>
+#include <Geode/modify/AppDelegate.hpp>
 #include <Geode/ui/BasedButtonSprite.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -4910,7 +4912,11 @@ private:
             m_tickClr = 1e9f;
             m_tickRing[0] = m_tickRing[1] = nullptr;
             resetCollisionLog(s1);
-            pl->checkCollisions(s1, dt, false);
+            // CRASH DIAGNOSTIC: temporarily skip simulated collision processing.
+            // If the access violation stops, the crash is in/under GD collision
+            // handling for the hidden simulation player. Predictions are NOT
+            // valid with this diagnostic enabled; restore/replace this after testing.
+            // pl->checkCollisions(s1, dt, false);
             if (m_simDead) { out.end = SimEnd::Died; break; }
             m_scanClr = std::min(m_scanClr, m_tickClr);
             m_prevRing[0] = m_tickRing[0]; // what it touches now = "already touching" next step
@@ -4918,7 +4924,8 @@ private:
 
             if (s2) {
                 resetCollisionLog(s2);
-                pl->checkCollisions(s2, dt, false);
+                // CRASH DIAGNOSTIC: keep player-2 simulation collision disabled too.
+                // pl->checkCollisions(s2, dt, false);
                 if (m_simDead) { out.end = SimEnd::Died; break; }
                 m_prevRing[1] = m_tickRing[1];
                 applyGdRing(s2, 1);
@@ -8228,6 +8235,23 @@ public:
         return false;
     }
 
+    // The game is rebuilding its graphics (fullscreen <-> borderless /
+    // windowed, a graphics setting, Android coming back from the background):
+    // everything drawn the window's way (its shapes, the switches, the sky)
+    // was made for the old graphics and comes out as big coloured blocks.
+    // Throw the window away now; it's built again fresh right after (2.2).
+    static void dropForReload() {
+        if (!s_instance) return;
+        s_instance->removeFromParent(); // (its destructor clears s_instance)
+        s_instance = nullptr;
+    }
+    static void rebuildSoon() {
+        dropForReload();
+        if (Mod::get()->getSavedValue<bool>("window-shown", true)) {
+            Loader::get()->queueInMainThread([] { BufferWindow::ensure(); });
+        }
+    }
+
     // Window key: flip "window shown".
     static void toggle() {
         auto* mod = Mod::get();
@@ -10261,6 +10285,27 @@ $on_mod(Loaded) {
     log::info("[InputBuffer] loaded");
 }
 
+
+// Graphics reload (fullscreen <-> borderless etc.): rebuild the window, or it
+// draws as big coloured blocks. GD shows the menu again after it, which brings
+// the window back (2.2).
+class $modify(BufGameManager, GameManager) {
+    void reloadAll(bool switchingModes, bool toFullscreen, bool borderless, bool fix, bool unused) {
+        BufferWindow::dropForReload();
+        GameManager::reloadAll(switchingModes, toFullscreen, borderless, fix, unused);
+    }
+};
+
+#ifdef GEODE_IS_ANDROID
+// Android drops the game's graphics when it goes to the background: rebuild
+// the window when it comes back.
+class $modify(BufAppDelegate, AppDelegate) {
+    void applicationWillEnterForeground() {
+        AppDelegate::applicationWillEnterForeground();
+        BufferWindow::rebuildSoon();
+    }
+};
+#endif
 
 // Show the window in the main menu too (if it's switched on).
 class $modify(BufMenuLayer, MenuLayer) {
