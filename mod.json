@@ -6,7 +6,7 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v2.1.0",
+	"version": "v2.2.0",
 	"id": "alquerez.inputbuffer",
 	"name": "Input Buffer",
 	"developer": "AlQuerez",
@@ -14,13 +14,20 @@
 	"resources": {
 		"sprites": [
 			"resources/*.png"
-		]
+		],
+		"fonts": {
+			"ibFont": {
+				"path": "resources/fonts/Poppins-Bold.ttf",
+				"size": 48,
+				"charset": "32-126"
+			}
+		}
 	},
 	"settings": {
 		"stage": {
 			"type": "string",
 			"name": "Stage",
-			"description": "How much the buffer helps (how early a click can be and still be saved). Off = raw input. Stage 1: 1 frame. Stage 2: 2 frames. Stage 3: 4 frames (3 ship / wave). Stage 4: 8 frames (5 ship / wave). Extreme: 20 frames (12 ship / wave). Custom: your own frames, set in the window (Left Alt) with Apply. F6 cycles through them.",
+			"description": "How much the buffer helps (how early a click can be and still be saved). Off = raw input. Stage 1: 1 frame. Stage 2: 2 frames. Stage 3: 3 frames (2 ship). Stage 4: 5 frames (4 wave, 2 ship). Extreme: 20 frames (12 wave, 2 ship). Custom: your own frames, set in the window (Left Alt) with Apply. F6 cycles through them.",
 			"default": "Stage 1",
 			"one-of": [
 				"Off",

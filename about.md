@@ -1,4 +1,4 @@
-# Input Buffer V2.1
+# Input Buffer V2.2
 
 **By AlQuerez23.** Discord: **alquerez23**
 
@@ -21,9 +21,9 @@ How early a click can be and still get saved (60fps frames, 1 frame = 16.7 ms):
 - **Off:** nothing (raw input)
 - **Stage 1:** 1 frame early
 - **Stage 2:** 2 frames early
-- **Stage 3:** 4 frames early (3 for ship / wave)
-- **Stage 4:** 8 frames early (5 for ship / wave)
-- **Extreme:** 20 frames early (12 for ship / wave), with live re-planning
+- **Stage 3:** 3 frames early (2 for ship)
+- **Stage 4:** 5 frames early (4 for wave, 2 for ship)
+- **Extreme:** 20 frames early (12 for wave, 2 for ship), with live re-planning
 - **Custom:** your own frames (0.5 to 30), set in the window
 
 **F6** cycles the stages.
@@ -32,14 +32,14 @@ How early a click can be and still get saved (60fps frames, 1 frame = 16.7 ms):
 
 **Left Alt** shows / hides it (or the key you set as Window Key). Or the **Input Buffer button** in the pause menu (green circle with the target icon), the way to open it on phones.
 
-- **Log:** what happened to each click
-- **Stats:** accuracy, your rhythm, windows, performance, your system
+- **Log:** what happened to each click (Windows: or in a console window)
+- **Stats** (click the version badge 5 times): accuracy, your rhythm, windows, performance, your system
 - **Stage:** stage, Custom frames, options
 - **Modes:** buffer on / off per gamemode
-- **Tools:** Orb helper, Level scan, Show scan, Real game (practice), Click guide, Snap to scan, your saved stats, Export report
+- **Tools:** Orb helper, Level scan, Show scan, Real game (practice), Snap to scan, your saved stats, Export report
 
 ## Platforms
 
-**V2.1 works on:** Windows, macOS (Apple Silicon and Intel), iOS and Android (32 and 64-bit).
+**V2.2 works on:** Windows, macOS (Apple Silicon and Intel), iOS and Android (32 and 64-bit).
 
 The full version list is in the Changelog tab.

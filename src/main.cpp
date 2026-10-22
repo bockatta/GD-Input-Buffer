@@ -939,6 +939,7 @@ namespace {
 
 struct SystemInfo {
     std::string brief;   // footer: "Windows 11", "macOS 15.1 - Apple Silicon", ...
+    std::string side;    // sidebar (2.2): "Windows 10 (22H2)" - brief with its version
     std::string full;    // Stats: with build / version numbers
     std::string device;  // Stats: chip / model, "" if unknown
 };
@@ -960,6 +961,9 @@ std::string androidProp(char const* name) {
 }
 #endif
 
+#if defined(GEODE_IS_WINDOWS) && defined(_MSC_VER)
+#pragma comment(lib, "advapi32.lib") // RegGetValueA (Windows version for the sidebar)
+#endif
 SystemInfo readSystemInfo() {
     SystemInfo si;
 #if defined(GEODE_IS_WINDOWS)
@@ -979,6 +983,19 @@ SystemInfo readSystemInfo() {
     else name = "Windows";
     si.brief = name;
     si.full = v.dwBuildNumber > 0 ? fmt::format("{} (build {})", name, v.dwBuildNumber) : name;
+    // the version people know ("22H2", older: "1909"), else the build number
+    {
+        char buf[64] = {};
+        DWORD sz = sizeof(buf);
+        std::string rel;
+        if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion",
+                         RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS) rel = buf;
+        sz = sizeof(buf);
+        if (rel.empty() && RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ReleaseId",
+                                        RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS) rel = buf;
+        if (rel.empty() && v.dwBuildNumber > 0) rel = std::to_string(v.dwBuildNumber);
+        si.side = rel.empty() ? name : fmt::format("{} ({})", name, rel);
+    }
     // Wine / Proton (Linux, Steam Deck, Mac): ntdll has Wine's own exports.
     if (nt) {
         using WineVerFn = char const*(__cdecl*)();
@@ -1149,6 +1166,12 @@ constexpr int    WAVE_GRACE_BASE         = 4;
 // going up, so a long hold read as "late" or "ignored" - past this it goes
 // through as you made it.
 constexpr int    WAVE_RELEASE_MAX_BASE   = 12;
+// Ship, light touch (2.2): a ship input is held at most 8 ticks (2 frames,
+// ~33 ms), and only for a crash in the next 24 ticks (100 ms) - anything later
+// is your next input's job. Holding ship inputs longer pulled you down off a
+// straight fly.
+constexpr int    SHIP_MAX_DELAY_BASE     = 8;
+constexpr int    SHIP_JUDGE_BASE         = 24;
 // Wave / ship (2.1): no input is held longer than this share of your own
 // rhythm (your usual hold for a press, gap for a release), and never less
 // than HOLD_DELAY_MIN_BASE. A delay longer than the gesture itself moved the
@@ -1246,9 +1269,11 @@ constexpr StageDef STAGES[] = {
     // order: cube, ufo, swing, robot, ship press, ship release, wave press, wave release
     {"Stage 1", "Stage 1: 1 frame",                       true,  false, {1, 1, 1, 1, 1, 1, 1, 1}},
     {"Stage 2", "Stage 2: 2 frames",                      true,  false, {2, 2, 2, 2, 2, 2, 2, 2}},
-    {"Stage 3", "Stage 3: 4 frames (3 ship / wave)",      true,  false, {4, 4, 4, 4, 3, 3, 3, 3}},
-    {"Stage 4", "Stage 4: 8 frames (5 ship / wave)",      true,  false, {8, 8, 8, 8, 5, 5, 5, 5}},
-    {"Extreme", "EXTREME: 20 frames (12 ship / wave)",    true,  true,  {8, 8, 8, 8, 5, 5, 5, 5}},
+    // 2.2: Stage 3 / 4 were 4 / 8 frames - a big jump from Stage 2 that held
+    // clicks too long ("too harsh"). Now an even climb: 1, 2, 3, 5 frames.
+    {"Stage 3", "Stage 3: 3 frames (2 ship)",             true,  false, {3, 3, 3, 3, 2, 2, 3, 3}},
+    {"Stage 4", "Stage 4: 5 frames (4 wave, 2 ship)",     true,  false, {5, 5, 5, 5, 2, 2, 4, 4}},
+    {"Extreme", "EXTREME: 20 frames (12 wave, 2 ship)",   true,  true,  {8, 8, 8, 8, 5, 5, 5, 5}},
     // Your own frames (window's Stage tab, Apply). Windows are filled in by Config::load.
     {"Custom",  "CUSTOM",                                 true,  true,  {0, 0, 0, 0, 0, 0, 0, 0}},
 };
@@ -1351,7 +1376,7 @@ struct Config {
         c.hudVerbose = mod->getSavedValue<bool>("log-safe-clicks", false);
         c.overlay    = mod->getSavedValue<bool>("show-paths", false);
         c.orbHelper  = mod->getSavedValue<bool>("orb-helper", false);
-        c.clickGuide = mod->getSavedValue<bool>("click-guide", false);
+        c.clickGuide = false; // removed in 2.2
         c.routeSnap  = mod->getSavedValue<bool>("route-snap", false);
         c.scanView   = mod->getSavedValue<bool>("scan-view", true);
         c.realScan   = mod->getSavedValue<bool>("real-scan", false);
@@ -2027,6 +2052,88 @@ ccColor3B logTagColor(std::string const& tag) {
 void windowEnsure();   // defined with BufferWindow (section 9)
 
 // ----------------------------------------------------------------------------
+//  Log console (2.2, Windows): the Log in its own command-prompt window
+//  instead of the window's Log tab. Its close button is taken away - closing
+//  a console window would close the game with it; the Log tab's "console"
+//  button closes it.
+// ----------------------------------------------------------------------------
+struct LogConsole {
+    static inline bool s_on = false;
+    static inline bool s_ours = false; // we opened it (Geode's own console stays)
+#ifdef GEODE_IS_WINDOWS
+    static inline HANDLE s_out = nullptr;
+    static BOOL WINAPI ctrlHandler(DWORD type) {
+        return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE; // Ctrl+C doesn't kill the game
+    }
+#endif
+    static bool available() {
+#ifdef GEODE_IS_WINDOWS
+        return true;
+#else
+        return false;
+#endif
+    }
+    static bool on() { return s_on; }
+    static bool open() {
+#ifdef GEODE_IS_WINDOWS
+        if (s_on) return true;
+        if (!GetConsoleWindow()) {
+            if (!AllocConsole()) return false;
+            s_ours = true;
+        }
+        s_out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+        if (s_out == INVALID_HANDLE_VALUE) s_out = nullptr;
+        SetConsoleTitleA("Input Buffer - Log");
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCtrlHandler(ctrlHandler, TRUE);
+        if (HWND w = GetConsoleWindow()) {
+            if (HMENU m = GetSystemMenu(w, FALSE)) DeleteMenu(m, SC_CLOSE, MF_BYCOMMAND);
+        }
+        s_on = true;
+        write("Input Buffer log - every buffered click, release and death shows up here.", {198, 166, 255});
+        write("Close it with the console button on the Log tab (closing this window would close the game).", {150, 150, 170});
+        return true;
+#else
+        return false;
+#endif
+    }
+    static void close() {
+#ifdef GEODE_IS_WINDOWS
+        if (!s_on) return;
+        s_on = false;
+        if (s_out) CloseHandle(s_out);
+        s_out = nullptr;
+        if (s_ours) {
+            FreeConsole();
+            s_ours = false;
+        } else if (HWND w = GetConsoleWindow()) {
+            GetSystemMenu(w, TRUE); // Geode's console: give its close button back
+        }
+#endif
+    }
+    static void write(std::string const& line, ccColor3B col) {
+#ifdef GEODE_IS_WINDOWS
+        if (!s_on || !s_out) return;
+        WORD attr = 0;
+        if (col.r > 140) attr |= FOREGROUND_RED;
+        if (col.g > 140) attr |= FOREGROUND_GREEN;
+        if (col.b > 140) attr |= FOREGROUND_BLUE;
+        if (attr == 0) attr = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+        if (std::max({col.r, col.g, col.b}) > 200) attr |= FOREGROUND_INTENSITY;
+        SetConsoleTextAttribute(s_out, attr);
+        std::string const text = line + "\n";
+        DWORD n = 0;
+        WriteConsoleA(s_out, text.data(), static_cast<DWORD>(text.size()), &n, nullptr);
+        SetConsoleTextAttribute(s_out, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+#else
+        (void)line;
+        (void)col;
+#endif
+    }
+};
+
+// ----------------------------------------------------------------------------
 //  7. TrajectoryBufferSim - the engine
 //
 //  Flow of one click (interceptInput):
@@ -2580,6 +2687,10 @@ public:
     // ------------------------------------------------------------------------
     static constexpr size_t MAX_TRACE = 2000;
     void trace(std::string line) {
+        // console + "Log: more detail": every click's decision too (log lines are shown already)
+        if (LogConsole::on() && line.rfind("log ", 0) != 0 && cfg().hudVerbose) {
+            LogConsole::write(fmt::format("{:8.2f}s  {}", levelMs() / 1000.f, line), ccColor3B{150, 150, 170});
+        }
         m_trace.push_back(fmt::format("{:9.3f} {}", levelMs() / 1000.f, line));
         while (m_trace.size() > MAX_TRACE) m_trace.pop_front();
     }
@@ -2760,7 +2871,8 @@ public:
     // (pink) - a white line from each press to its release. No text. Drawn
     // once into the level (it scrolls with it).
     void drawGuide(PlayLayer* pl) {
-        bool const on = cfg().clickGuide && pl && pl->m_objectLayer;
+        // Click guide removed in 2.2 (the scan still feeds Snap To Scan).
+        bool const on = false && pl && pl->m_objectLayer;
         if (!on) {
             if (m_guideNode.data()) m_guideNode->clear();
             return;
@@ -4018,8 +4130,8 @@ public:
                          Loader::get()->getVersion().toVString(), Loader::get()->getGameVersion()));
         line(fmt::format("system: {}  device: {}", systemInfo().full, systemInfo().device));
         line(fmt::format("level: {} ({})  in level: {}", m_lvlName, m_lvlKey, PlayLayer::get() ? "yes" : "no"));
-        line(fmt::format("stage: {}  orb helper: {}  click guide: {}  show paths: {}  learn: {}  detail log: {}",
-                         STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].name, c.orbHelper, c.clickGuide, c.overlay,
+        line(fmt::format("stage: {}  orb helper: {}  snap to scan: {}  show paths: {}  learn: {}  detail log: {}",
+                         STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].name, c.orbHelper, c.routeSnap, c.overlay,
                          c.learnSpots, c.hudVerbose));
         line("");
         line("== Stats ==");
@@ -4983,6 +5095,10 @@ private:
 
     // Record one click decision (stats always, text only if a log is enabled).
     void note(Config const& c, ModeInfo const& mode, float dt, ClickNote const& n) {
+        m_devNote = n;
+        m_devNoteMode = mode.name();
+        m_devNoteAt = m_gameTime;
+        m_devNoteHave = true;
         m_stats.clicks++;
         m_stats.byDecision[static_cast<int>(n.d)]++;
         if (n.us > 0) {
@@ -5070,6 +5186,7 @@ private:
         trace(fmt::format("log {} {}", tag, text));
         m_logVersion++;
         float const t = levelMs() / 1000.f;
+        if (LogConsole::on()) LogConsole::write(fmt::format("{:8.2f}s  {:<6}  {}", t, tag, text), logTagColor(tag));
         if (!m_history.empty() && m_history.back().text == text && m_history.back().tag == tag) {
             m_history.back().repeat++;
             m_history.back().t = t;
@@ -5189,7 +5306,10 @@ private:
         if (!m_active)  return "INPUT BUFFER  OFF (practice only)";
         if (c.custom)   return "INPUT BUFFER  CUSTOM";
         if (c.extreme)  return "INPUT BUFFER  EXTREME";
-        return "INPUT BUFFER  ON";
+        // the stage (2.2: it used to just say ON)
+        std::string st = STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].setting;
+        for (auto& ch : st) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return "INPUT BUFFER  " + st;
     }
 
     ccColor3B headerColor(Config const& c) const {
@@ -6157,6 +6277,108 @@ public:
     }
 
     void clearHistory() { m_history.clear(); m_logVersion++; }
+
+    // ---- Dev tab (2.2): what's going on right now, for working on the mod ----
+    ClickNote   m_devNote;
+    std::string m_devNoteMode;
+    double      m_devNoteAt = 0.0;
+    bool        m_devNoteHave = false;
+
+    std::vector<Row> devRows() {
+        std::vector<Row> rows;
+        auto head = [&](std::string const& t) {
+            if (!rows.empty()) rows.emplace_back("", COL_WHITE);
+            rows.emplace_back("\x01" + t, COL_WHITE);
+        };
+        auto kv = [&](std::string const& k, std::string const& v, ccColor3B col = COL_WHITE) { rows.emplace_back(k + "\t" + v, col); };
+        float const dt = getValidDt();
+        PlayLayer* pl = PlayLayer::get();
+        PlayerObject* p = pl ? pl->m_player1 : nullptr;
+        head("Player");
+        if (p) {
+            ModeInfo mi;
+            mi.add(p);
+            kv("Mode", fmt::format("{}{}{}", mi.name(), p->m_isUpsideDown ? ", upside down" : "",
+                                   pl->m_gameState.m_isDualMode ? ", dual" : ""));
+            kv("Position", fmt::format("x {:.1f}  y {:.1f}", p->getPositionX(), p->getPositionY()));
+            kv("Y speed", fmt::format("{:.3f}", p->m_yVelocity));
+            kv("On ground", p->m_isOnGround ? "yes" : "no");
+            kv("Holding (game / button)", fmt::format("{} / {}", m_gameHolding ? "yes" : "no", m_physicalHolding ? "yes" : "no"));
+            kv("Speed / size", fmt::format("{:.2f} / {:.2f}", p->m_playerSpeed, p->m_vehicleSize));
+            kv("Dead", p->m_isDead ? "yes" : "no", p->m_isDead ? COL_ORANGE : COL_WHITE);
+        } else {
+            kv("Level", "not in a level");
+        }
+        kv("TPS / FPS", fmt::format("{} / {}", static_cast<int>(std::lround(60.0f / dt)),
+                                    static_cast<int>(std::lround(1e6f / std::max(1.f, m_frameUs)))));
+        head("Last input");
+        if (m_devNoteHave) {
+            ClickNote const& n = m_devNote;
+            kv("Input", fmt::format("{} [{}], {:.2f}s ago", n.push ? "press" : "release", m_devNoteMode,
+                                    std::max(0.0, (m_gameTime - m_devNoteAt) / 60.0)));
+            kv("Decision", decisionName(n.d), n.d == Decision::Buffered ? COL_GREEN : COL_WHITE);
+            kv("Delay / window", fmt::format("{}t / {}t ({:.2f} / {:.2f} frames)", n.delay, n.windowTicks,
+                                             n.delay * dt, n.windowTicks * dt));
+            kv("Click as made", n.r0.end == SimEnd::Died
+                                    ? fmt::format("dies in {}t ({})", n.r0.ticks, deathWhat(n.r0))
+                                    : fmt::format("{} ({}t looked at)", simEndName(n.r0.end), n.r0.ticks),
+               n.r0.end == SimEnd::Died ? COL_ORANGE : COL_WHITE);
+            kv("Search", fmt::format("{} delays tested, {} us, lookahead {}t", n.evals, n.us, n.horizon));
+            std::string flags;
+            auto f = [&](bool b, char const* t) { if (b) flags += flags.empty() ? t : std::string(", ") + t; };
+            f(n.orb, "orb"); f(n.stream, "wave stream"); f(n.rescue, "rescue"); f(n.portal, "portal");
+            f(n.orbHelp, "orb helper"); f(n.route, "snapped to scan");
+            if (!flags.empty()) kv("Flags", flags);
+        } else {
+            kv("Input", "none yet");
+        }
+        head("Queue");
+        kv("Waiting inputs", fmt::format("{} (shift {:.2f} frames)", m_queue.size(), m_queue.shift()));
+        kv("Live check", m_live ? "on" : "off");
+        head("Your rhythm");
+        for (auto [w, name] : {std::pair{W_SHIP, "Ship"}, std::pair{W_WAVE, "Wave"}}) {
+            kv(fmt::format("{} hold / gap", name),
+               fmt::format("{:.1f}f / {:.1f}f ({} / {} samples)", rhythm(m_holdLen[w], DEFAULT_TAP_FRAMES),
+                           rhythm(m_gapLen[w], DEFAULT_GAP_FRAMES), m_holdLen[w].count(), m_gapLen[w].count()));
+        }
+        kv("Ship limits", fmt::format("held up to {}t, judged {}t ahead", SHIP_MAX_DELAY_BASE, SHIP_JUDGE_BASE));
+        head("Prediction (one tick)");
+        if (m_oneStep.empty()) kv("Checks", "none yet (turn on Log: More Detail)");
+        for (auto const& [mode, o] : m_oneStep) {
+            if (o.n == 0) continue;
+            double const pct = 100.0 * o.exact / o.n;
+            kv(mode, fmt::format("{:.0f}% of {}, worst {:.2f}px", pct, o.n, o.worst),
+               pct >= 99.0 ? COL_GREEN : pct >= 90.0 ? COL_YELLOW : COL_ORANGE);
+        }
+        head("Scan");
+        kv("Status", scanStatus());
+        kv("Versions / history", fmt::format("{} / {}", m_beam.size(), m_beamHist.size()));
+        kv("Backups / runs / real / skips", fmt::format("{} / {} / {} / {}", m_scanBackups, m_scanJumps, m_scanReal, m_scanSkips));
+        kv("Saved run states", std::to_string(m_anchors.size()));
+        kv("Route inputs", std::to_string(m_route.size()));
+        return rows;
+    }
+    // Dev tab "Copy All": the tab plus the newest trace lines.
+    std::string devCopyText() {
+        std::string out = fmt::format("Input Buffer dev info - {} - {}\n", Mod::get()->getVersion().toVString(), systemInfo().full);
+        for (auto const& r : devRows()) {
+            std::string t = r.first;
+            if (!t.empty() && t[0] == '\x01') { out += "\n== " + t.substr(1) + " ==\n"; continue; }
+            for (auto& ch : t) if (ch == '\t') ch = ':';
+            out += t + "\n";
+        }
+        out += "\n== Trace (newest 80) ==\n";
+        size_t const from = m_trace.size() > 80 ? m_trace.size() - 80 : 0;
+        for (size_t i = from; i < m_trace.size(); i++) out += m_trace[i] + "\n";
+        return out;
+    }
+    // Console just opened: what's in the Log so far, oldest first.
+    void dumpLogToConsole() {
+        for (auto const& h : m_history) {
+            std::string const rep = h.repeat > 1 ? fmt::format(" (x{})", h.repeat) : std::string();
+            LogConsole::write(fmt::format("{:8.2f}s  {:<6}  {}{}", h.t, h.tag, h.text, rep), logTagColor(h.tag));
+        }
+    }
     // Latest Log line (for the in-game pill).
     bool lastLog(std::string& tag, std::string& text, ccColor3B& color) const {
         if (m_history.empty()) return false;
@@ -6598,6 +6820,8 @@ public:
         if (x.landRule && r.landTick >= 0 && r.ticks > r.landTick + scaleTicks(LAND_GRACE_BASE, x.s)) return true;
         if (!x.canEscape) return false;
         int const deadTicks = r.ticks;
+        // Ship (2.2): a crash further than 100 ms out isn't this input's fault.
+        if (x.mode.ship && !x.mode.wave && deadTicks > scaleTicks(SHIP_JUDGE_BASE, x.s)) return true;
         int commit = scaleTicks(ESCAPE_COMMIT_BASE, x.s); // deaths before this are the click's fault
         int react  = scaleTicks(ESCAPE_FOLLOW_BASE, x.s); // earliest follow-up we assume
         // Ship / wave: your next input comes at YOUR rhythm (median hold after a
@@ -7062,6 +7286,8 @@ public:
                                      static_cast<int>(std::lround(HOLD_DELAY_FRAC * opp / dt)));
             maxDelay = std::min(maxDelay, cap);
         }
+        // Ship, light touch (2.2): small corrections only, on every stage.
+        if (mode.ship && !mode.wave) maxDelay = std::min(maxDelay, scaleTicks(SHIP_MAX_DELAY_BASE, s));
 
         // CPU budget: the manual cap, further capped to a share of the frame time
         // when Auto is on (extreme gets a bigger share since it searches more).
@@ -7828,10 +8054,26 @@ std::string showHowTo() {
 
 // Window key name for on-screen hints ("Left Alt"), from the Window Key
 // setting. cocos key codes are Windows virtual-key codes.
-std::string windowKeyName() {
+// Any key you bound (2.2): its name, with Ctrl / Shift / Alt if you added them.
+std::string keyNameFor(Keybind const& b, char const* fallback);
+[[maybe_unused]] std::string windowKeyName() {
     auto const binds = Mod::get()->getSettingValue<std::vector<Keybind>>("window-key-v3");
     if (binds.empty()) return "the Window Key";
-    int const vk = static_cast<int>(binds.front().key);
+    return keyNameFor(binds.front(), "the Window Key");
+}
+// The Stage Cycle Key you set ("F6").
+[[maybe_unused]] std::string cycleKeyName() {
+    auto const binds = Mod::get()->getSettingValue<std::vector<Keybind>>("cycle-key");
+    if (binds.empty()) return "";
+    return keyNameFor(binds.front(), "");
+}
+std::string keyNameFor(Keybind const& b, char const* fallback) {
+    // with modifiers, Geode's own name says it all ("Ctrl+Shift+X")
+    if (b.modifiers != KeyboardModifier::None) {
+        std::string const t = b.toString();
+        return t.empty() ? std::string(fallback) : t;
+    }
+    int const vk = static_cast<int>(b.key);
     switch (vk) {
         case 0xA4: return "Left Alt";
         case 0xA5: return "Right Alt";
@@ -7854,7 +8096,9 @@ std::string windowKeyName() {
     }
     if (vk >= 0x70 && vk <= 0x87) return fmt::format("F{}", vk - 0x70 + 1);
     if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A)) return std::string(1, static_cast<char>(vk));
-    return "the Window Key";
+    // anything else: Geode's name for it
+    std::string const t = b.toString();
+    return t.empty() ? std::string(fallback) : t;
 }
 
 constexpr char const* AUTHOR_NAME    = "AlQuerez23";
@@ -7863,13 +8107,82 @@ constexpr float PLATFORM_WINDOW_SCALE = 1.5f; // window size on iOS / Android (2
 #else
 constexpr float PLATFORM_WINDOW_SCALE = 1.0f;
 #endif
-constexpr char const* TITLE_BADGE = "V2.1"; // the badge next to the title
+constexpr char const* TITLE_BADGE = "V2.2"; // the badge next to the title
 constexpr char const* AUTHOR_DISCORD = "alquerez23";
+
+// ----------------------------------------------------------------------------
+//  Window text (2.2): one smooth bold font for the whole window - Poppins
+//  Bold, bundled with the mod (resources/fonts, SIL Open Font License, see
+//  OFL.txt there). The window's code keeps GD-font sizes: a label made "as
+//  bigFont" or "as chatFont" is scaled to come out the size that GD font
+//  would have been (measured once). If the bundled font isn't there, it falls
+//  back to GD's own font.
+// ----------------------------------------------------------------------------
+class IBLabel : public CCLabelBMFont {
+public:
+    float m_k = 1.f; // drawn scale = asked scale * m_k
+
+    static char const* fontFile() { return "ibFont.fnt"_spr; }
+    static bool fontReady() {
+        static int ok = -1;
+        if (ok < 0) {
+            auto* fu = CCFileUtils::sharedFileUtils();
+            auto const path = fu->fullPathForFilename(fontFile(), false);
+            ok = fu->isFileExist(path) ? 1 : 0;
+        }
+        return ok == 1;
+    }
+    static float factor(bool big) {
+        static float kBig = -1.f, kChat = -1.f;
+        if (kBig < 0.f) {
+            kBig = kChat = 1.f;
+            if (fontReady()) {
+                auto h = [](char const* font) {
+                    auto* l = CCLabelBMFont::create("AgH", font);
+                    return l ? l->getContentSize().height : 0.f;
+                };
+                float const mine = h(fontFile()), big = h("bigFont.fnt"), chat = h("chatFont.fnt");
+                if (mine > 0.f && big > 0.f) kBig = big / mine * 1.0f;
+                if (mine > 0.f && chat > 0.f) kChat = chat / mine * 1.18f; // a bit bigger: easier to read
+            }
+        }
+        return big ? kBig : kChat;
+    }
+    // `gdFont`: "bigFont.fnt" or "chatFont.fnt" - which GD font's sizes the caller uses
+    static IBLabel* make(char const* text, char const* gdFont) {
+        bool const big = std::strcmp(gdFont, "bigFont.fnt") == 0;
+        bool const mine = fontReady();
+        auto* l = new IBLabel();
+        if (!l->initWithString(text, mine ? fontFile() : gdFont, -1.f, kCCTextAlignmentLeft, CCPoint{0.f, 0.f})) {
+            return nullptr; // (cocos frees a label whose init fails)
+        }
+        l->autorelease();
+        l->m_k = mine ? factor(big) : 1.f;
+        l->setScale(1.f);
+        return l;
+    }
+    void setScale(float s) override { CCLabelBMFont::setScale(s * m_k); }
+};
 
 class BufferWindow : public CCLayer {
 public:
-    enum Tab { TAB_LOG, TAB_STATS, TAB_SETTINGS, TAB_MODES, TAB_TOOLS, TAB_COUNT };
-    static bool isList(Tab t) { return t == TAB_LOG || t == TAB_STATS; }
+    enum Tab { TAB_LOG, TAB_STATS, TAB_SETTINGS, TAB_MODES, TAB_TOOLS, TAB_DEV, TAB_COUNT };
+    static bool isList(Tab t) { return t == TAB_LOG || t == TAB_STATS || t == TAB_DEV; }
+    // Dev mode (2.2): hidden; clicking the version badge 5 times turns it on /
+    // off. It shows the Stats and Dev tabs.
+    static bool devOn() { return Mod::get()->getSavedValue<bool>("dev-tab", false); }
+    static bool tabShown(int t) { return (t != TAB_STATS && t != TAB_DEV) || devOn(); }
+    // a tab's row in the sidebar (hidden tabs take no room)
+    static int tabSlot(int t) {
+        int slot = 0;
+        for (int i = 0; i < t; i++) if (tabShown(i)) slot++;
+        return slot;
+    }
+    static int tabSlotsShown() {
+        int n = 0;
+        for (int i = 0; i < TAB_COUNT; i++) if (tabShown(i)) n++;
+        return n;
+    }
 
     static BufferWindow* instance() { return s_instance; }
 
@@ -7927,17 +8240,21 @@ public:
         mod->setSavedValue<bool>("window-shown", on);
         s_sim.settingsChanged();
         if (on) ensure();
-        else if (s_instance) s_instance->setVisible(false);
+        else if (s_instance) s_instance->popOut();
     }
 
 protected:
     static inline BufferWindow* s_instance = nullptr;
 
     // Layout (window-local units; the whole window is scaled by "Window Size").
+    // 2.2: a sidebar on the left (title + the tabs), the page on the right.
+    // W is the PAGE width - every page is laid out in page coordinates.
+    static constexpr float SIDE_W  = 88.f;
     static constexpr float W       = 320.f;
-    static constexpr float H       = 214.f;
+    static constexpr float FULL_W  = SIDE_W + W;
+    static constexpr float H       = 198.f;
     static constexpr float TITLE_H = 18.f;
-    static constexpr float TABS_H  = 16.f;
+    static constexpr float TABS_H  = 0.f;   // (the tabs are in the sidebar)
     static constexpr float FOOT_H  = 14.f;
     static constexpr float LINE_H  = 11.f;
     static constexpr float PAD     = 6.f;
@@ -7947,20 +8264,27 @@ protected:
     static constexpr int   PRIO_WINDOW = -510; // window body: swallows touches inside it
     static constexpr int   PRIO_MENUS  = -520; // its buttons: ahead of the body
 
-    // Palette (1.25.7): midnight blue fading up into purple, violet accents.
-    static inline const ccColor3B C_FRAME   = {9, 8, 24};
-    static inline const ccColor4B C_GRAD_TOP = {48, 24, 86, 235};   // body gradient: purple at the top...
-    static inline const ccColor4B C_GRAD_BOT = {11, 13, 38, 235};   // ...midnight at the bottom
-    static inline const ccColor3B C_CARD    = {28, 20, 58};
-    static inline const ccColor3B C_BTN     = {50, 38, 92};         // button / tab box
-    static inline const ccColor3B C_BTN_SEL = {128, 76, 236};       // selected tab / stage
+    // Palette (2.2): dark glass with a purple hue - near-black panels, soft
+    // violet edges, one bright violet accent.
+    static inline const ccColor3B C_FRAME   = {13, 10, 24};
+    static inline const ccColor3B C_EDGE    = {64, 50, 108};        // outline around the window / cards
+    static inline const ccColor4B C_GRAD_TOP = {34, 24, 60, 240};   // page: dusk purple at the top...
+    static inline const ccColor4B C_GRAD_BOT = {16, 12, 30, 240};   // ...near black at the bottom
+    static inline const ccColor3B C_SIDE    = {20, 15, 36};         // sidebar
+    static inline const ccColor3B C_SIDE_SEL = {66, 48, 118};       // selected tab in the sidebar
+    static inline const ccColor3B C_CARD    = {29, 22, 50};
+    static inline const ccColor3B C_CARD_EDGE = {56, 44, 94};
+    static inline const ccColor3B C_BTN     = {46, 37, 78};         // button box
+    static inline const ccColor3B C_BTN_SEL = {136, 88, 246};       // selected stage / main buttons
     static inline const ccColor3B C_BTN_HOT = {196, 72, 168};       // unsaved Apply
-    static inline const ccColor3B C_PILL    = {36, 26, 70};
-    static inline const ccColor3B C_LAV     = {198, 166, 255};      // card titles
-    static inline const ccColor3B C_MUTED   = {168, 158, 205};
-    static inline const ccColor3B C_DIM     = {120, 110, 160};
+    static inline const ccColor3B C_SW_OFF  = {62, 54, 92};         // switch track, off
+    static inline const ccColor3B C_PILL    = {34, 26, 60};
+    static inline const ccColor3B C_LAV     = {200, 172, 255};      // card titles
+    static inline const ccColor3B C_MUTED   = {192, 183, 228};  // secondary text (brighter in 2.2)
+    static inline const ccColor3B C_DIM     = {146, 136, 186};
 
     Tab   m_tab = TAB_LOG;
+    bool  m_shownOnce = false;
     int   m_offset = 0;            // first visible row
     CCNode*        m_body = nullptr;     // the full window (everything below is in here)
     CCNode*        m_pill = nullptr;     // small pill shown instead while a level runs
@@ -7993,6 +8317,14 @@ protected:
     CCLayerColor*  m_scrollThumb = nullptr;
     CCLabelBMFont* m_footer = nullptr;
     CCLabelBMFont* m_platform = nullptr; // footer, right: "Windows 11" etc. (2.1)
+    CCNode* m_page = nullptr;      // the page (right of the sidebar); pages use its coordinates
+    CCNode* m_stars = nullptr;     // background shooting stars
+    float   m_badgeW = 20.f;
+    int     m_badgeTaps = 0;
+    float   m_badgeTapAge = 0.f;
+    float   m_starIn = 0.f;        // seconds until the next one
+    unsigned m_starSeed = 12345u;
+    CCLabelBMFont* m_pageTitle = nullptr;
     CCMenu* m_titleMenu = nullptr; // close button
     CCMenu* m_tabMenu = nullptr;
     CCMenu* m_listMenu = nullptr;  // scroll arrows / list buttons
@@ -8018,7 +8350,7 @@ protected:
     bool init() override {
         if (!CCLayer::init()) return false;
         s_instance = this;
-        setContentSize({W, H});
+        setContentSize({FULL_W, H});
         ignoreAnchorPointForPosition(false);
         setAnchorPoint({0.f, 0.f});
 
@@ -8034,89 +8366,124 @@ protected:
         // Everything lives in m_body (centred anchor, so it can pop in from the
         // middle); the in-game pill is a sibling.
         m_body = CCNode::create();
-        m_body->setContentSize({W, H});
+        m_body->setContentSize({FULL_W, H});
         m_body->setAnchorPoint({0.5f, 0.5f});
-        m_body->setPosition({W / 2.f, H / 2.f});
+        m_body->setPosition({FULL_W / 2.f, H / 2.f});
         this->addChild(m_body, 0);
 
-        // Frame, then the body: a vertical gradient, purple at the top fading
-        // into midnight blue at the bottom (inset so the frame's round corners
-        // stay visible).
-        m_body->addChild(panel(W, H, C_FRAME, op(245.f), 7.f), 0);
+        // Frame: a soft violet edge around a near-black glass panel.
+        auto* edge = panel(FULL_W, H, C_EDGE, op(150.f), 10.f);
+        m_body->addChild(edge, 0);
+        auto* frame = panel(FULL_W - 2.f, H - 2.f, C_FRAME, op(245.f), 9.f);
+        frame->setPosition({1.f, 1.f});
+        m_body->addChild(frame, 0);
+
+        // Sidebar panel.
+        auto* side = panel(SIDE_W - 4.f, H - 8.f, C_SIDE, op(235.f), 7.f);
+        side->setPosition({4.f, 4.f});
+        m_body->addChild(side, 0);
+
+        // The page (right of the sidebar): its own node, so every page keeps
+        // its own coordinates (0..W).
+        m_page = CCNode::create();
+        m_page->setContentSize({W, H});
+        m_page->setPosition({SIDE_W, 0.f});
+        m_body->addChild(m_page, 1);
+
+        // Page background: dusk purple fading to black.
         ccColor4B gTop = C_GRAD_TOP, gBot = C_GRAD_BOT;
         gTop.a = op(gTop.a);
         gBot.a = op(gBot.a);
-        auto* body = CCLayerGradient::create(gTop, gBot);
-        body->setContentSize({W - 6.f, H - TITLE_H - FOOT_H - 1.f});
-        body->setPosition({3.f, FOOT_H});
-        m_body->addChild(body, 0);
+        // (rounded corners, 2.2 - a gradient layer is a plain box)
+        auto* body = CCDrawNode::create();
+        roundedGradient(body, W - 8.f, H - TITLE_H - FOOT_H - 3.f, 7.f, gTop, gBot);
+        body->setPosition({3.f, FOOT_H + 1.f});
+        m_page->addChild(body, 0);
 
-        // Accent line under the title: violet into pink.
-        m_accent = CCLayerGradient::create(ccColor4B{150, 90, 255, 230}, ccColor4B{235, 90, 200, 230}, CCPoint{1.f, 0.f});
-        m_accent->setContentSize({W - 16.f, 1.f});
-        m_accent->setPosition({8.f, H - TITLE_H});
-        m_body->addChild(m_accent, 1);
+        // Shooting stars behind the page (2.2). (The galaxy is only in the
+        // sidebar - behind the page it made the text hard to read.)
+        m_stars = CCNode::create();
+        m_page->addChild(m_stars, 0);
 
-        // Title + "by AlQuerez".
-        // White title (goldFont's yellow is baked into the font, so it can't be tinted white).
-        auto* title = CCLabelBMFont::create("Input Buffer", "bigFont.fnt");
-        title->setScale(0.38f);
+        // Accent line under the page header: violet into pink.
+        m_accent = CCLayerGradient::create(ccColor4B{150, 90, 255, 200}, ccColor4B{235, 90, 200, 120}, CCPoint{1.f, 0.f});
+        m_accent->setContentSize({W - 14.f, 1.f});
+        m_accent->setPosition({6.f, H - TITLE_H});
+        m_page->addChild(m_accent, 1);
+
+        // ---- sidebar: title, version + author, the tabs, the system ----
+        auto* title = IBLabel::make("Input Buffer", "bigFont.fnt");
+        title->setScale(0.44f);
+        limitNodeWidth(title, SIDE_W - 16.f, 0.44f, 0.15f);
         title->setColor({255, 255, 255});
         title->setAnchorPoint({0.f, 0.5f});
-        title->setPosition({PAD + 2.f, H - TITLE_H / 2.f + 0.5f});
+        title->setPosition({10.f, H - 16.f});
         m_body->addChild(title, 2);
-        // Version badge right after the title ("V2.1"): violet pill, white text,
-        // sized to the text.
-        float const titleEnd = PAD + 2.f + title->getContentSize().width * 0.38f;
-        auto* v2 = CCLabelBMFont::create(TITLE_BADGE, "bigFont.fnt");
-        v2->setScale(0.2f);
-        float const badgeW = std::max(15.f, v2->getContentSize().width * 0.2f + 6.f), badgeH = 9.f;
-        auto* badge = panel(badgeW, badgeH, C_BTN_SEL, 255, 3.f);
-        badge->setPosition({titleEnd + 4.f, H - TITLE_H / 2.f - badgeH / 2.f + 0.5f});
-        m_body->addChild(badge, 2);
-        v2->setColor({255, 255, 255});
-        v2->setPosition({titleEnd + 4.f + badgeW / 2.f, H - TITLE_H / 2.f + 0.5f});
-        m_body->addChild(v2, 3);
-        auto* by = CCLabelBMFont::create(fmt::format("by {}", AUTHOR_NAME).c_str(), "bigFont.fnt");
-        by->setScale(0.2f);
-        by->setColor({255, 255, 255});
+        // Version badge ("V2.2"): violet pill, white text, sized to the text.
+        // version badge (a violet pill; a button - see buildTabs)
+        auto* v2 = IBLabel::make(TITLE_BADGE, "bigFont.fnt");
+        v2->setScale(0.31f);
+        float const badgeW = std::max(24.f, v2->getContentSize().width * v2->getScale() + 11.f);
+        float const badgeY = H - 31.f;
+        m_badgeW = badgeW;
+        auto* by = IBLabel::make(fmt::format("by {}", AUTHOR_NAME).c_str(), "chatFont.fnt");
+        by->setScale(0.5f);
+        limitNodeWidth(by, SIDE_W - 20.f - badgeW, 0.5f, 0.25f);
+        by->setColor({255, 255, 255}); // white: readable over the galaxy
         by->setAnchorPoint({0.f, 0.5f});
-        by->setPosition({titleEnd + 4.f + badgeW + 5.f, H - TITLE_H / 2.f});
+        by->setPosition({10.f + badgeW + 4.f, badgeY - 0.3f});
         m_body->addChild(by, 2);
+        auto* sideLine = CCLayerColor::create(ccColor4B{150, 110, 255, 50}, SIDE_W - 20.f, 1.f);
+        sideLine->setPosition({10.f, H - 41.f});
+        m_body->addChild(sideLine, 2);
 
-        // Status pill (stage, or what the buffer is doing) on the right.
+        // the sidebar gets its own bit of sky
+        m_body->addChild(buildSideSky(), 1);
+        buildRunners();
+
+        // Tabs: a highlight that slides to the selected one, items over it.
+        m_tabSlots = CCNode::create();
+        m_body->addChild(m_tabSlots, 1);
+        m_tabHi = panel(SIDE_W - 16.f, SIDE_ITEM_H, C_SIDE_SEL, 255, 5.f);
+        m_body->addChild(m_tabHi, 2);
+
+        // System, bottom of the sidebar ("Windows 11" etc.).
+        auto* sideLine2 = CCLayerColor::create(ccColor4B{150, 110, 255, 40}, SIDE_W - 20.f, 1.f);
+        sideLine2->setPosition({10.f, 21.f});
+        m_body->addChild(sideLine2, 2);
+        std::string const sys = (systemInfo().side.empty() || systemInfo().brief.rfind("Wine", 0) == 0)
+                                    ? systemInfo().brief : systemInfo().side;
+        m_platform = IBLabel::make(sys.c_str(), "chatFont.fnt");
+        m_platform->setScale(0.42f);
+        limitNodeWidth(m_platform, SIDE_W - 14.f, 0.42f, 0.2f);
+        m_platform->setColor(C_MUTED);
+        m_platform->setPosition({(SIDE_W + 2.f) / 2.f, 12.5f});
+        m_body->addChild(m_platform, 2);
+
+        // ---- page header: page name on the left, status pill + close on the right ----
+        m_pageTitle = IBLabel::make("", "bigFont.fnt");
+        m_pageTitle->setScale(0.4f);
+        m_pageTitle->setColor({255, 255, 255});
+        m_pageTitle->setAnchorPoint({0.f, 0.5f});
+        m_pageTitle->setPosition({PAD + 2.f, H - TITLE_H / 2.f});
+        m_page->addChild(m_pageTitle, 2);
+
         m_headerPill = panel(60.f, 12.f, C_PILL, 240);
         m_headerPill->setAnchorPoint({1.f, 0.5f});
         m_headerPill->setPosition({W - 21.f, H - TITLE_H / 2.f});
-        m_body->addChild(m_headerPill, 1);
-        m_header = CCLabelBMFont::create("", "bigFont.fnt");
-        m_header->setScale(0.26f);
+        m_page->addChild(m_headerPill, 1);
+        m_header = bodyLabel("", 0.28f);
         m_header->setAnchorPoint({1.f, 0.5f});
         m_header->setPosition({W - 26.f, H - TITLE_H / 2.f});
-        m_body->addChild(m_header, 2);
-
-        // Tabs: four static boxes, a highlight that slides to the selected one,
-        // and (in buildTabs) clickable items over them - the whole box clicks.
-        {
-            m_tabSlots = CCNode::create();
-            m_body->addChild(m_tabSlots, 1);
-            float const y = H - TITLE_H - TABS_H / 2.f - 1.f;
-            for (int i = 0; i < TAB_COUNT; i++) {
-                auto* slot = panel(tabSegW(), TABS_H - 3.f, C_BTN, op(200.f));
-                slot->setPosition({tabCenterX(i) - tabSegW() / 2.f, y - (TABS_H - 3.f) / 2.f});
-                m_tabSlots->addChild(slot);
-            }
-            m_tabHi = panel(tabSegW(), TABS_H - 3.f, C_BTN_SEL, 255);
-            m_body->addChild(m_tabHi, 2);
-        }
+        m_page->addChild(m_header, 2);
 
         // Card panels (Stage / Modes) sit under the page content.
         m_cards = CCNode::create();
-        m_body->addChild(m_cards, 1);
+        m_page->addChild(m_cards, 1);
 
         // Zebra stripes behind the list rows.
         m_stripes = CCNode::create();
-        m_body->addChild(m_stripes, 1);
+        m_page->addChild(m_stripes, 1);
         for (int i = 1; i < visibleRows(); i += 2) {
             auto* st = CCLayerColor::create(ccColor4B{170, 130, 255, 12}, W - 2.f * PAD - SCROLL_W + 2.f, LINE_H);
             st->setPosition({PAD - 2.f, contentTop() - static_cast<float>(i + 1) * LINE_H + 1.f});
@@ -8126,70 +8493,61 @@ protected:
         // Scrollbar: a faint track and a thumb sized to how much of the list is visible.
         m_scrollTrack = CCLayerColor::create(ccColor4B{255, 255, 255, 18}, 2.f, trackTop() - trackBottom());
         m_scrollTrack->setPosition({W - PAD - SCROLL_W / 2.f - 1.f, trackBottom()});
-        m_body->addChild(m_scrollTrack, 1);
+        m_page->addChild(m_scrollTrack, 1);
         m_scrollThumb = CCLayerColor::create(ccColor4B{176, 136, 255, 210}, 2.f, 10.f);
         m_scrollThumb->setPosition({W - PAD - SCROLL_W / 2.f - 1.f, trackBottom()});
-        m_body->addChild(m_scrollThumb, 2);
+        m_page->addChild(m_scrollThumb, 2);
 
-        // Footer: a faint line, then the status text.
-        auto* footLine = CCLayerColor::create(ccColor4B{150, 110, 255, 45}, W - 16.f, 1.f);
-        footLine->setPosition({8.f, FOOT_H});
-        m_body->addChild(footLine, 1);
-        // Left: how to show / hide the window ("Left Alt to toggle"), white bold (2.1).
-        m_footer = CCLabelBMFont::create("", "bigFont.fnt");
-        m_footer->setScale(0.2f);
+        // Footer: a faint line, then how to show / hide the window.
+        auto* footLine = CCLayerColor::create(ccColor4B{150, 110, 255, 45}, W - 14.f, 1.f);
+        footLine->setPosition({6.f, FOOT_H});
+        m_page->addChild(footLine, 1);
+        m_footer = bodyLabel("", 0.23f, C_MUTED);
         m_footer->setAnchorPoint({0.f, 0.5f});
         m_footer->setPosition({PAD + 2.f, FOOT_H / 2.f});
-        m_footer->setColor({255, 255, 255});
-        m_body->addChild(m_footer, 2);
-        // What the game runs on, right side of the footer (left of "clear" on the Log tab).
-        m_platform = CCLabelBMFont::create(systemInfo().brief.c_str(), "bigFont.fnt");
-        m_platform->setScale(0.2f);
-        m_platform->setAnchorPoint({1.f, 0.5f});
-        m_platform->setColor({255, 255, 255});
-        m_body->addChild(m_platform, 2);
+        m_page->addChild(m_footer, 2);
 
-        m_titleMenu = makeMenu();
-        // Close: a white X in a small box (GD's close button is a green sprite).
+        m_titleMenu = makeMenu(m_page);
+        // Close: a white X in a small box.
         boxButton(m_titleMenu, "X", {W - 11.f, H - TITLE_H / 2.f}, 12.f, 12.f, C_BTN, ccColor3B{255, 255, 255}, 0.3f, [] {
             BufferWindow::toggle();
             Notification::create(fmt::format("Input Buffer hidden - {} shows it again", showHowTo()),
                                  NotificationIcon::None, 2.0f)->show();
         });
 
-        m_tabMenu = makeMenu();
-        m_listMenu = makeMenu();
-        m_settingsMenu = makeMenu();
+        m_tabMenu = makeMenu(m_body);
+        m_listMenu = makeMenu(m_page);
+        m_settingsMenu = makeMenu(m_page);
         m_settingsLabels = CCNode::create();
-        m_body->addChild(m_settingsLabels, 3);
+        m_page->addChild(m_settingsLabels, 3);
 
         // Row label pool.
         for (int i = 0; i < visibleRows(); i++) {
-            auto* l = CCLabelBMFont::create("", "chatFont.fnt");
+            auto* l = IBLabel::make("", "chatFont.fnt");
             l->setAnchorPoint({0.f, 1.f});
             l->setScale(0.5f);
             l->setPosition({PAD + 1.f, contentTop() - static_cast<float>(i) * LINE_H});
-            m_body->addChild(l, 2);
+            m_page->addChild(l, 2);
             m_rows.push_back(l);
-            auto* r = CCLabelBMFont::create("", "chatFont.fnt");
+            auto* r = IBLabel::make("", "chatFont.fnt");
             r->setAnchorPoint({1.f, 1.f});
             r->setScale(0.5f);
             r->setPosition({W - PAD - SCROLL_W - 2.f, contentTop() - static_cast<float>(i) * LINE_H});
-            m_body->addChild(r, 2);
+            m_page->addChild(r, 2);
             m_rowsR.push_back(r);
-            auto* h = CCLabelBMFont::create("", "bigFont.fnt");
+            auto* h = IBLabel::make("", "bigFont.fnt");
             h->setAnchorPoint({0.f, 0.5f});
             h->setScale(0.3f);
             h->setColor({255, 255, 255});
             h->setPosition({PAD + 1.f, contentTop() - static_cast<float>(i) * LINE_H - LINE_H / 2.f});
-            m_body->addChild(h, 2);
+            m_page->addChild(h, 2);
             m_rowsH.push_back(h);
-            auto* tl = CCLabelBMFont::create("", "chatFont.fnt");
+            auto* tl = IBLabel::make("", "chatFont.fnt");
             tl->setAnchorPoint({1.f, 1.f});
             tl->setScale(0.42f);
             tl->setColor(C_DIM);
             tl->setPosition({PAD + LOG_TIME_W, contentTop() - static_cast<float>(i) * LINE_H - 0.5f});
-            m_body->addChild(tl, 2);
+            m_page->addChild(tl, 2);
             m_rowsT.push_back(tl);
         }
 
@@ -8198,9 +8556,11 @@ protected:
         setTouchEnabled(true);
         // (mouse wheel: BufMouse hook -> takeScroll, so it's handled before anything behind the window)
         scheduleUpdate();
-        int const lastTab = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int>("last-tab", 0)), 0, TAB_COUNT - 1);
+        int lastTab = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int>("last-tab", 0)), 0, TAB_COUNT - 1);
+        if (!tabShown(lastTab)) lastTab = TAB_LOG;
         showTab(static_cast<Tab>(lastTab));
         popIn();
+        if (LogConsole::available() && Mod::get()->getSavedValue<bool>("log-console", false)) LogConsole::open();
         return true;
     }
 
@@ -8208,12 +8568,30 @@ protected:
         return static_cast<float>(std::clamp(Mod::get()->getSettingValue<double>("window-opacity"), 0.3, 1.0));
     }
 
-    // Little pop when the window appears (scale from 94% with an ease-out).
+    // Open (2.2): grows in from 86% with a small overshoot while rising 8
+    // units into place. Close: shrinks away, then hides.
     void popIn() {
         if (!m_body) return;
         m_body->stopAllActions();
-        m_body->setScale(0.94f);
-        m_body->runAction(CCEaseOut::create(CCScaleTo::create(0.12f, 1.f), 2.f));
+        CCPoint const home{FULL_W / 2.f, H / 2.f};
+        m_body->setScale(0.86f);
+        m_body->setPosition({home.x, home.y - 8.f});
+        m_body->runAction(CCEaseBackOut::create(CCScaleTo::create(0.24f, 1.f)));
+        m_body->runAction(CCEaseOut::create(CCMoveTo::create(0.2f, home), 2.5f));
+    }
+    void popOut() {
+        if (!m_body || !isVisible()) return;
+        if (m_compactNow) { setVisible(false); return; }
+        m_body->stopAllActions();
+        m_body->runAction(CCSequence::create(CCEaseIn::create(CCScaleTo::create(0.13f, 0.84f), 2.f),
+                                             CCCallFunc::create(this, callfunc_selector(BufferWindow::finishClose)), nullptr));
+        m_body->runAction(CCEaseIn::create(CCMoveTo::create(0.13f, CCPoint{FULL_W / 2.f, H / 2.f - 8.f}), 2.f));
+    }
+    void finishClose() {
+        setVisible(false);
+        if (!m_body) return;
+        m_body->setScale(1.f);
+        m_body->setPosition({FULL_W / 2.f, H / 2.f});
     }
 
     // ---- in-game pill: "EXTREME  BUFFER press +6t" while a level runs -------------
@@ -8224,14 +8602,14 @@ protected:
         this->addChild(m_pill, 5);
         m_pillBg = panel(80.f, PILL_H, C_PILL, static_cast<GLubyte>(std::clamp(235.f * m_alpha, 0.f, 255.f)));
         m_pill->addChild(m_pillBg, 0);
-        m_pillStage = CCLabelBMFont::create("", "bigFont.fnt");
+        m_pillStage = IBLabel::make("", "bigFont.fnt");
         m_pillStage->setAnchorPoint({0.f, 0.5f});
         m_pillStage->setColor({255, 255, 255});
         m_pill->addChild(m_pillStage, 1);
-        m_pillTag = CCLabelBMFont::create("", "bigFont.fnt");
+        m_pillTag = IBLabel::make("", "bigFont.fnt");
         m_pillTag->setAnchorPoint({0.f, 0.5f});
         m_pill->addChild(m_pillTag, 1);
-        m_pillText = CCLabelBMFont::create("", "chatFont.fnt");
+        m_pillText = IBLabel::make("", "chatFont.fnt");
         m_pillText->setAnchorPoint({0.f, 0.5f});
         m_pillText->setColor(C_MUTED);
         m_pill->addChild(m_pillText, 1);
@@ -8247,23 +8625,23 @@ protected:
         m_pillVersion = v;
         std::string tag, text;
         ccColor3B col = COL_WHITE;
-        bool const have = s_sim.lastLog(tag, text, col);
+        bool const have = !LogConsole::on() && s_sim.lastLog(tag, text, col); // console on: the Log is there
         if (text.size() > 26) text = text.substr(0, 25) + "..";
         float const y = PILL_H / 2.f;
         float x = 6.f;
         m_pillStage->setString(stage.c_str());
         m_pillStage->setScale(0.24f);
         m_pillStage->setPosition({x, y});
-        x += m_pillStage->getContentSize().width * 0.24f + 7.f;
+        x += m_pillStage->getContentSize().width * m_pillStage->getScale() + 7.f;
         m_pillTag->setString(have ? tag.c_str() : "");
         m_pillTag->setScale(0.19f);
         m_pillTag->setColor(logTagColor(tag));
         m_pillTag->setPosition({x, y});
-        if (have) x += m_pillTag->getContentSize().width * 0.19f + 4.f;
+        if (have) x += m_pillTag->getContentSize().width * m_pillTag->getScale() + 4.f;
         m_pillText->setString(have ? text.c_str() : "");
         m_pillText->setScale(0.42f);
         m_pillText->setPosition({x, y - 0.5f});
-        if (have) x += m_pillText->getContentSize().width * 0.42f;
+        if (have) x += m_pillText->getContentSize().width * m_pillText->getScale();
         float const w = std::max(40.f, x + 6.f);
         drawRound(m_pillBg, w, PILL_H, C_PILL, static_cast<GLubyte>(std::clamp(235.f * m_alpha, 0.f, 255.f)));
         m_pill->setPosition({0.f, H - PILL_H}); // the window's top-left corner
@@ -8281,12 +8659,18 @@ protected:
         pts.reserve(4 * (SEG + 1));
         struct Corner { float cx, cy, a0; };
         Corner const cs[4] = {{w - r, h - r, 0.f}, {r, h - r, 90.f}, {r, r, 180.f}, {w - r, r, 270.f}};
+        auto same = [](CCPoint const& a, CCPoint const& b) { return std::fabs(a.x - b.x) < 0.01f && std::fabs(a.y - b.y) < 0.01f; };
         for (auto const& c : cs) {
             for (int j = 0; j <= SEG; j++) {
                 float const ang = (c.a0 + 90.f * static_cast<float>(j) / SEG) * 3.14159265f / 180.f;
-                pts.push_back(CCPoint{c.cx + r * std::cos(ang), c.cy + r * std::sin(ang)});
+                CCPoint const q{c.cx + r * std::cos(ang), c.cy + r * std::sin(ang)};
+                // a fully round end (a pill) repeats points where the corners meet;
+                // GD's polygon fill turns a zero-length edge into a spike (2.2)
+                if (!pts.empty() && same(pts.back(), q)) continue;
+                pts.push_back(q);
             }
         }
+        while (pts.size() > 3 && same(pts.front(), pts.back())) pts.pop_back();
         // CCDrawNode blends premultiplied (GL_ONE, GL_ONE_MINUS_SRC_ALPHA).
         float const al = opacity / 255.f;
         ccColor4F const fill{col.r / 255.f * al, col.g / 255.f * al, col.b / 255.f * al, al};
@@ -8302,42 +8686,46 @@ protected:
 
     // A card on a page: rounded panel + small caps title, optional hint on the right.
     void card(float x, float y, float w, float h, char const* titleText, std::string const& hint = {}) {
-        auto* p = panel(w, h, C_CARD, static_cast<GLubyte>(std::clamp(175.f * m_alpha, 0.f, 255.f)), 5.f);
-        p->setPosition({x, y});
+        // soft violet edge, then the card itself
+        auto* e = panel(w, h, C_CARD_EDGE, static_cast<GLubyte>(std::clamp(150.f * m_alpha, 0.f, 255.f)), 6.f);
+        e->setPosition({x, y});
+        m_cards->addChild(e);
+        auto* p = panel(w - 1.2f, h - 1.2f, C_CARD, static_cast<GLubyte>(std::clamp(215.f * m_alpha, 0.f, 255.f)), 5.4f);
+        p->setPosition({x + 0.6f, y + 0.6f});
         m_cards->addChild(p);
         if (titleText && *titleText) {
-            auto* t = CCLabelBMFont::create(titleText, "bigFont.fnt");
-            t->setScale(0.22f);
+            auto* t = IBLabel::make(titleText, "bigFont.fnt");
+            t->setScale(0.28f);
             t->setColor(C_LAV);
             t->setAnchorPoint({0.f, 0.5f});
-            t->setPosition({x + 6.f, y + h - 6.f});
+            t->setPosition({x + 6.f, y + h - 7.f});
             m_settingsLabels->addChild(t);
         }
         if (!hint.empty()) {
-            auto* hl = CCLabelBMFont::create(hint.c_str(), "chatFont.fnt");
+            auto* hl = IBLabel::make(hint.c_str(), "chatFont.fnt");
             hl->setScale(0.4f);
             hl->setColor({255, 255, 255});
             hl->setAnchorPoint({1.f, 0.5f});
-            hl->setPosition({x + w - 6.f, y + h - 6.f});
+            hl->setPosition({x + w - 6.f, y + h - 7.f});
             m_settingsLabels->addChild(hl);
         }
     }
 
-    CCMenu* makeMenu() {
+    CCMenu* makeMenu(CCNode* parent) {
         auto* m = CCMenu::create();
         m->ignoreAnchorPointForPosition(false);
         m->setAnchorPoint({0.f, 0.f});
         m->setPosition({0.f, 0.f});
-        m->setContentSize({W, H});
+        m->setContentSize({parent == m_page ? W : FULL_W, H});
         m->setTouchPriority(PRIO_MENUS);
-        m_body->addChild(m, 4);
+        parent->addChild(m, 4);
         return m;
     }
 
     // ---- position ------------------------------------------------------------
     void restorePosition() {
         auto const win = CCDirector::sharedDirector()->getWinSize();
-        float const sw = W * getScale(), sh = H * getScale();
+        float const sw = FULL_W * getScale(), sh = H * getScale();
         auto* mod = Mod::get();
         float const x = static_cast<float>(mod->getSavedValue<double>("window-x", win.width - sw - 6.0));
         float const y = static_cast<float>(mod->getSavedValue<double>("window-y", win.height - sh - 6.0));
@@ -8346,7 +8734,7 @@ protected:
 
     CCPoint clampPos(CCPoint p) {
         auto const win = CCDirector::sharedDirector()->getWinSize();
-        float const sw = W * getScale(), sh = H * getScale();
+        float const sw = FULL_W * getScale(), sh = H * getScale();
         p.x = std::clamp(p.x, 0.f, std::max(0.f, win.width - sw));
         p.y = std::clamp(p.y, 0.f, std::max(0.f, win.height - sh));
         return p;
@@ -8359,9 +8747,31 @@ protected:
     }
 
     // ---- buttons: a rounded box, the WHOLE box is clickable ---------------------
+    // Text (2.2): headings (title, page name, card titles) stay in GD's bold
+    // font; labels and buttons use the clean one. Sizes are given in bigFont
+    // terms - chatFont is about half as big, so it's drawn at 2x.
+    static constexpr float BODY_K = 1.f; // (sizes are bigFont sizes; IBLabel converts)
+    static CCLabelBMFont* bodyLabel(char const* text, float bigScale, ccColor3B col = {255, 255, 255}) {
+        auto* l = IBLabel::make(text, "bigFont.fnt");
+        l->setScale(bigScale);
+        l->setColor(col);
+        return l;
+    }
     static float textWidth(char const* text, float scale) {
-        auto* l = CCLabelBMFont::create(text, "bigFont.fnt");
-        return l->getContentSize().width * scale;
+        auto* l = IBLabel::make(text, "bigFont.fnt");
+        l->setScale(scale);
+        return l->getContentSize().width * l->getScale();
+    }
+    // Geode's limitNodeWidth, aware of IBLabel's size conversion (shadows it in the window).
+    static void limitNodeWidth(CCNode* n, float width, float def, float minScale) {
+        if (!n) return;
+        float k = 1.f;
+        if (auto* l = typeinfo_cast<IBLabel*>(n)) k = l->m_k;
+        float const cw = n->getContentSize().width * k;
+        float sc = def;
+        if (cw > 0.f && def * cw > width) sc = width / cw;
+        if (minScale != 0.f && sc < minScale) sc = minScale;
+        n->setScale(sc);
     }
 
     CCMenuItemSpriteExtra* boxButton(CCMenu* menu, std::string const& text, CCPoint center, float w, float h,
@@ -8370,11 +8780,10 @@ protected:
         auto* node = CCNode::create();
         node->setContentSize({w, h});
         node->addChild(panel(w, h, fill, opacity));
-        auto* l = CCLabelBMFont::create(text.c_str(), "bigFont.fnt");
-        l->setScale(textScale);
-        limitNodeWidth(l, w - 6.f, textScale, textScale * 0.5f);
-        l->setColor(textCol);
-        l->setPosition({w / 2.f, h / 2.f + 0.5f});
+        float const ts = textScale * 1.12f;
+        auto* l = bodyLabel(text.c_str(), ts, textCol);
+        limitNodeWidth(l, w - 8.f, ts, ts * 0.5f);
+        l->setPosition({w / 2.f, h / 2.f - 0.4f});
         node->addChild(l);
         auto* item = CCMenuItemExt::createSpriteExtra(node, [fn = std::move(fn)](CCMenuItemSpriteExtra*) { fn(); });
         item->setSizeMult(1.06f);
@@ -8387,31 +8796,74 @@ protected:
     CCMenuItemSpriteExtra* boxButtonFit(CCMenu* menu, char const* text, CCPoint center, ccColor3B textCol,
                                         std::function<void()> fn, float textScale = 0.24f, float h = 12.f,
                                         ccColor3B fill = C_BTN) {
-        float const w = textWidth(text, textScale) + 12.f;
+        float const w = textWidth(text, textScale * 1.12f) + 16.f;
         return boxButton(menu, text, center, w, h, fill, textCol, textScale, std::move(fn));
     }
 
-    // ---- tabs: four equal boxes, the highlight slides to the selected one ------------
-    static constexpr float TAB_GAP = 3.f;
-    static float tabSegW() {
-        return (W - 2.f * PAD - TAB_GAP * static_cast<float>(TAB_COUNT - 1)) / static_cast<float>(TAB_COUNT);
+    // ---- tabs (2.2): a list in the sidebar, the highlight slides to the selected one ----
+    static constexpr float SIDE_ITEM_H = 16.f;
+    static constexpr float SIDE_ITEM_GAP = 3.f;
+    static float sideItemY(int i) { return H - 55.f - static_cast<float>(i) * (SIDE_ITEM_H + SIDE_ITEM_GAP); }
+    static char const* tabName(int i) {
+        static char const* names[TAB_COUNT] = {"Log", "Stats", "Stage", "Modes", "Tools", "Dev"};
+        return names[std::clamp(i, 0, TAB_COUNT - 1)];
     }
-    static float tabCenterX(int i) { return PAD + tabSegW() / 2.f + static_cast<float>(i) * (tabSegW() + TAB_GAP); }
 
     void buildTabs() {
         m_tabMenu->removeAllChildren();
-        char const* names[TAB_COUNT] = {"Log", "Stats", "Stage", "Modes", "Tools"};
-        float const y = H - TITLE_H - TABS_H / 2.f - 1.f;
+        // the version badge: 5 quick clicks turn the Dev tab on / off
+        {
+            float const bh = 12.5f, by = H - 31.f;
+            auto* node = CCNode::create();
+            node->setContentSize({m_badgeW, bh});
+            node->addChild(panel(m_badgeW, bh, C_BTN_SEL, 255, bh / 2.f));
+            auto* v2 = IBLabel::make(TITLE_BADGE, "bigFont.fnt");
+            v2->setScale(0.31f);
+            v2->setColor({255, 255, 255});
+            v2->setPosition({m_badgeW / 2.f, bh / 2.f - 0.3f});
+            node->addChild(v2);
+            auto* item = CCMenuItemExt::createSpriteExtra(node, [this](CCMenuItemSpriteExtra*) {
+                if (m_badgeTapAge > 2.5f) m_badgeTaps = 0;
+                m_badgeTapAge = 0.f;
+                if (++m_badgeTaps < 5) return;
+                m_badgeTaps = 0;
+                bool const on = !devOn();
+                Mod::get()->setSavedValue<bool>("dev-tab", on);
+                Notification::create(on ? "Dev tab on" : "Dev tab off", NotificationIcon::None, 1.2f)->show();
+                m_tabHiPlaced = false; // the rows moved: no slide from the old spot
+                showTab(on ? TAB_DEV : TAB_LOG);
+            });
+            item->setSizeMult(1.05f);
+            item->setPosition({10.f + m_badgeW / 2.f, by});
+            m_tabMenu->addChild(item);
+        }
+        float const iw = SIDE_W - 16.f;
         for (int i = 0; i < TAB_COUNT; i++) {
+            if (!tabShown(i)) continue;
             bool const sel = i == static_cast<int>(m_tab);
-            // invisible box (opacity 0) over the static slot: the whole box clicks
-            auto* item = boxButton(m_tabMenu, names[i], {tabCenterX(i), y}, tabSegW(), TABS_H - 3.f, C_BTN,
-                                   sel ? ccColor3B{255, 255, 255} : C_MUTED, 0.27f,
-                                   [this, i] { showTab(static_cast<Tab>(i)); }, 0);
-            item->setSizeMult(1.02f);
+            // the whole row clicks: a dot, then the name, left-aligned
+            auto* node = CCNode::create();
+            node->setContentSize({iw, SIDE_ITEM_H});
+            CCPoint dotPts[10];
+            for (int k = 0; k < 10; k++) {
+                float const a = 6.2831853f * static_cast<float>(k) / 10.f;
+                dotPts[k] = CCPoint{8.f + 1.9f * std::cos(a), SIDE_ITEM_H / 2.f - 0.5f + 1.9f * std::sin(a)};
+            }
+            auto* dot = CCDrawNode::create();
+            ccColor3B const dc = sel ? ccColor3B{214, 180, 255} : C_DIM;
+            dot->drawPolygon(dotPts, 10, ccColor4F{dc.r / 255.f, dc.g / 255.f, dc.b / 255.f, 1.f}, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
+            node->addChild(dot);
+            auto* l = bodyLabel(tabName(i), 0.34f, sel ? ccColor3B{255, 255, 255} : C_MUTED);
+            l->setAnchorPoint({0.f, 0.5f});
+            l->setPosition({15.f, SIDE_ITEM_H / 2.f});
+            node->addChild(l);
+            auto* item = CCMenuItemExt::createSpriteExtra(node, [this, i](CCMenuItemSpriteExtra*) { showTab(static_cast<Tab>(i)); });
+            item->setSizeMult(1.03f);
+            item->setPosition({8.f + iw / 2.f, sideItemY(tabSlot(i))});
+            m_tabMenu->addChild(item);
         }
         if (m_tabHi) {
-            CCPoint const to{tabCenterX(static_cast<int>(m_tab)) - tabSegW() / 2.f, y - (TABS_H - 3.f) / 2.f};
+            CCPoint const to{8.f, sideItemY(tabSlot(static_cast<int>(m_tab))) - SIDE_ITEM_H / 2.f};
             m_tabHi->stopAllActions();
             if (!m_tabHiPlaced) {
                 m_tabHi->setPosition(to);
@@ -8423,11 +8875,14 @@ protected:
     }
 
     void showTab(Tab t) {
+        bool const changed = t != m_tab || !m_shownOnce;
+        m_shownOnce = true;
         m_tab = t;
         m_offset = 0;
         m_forceRefresh = true;
         Mod::get()->setSavedValue<int>("last-tab", static_cast<int>(t));
         buildTabs();
+        if (m_pageTitle) m_pageTitle->setString(tabName(static_cast<int>(t)));
         bool const list = isList(t);
         for (auto* l : m_rows) l->setVisible(list);
         for (auto* l : m_rowsR) l->setVisible(list);
@@ -8449,6 +8904,14 @@ protected:
         else if (t == TAB_MODES) buildModes();
         else if (t == TAB_TOOLS) buildTools();
         else buildSettings();
+        // a new page slides in a little (only when you switch tabs - not when
+        // the same page is rebuilt after a click)
+        for (CCNode* n : {static_cast<CCNode*>(m_settingsMenu), static_cast<CCNode*>(m_settingsLabels),
+                          static_cast<CCNode*>(m_cards)}) {
+            n->stopAllActions();
+            n->setPosition({changed ? 7.f : 0.f, 0.f});
+            if (changed) n->runAction(CCEaseOut::create(CCMoveTo::create(0.16f, CCPoint{0.f, 0.f}), 2.5f));
+        }
         refresh();
     }
 
@@ -8458,13 +8921,37 @@ protected:
                   [this] { scrollBy(-visibleRows() + 1); });
         boxButton(m_listMenu, "v", {x, contentBottom() + 5.f}, 10.f, 10.f, C_BTN, C_MUTED, 0.26f,
                   [this] { scrollBy(visibleRows() - 1); });
+        if (m_tab == TAB_DEV) {
+            boxButtonFit(m_listMenu, "Copy All", {W - PAD - 24.f, FOOT_H / 2.f}, ccColor3B{255, 255, 255}, [] {
+                bool const ok = geode::utils::clipboard::write(s_sim.devCopyText());
+                Notification::create(ok ? "Dev info copied - paste it to Claude" : "Couldn't copy", NotificationIcon::None, 1.5f)->show();
+            }, 0.22f, 10.f, C_BTN_SEL);
+        }
         if (m_tab == TAB_LOG) {
-            // In the footer, out of the tab bar.
-            boxButtonFit(m_listMenu, "clear", {W - PAD - 15.f, FOOT_H / 2.f}, COL_ORANGE, [this] {
+            // In the footer.
+            boxButtonFit(m_listMenu, "Clear", {W - PAD - 15.f, FOOT_H / 2.f}, COL_ORANGE, [this] {
                 s_sim.clearHistory();
                 m_forceRefresh = true;
                 refresh();
             }, 0.22f, 10.f);
+            // The Log in a command-prompt window instead (2.2, Windows).
+            if (LogConsole::available()) {
+                boxButtonFit(m_listMenu, LogConsole::on() ? "Console: On" : "Console", {W - PAD - 62.f, FOOT_H / 2.f},
+                             ccColor3B{255, 255, 255}, [this] {
+                    bool const on = !LogConsole::on();
+                    if (on) {
+                        if (!LogConsole::open()) {
+                            Notification::create("Couldn't open a console window", NotificationIcon::None, 1.5f)->show();
+                            return;
+                        }
+                        s_sim.dumpLogToConsole();
+                    } else {
+                        LogConsole::close();
+                    }
+                    Mod::get()->setSavedValue<bool>("log-console", on);
+                    showTab(TAB_LOG);
+                }, 0.22f, 10.f, LogConsole::on() ? C_BTN_SEL : C_BTN);
+            }
         }
     }
 
@@ -8478,6 +8965,7 @@ protected:
     // Only what changed is rebuilt (1.26.0): text labels are rebuilt glyph by
     // glyph, and doing all of them 4x a second while you play cost frame time.
     std::string m_shownHeader, m_shownFooter;
+    Tab m_shownFooterTab = TAB_COUNT;
     unsigned long long m_shownLogVersion = ~0ull;
     float m_statsAge = 0.f;
     bool  m_forceRefresh = true;
@@ -8491,32 +8979,34 @@ protected:
             m_shownHeader = head;
             m_header->setString(head.c_str());
             m_header->setColor({255, 255, 255});
-            m_header->setScale(0.26f);
-            limitNodeWidth(m_header, W - 170.f, 0.26f, 0.15f);
+            m_header->setScale(0.28f);
+            limitNodeWidth(m_header, W - 120.f, 0.28f, 0.15f);
             if (m_headerPill) {
-                float const hw = m_header->getContentSize().width * m_header->getScale() + 10.f;
-                drawRound(m_headerPill, hw, 12.f, C_PILL, 240);
+                float const hw = m_header->getContentSize().width * m_header->getScale() + 12.f;
+                drawRound(m_headerPill, hw, 13.f, C_PILL, 240);
+                m_header->setAnchorPoint({0.5f, 0.5f});
+                m_header->setPosition({W - 21.f - hw / 2.f, H - TITLE_H / 2.f - 0.4f});
             }
         }
         std::string const foot = toggleHint(); // was the status line ("INPUT BUFFER  EXTREME" ...) before 2.1
-        if (force || foot != m_shownFooter) {
+        if (force || foot != m_shownFooter || m_shownFooterTab != m_tab) {
+            m_shownFooterTab = m_tab;
             m_shownFooter = foot;
-            m_footer->setString(foot.c_str());
-            m_footer->setScale(0.2f);
-            // room for "clear" on the Log tab and the system name on the right
-            float const right = W - PAD - (m_tab == TAB_LOG ? 34.f : 2.f);
-            float platW = 0.f;
-            if (m_platform) {
-                m_platform->setPosition({right, FOOT_H / 2.f});
-                platW = m_platform->getContentSize().width * m_platform->getScale() + 8.f;
-            }
-            limitNodeWidth(m_footer, std::max(40.f, right - platW - (PAD + 2.f)), 0.2f, 0.12f);
+            std::string up = foot;
+            for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            m_footer->setString(up.c_str());
+            m_footer->setScale(0.23f);
+            // room for "clear" / "console" on the Log tab
+            float const right = W - PAD - (m_tab == TAB_LOG ? (LogConsole::available() ? 92.f : 34.f) : m_tab == TAB_DEV ? 52.f : 2.f);
+            limitNodeWidth(m_footer, std::max(40.f, right - (PAD + 2.f)), 0.23f, 0.12f);
         }
         if (m_tab == TAB_TOOLS && m_scanLabel) {
             std::string const st = s_sim.scanStatus();
             if (st != m_scanShown) {
                 m_scanShown = st;
-                m_scanLabel->setString(st.c_str());
+                std::string up = st;
+                for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                m_scanLabel->setString(up.c_str());
                 m_scanLabel->setScale(0.42f);
                 limitNodeWidth(m_scanLabel, W - PAD - 6.f - (PAD + 88.f), 0.42f, 0.25f);
             }
@@ -8526,17 +9016,21 @@ protected:
             if (!force && s_sim.logVersion() == m_shownLogVersion) return; // nothing new
             m_shownLogVersion = s_sim.logVersion();
         } else {
-            // Stats: about once a second while a level runs, 4x a second otherwise.
-            if (!force && levelRunning() && m_statsAge < 1.f) return;
+            // Stats: about once a second while a level runs, 4x a second otherwise (Dev: always 4x).
+            if (!force && m_tab != TAB_DEV && levelRunning() && m_statsAge < 1.f) return;
             m_statsAge = 0.f;
         }
         Config const c = Config::load();
-        m_data = (m_tab == TAB_LOG) ? s_sim.historyRows(c.hudVerbose) : s_sim.statsRows();
-        if (m_tab == TAB_LOG && m_data.empty()) {
+        m_data = (m_tab == TAB_LOG) ? s_sim.historyRows(c.hudVerbose) : (m_tab == TAB_DEV) ? s_sim.devRows() : s_sim.statsRows();
+        if (m_tab == TAB_LOG && LogConsole::on()) {
+            m_data.clear();
+            m_data.emplace_back("The Log is in the console window now.", COL_WHITE);
+            m_data.emplace_back("Press console (bottom right) to bring it back here.", C_MUTED);
+        } else if (m_tab == TAB_LOG && m_data.empty()) {
             // Empty log: say what will show up here, and how to hide the window.
             m_data.emplace_back("Nothing logged yet.", COL_WHITE);
-            m_data.emplace_back("Buffered clicks, when they fired, and deaths show up here while you play.", C_MUTED);
-            m_data.emplace_back(fmt::format("Show / hide this window: {}. Drag it by the title bar.", showHowTo()), C_MUTED);
+            m_data.emplace_back("Buffered clicks, when they fired, and deaths show up here while you play.", COL_WHITE);
+            m_data.emplace_back(fmt::format("Show / hide this window: {}. Drag it by the title bar.", showHowTo()), COL_WHITE);
         }
         m_rowCount = static_cast<int>(m_data.size());
         scrollBy(0);
@@ -8580,13 +9074,15 @@ protected:
                     }
                     r->setString("");
                 } else if (!text.empty() && text[0] == '\x01') {
-                    h->setColor({255, 255, 255});
-                    // section title: bold, white
+                    // section title: like the card titles (2.2) - lavender, bold, uppercase
+                    h->setColor(C_LAV);
                     l->setString("");
                     r->setString("");
-                    h->setString(text.substr(1).c_str());
-                    h->setScale(0.3f);
-                    limitNodeWidth(h, full, 0.3f, 0.15f);
+                    std::string up = text.substr(1);
+                    for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                    h->setString(up.c_str());
+                    h->setScale(0.32f);
+                    limitNodeWidth(h, full, 0.32f, 0.15f);
                 } else if (tab == std::string::npos) {
                     // plain row (log lines, section titles, notes)
                     l->setString(text.c_str());
@@ -8602,7 +9098,7 @@ protected:
                     limitNodeWidth(r, full * 0.55f, 0.5f, 0.25f);
                     float const valueW = r->getContentSize().width * r->getScale();
                     l->setString(text.substr(0, tab).c_str());
-                    l->setColor(C_MUTED);
+                    l->setColor({255, 255, 255}); // (titles are the coloured ones - 2.2)
                     l->setScale(0.5f);
                     limitNodeWidth(l, std::max(40.f, full - valueW - 8.f), 0.5f, 0.25f);
                 }
@@ -8638,9 +9134,9 @@ protected:
             case 0:  return "Raw input. The buffer does nothing.";
             case 1:  return "Saves clicks up to 1 frame early (1f @60fps).";
             case 2:  return "Saves clicks up to 2 frames early.";
-            case 3:  return "4 frames early (3 for ship / wave).";
-            case 4:  return "8 frames early (5 for ship / wave).";
-            case 5:  return "20 frames early (12 for ship / wave).";
+            case 3:  return "3 frames early (2 for ship).";
+            case 4:  return "5 frames early (4 for wave, 2 for ship).";
+            case 5:  return "20 frames early (12 for wave, 2 for ship).";
             case 6: {
                 CustomFrames const f = CustomFrames::load();
                 return fmt::format("Your frames: cube {:g}, ship {:g}, wave {:g} (Extreme engine).", f.cube, f.ship, f.wave);
@@ -8652,22 +9148,54 @@ protected:
     // Custom frames being edited (applied with the Apply button).
     CustomFrames m_customEdit = CustomFrames::load();
 
-    // A toggle + label pair on a card.
+    // A switch (2.2): a pill track (violet when on) with a white knob that
+    // slides across. `flip` changes the setting and returns the new state.
+    static constexpr float SW_W = 21.f, SW_H = 11.f;
+    void addSwitch(CCPoint center, bool on, std::function<bool()> flip) {
+        auto* node = CCNode::create();
+        node->setContentSize({SW_W, SW_H});
+        auto* track = panel(SW_W, SW_H, on ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+        node->addChild(track);
+        auto* knob = CCDrawNode::create();
+        auto circle = [&](float cx, float cy, float r, ccColor4F col) {
+            CCPoint pts[20];
+            for (int k = 0; k < 20; k++) {
+                float const a = 6.2831853f * static_cast<float>(k) / 20.f;
+                pts[k] = CCPoint{cx + r * std::cos(a), cy + r * std::sin(a)};
+            }
+            knob->drawPolygon(pts, 20, col, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
+        };
+        float const r = SW_H / 2.f - 1.5f;
+        circle(0.f, -0.5f, r + 0.4f, ccColor4F{0.f, 0.f, 0.f, 0.22f}); // soft shadow under the knob
+        circle(0.f, 0.f, r, ccColor4F{1.f, 1.f, 1.f, 1.f});
+        float const offX = SW_H / 2.f, onX = SW_W - SW_H / 2.f;
+        knob->setPosition({on ? onX : offX, SW_H / 2.f});
+        node->addChild(knob);
+        auto* item = CCMenuItemExt::createSpriteExtra(node, [track, knob, offX, onX, flip = std::move(flip)](CCMenuItemSpriteExtra*) {
+            bool const now = flip();
+            drawRound(track, SW_W, SW_H, now ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+            knob->stopAllActions();
+            knob->runAction(CCEaseOut::create(CCMoveTo::create(0.12f, CCPoint{now ? onX : offX, SW_H / 2.f}), 2.5f));
+        });
+        item->setSizeMult(1.08f);
+        item->setPosition(center);
+        m_settingsMenu->addChild(item);
+    }
+
+    // A switch + label pair on a card.
     void addToggle(float x, float y, char const* label, char const* key, bool def) {
         bool const on = Mod::get()->getSavedValue<bool>(key, def);
         std::string const k = key;
-        auto* tog = CCMenuItemExt::createTogglerWithStandardSprites(0.4f, [k, def](CCMenuItemToggler*) {
+        addSwitch({x + SW_W / 2.f + 1.f, y}, on, [k, def] {
             auto* mod = Mod::get();
-            mod->setSavedValue<bool>(k, !mod->getSavedValue<bool>(k, def));
+            bool const v = !mod->getSavedValue<bool>(k, def);
+            mod->setSavedValue<bool>(k, v);
             s_sim.settingsChanged();
+            return v;
         });
-        tog->toggle(on);
-        tog->setPosition({x + 8.f, y});
-        m_settingsMenu->addChild(tog);
-        auto* l = CCLabelBMFont::create(label, "bigFont.fnt");
-        l->setScale(0.25f);
+        auto* l = bodyLabel(label, 0.29f);
         l->setAnchorPoint({0.f, 0.5f});
-        l->setPosition({x + 19.f, y});
+        l->setPosition({x + SW_W + 6.f, y});
         m_settingsLabels->addChild(l);
     }
 
@@ -8681,7 +9209,12 @@ protected:
         float const cx = PAD, cw = W - 2.f * PAD;
 
         // -- STAGE card (117..176)
-        card(cx, 117.f, cw, 59.f, "STAGE", "F6 cycles stages");
+        // the Stage Cycle Key you set (phones: no keyboard, no hint)
+        std::string cycleHint;
+#ifndef GEODE_IS_MOBILE
+        if (std::string const k = cycleKeyName(); !k.empty()) cycleHint = k + " cycles stages";
+#endif
+        card(cx, 117.f, cw, 59.f, "STAGE", cycleHint);
         char const* labels[] = {"Off", "1", "2", "3", "4", "Extreme", "Custom"};
         float const by = 152.f;
         constexpr float BTN_H = 15.f, BTN_GAP = 4.f, BTN_TEXT = 0.28f;
@@ -8702,13 +9235,13 @@ protected:
                       }, sel ? 255 : 220);
             x += widths[i] + BTN_GAP;
         }
-        auto* name = CCLabelBMFont::create(STAGES[cur].name, "bigFont.fnt");
+        auto* name = IBLabel::make(STAGES[cur].name, "bigFont.fnt");
         name->setScale(0.3f);
         name->setColor({255, 255, 255});
         limitNodeWidth(name, cw - 12.f, 0.3f, 0.18f);
         name->setPosition({W / 2.f, 137.f});
         m_settingsLabels->addChild(name);
-        auto* blurb = CCLabelBMFont::create(stageBlurb(cur).c_str(), "chatFont.fnt");
+        auto* blurb = IBLabel::make(stageBlurb(cur).c_str(), "chatFont.fnt");
         blurb->setScale(0.48f);
         blurb->setColor(C_MUTED);
         limitNodeWidth(blurb, cw - 12.f, 0.48f, 0.28f);
@@ -8716,24 +9249,27 @@ protected:
         m_settingsLabels->addChild(blurb);
 
         // -- CUSTOM FRAMES card (80..114)
-        card(cx, 80.f, cw, 34.f, "CUSTOM FRAMES", "frames @60fps, 0.5 steps");
+        card(cx, 80.f, cw, 34.f, "CUSTOM FRAMES", "Frames @60fps, 0.5 steps");
         buildCustomRow(92.f);
 
         // -- OPTIONS card (30..77): title row has the two buttons, then 2x2 toggles
         card(cx, 30.f, cw, 47.f, "OPTIONS");
         float const colL = cx + 4.f, colR = W / 2.f + 2.f;
-        boxButton(m_settingsMenu, "forget level", {W - PAD - 108.f, 70.f}, 62.f, 11.f, C_BTN_SEL, ccColor3B{255, 255, 255}, 0.21f, [] {
+        float const wAll = textWidth("All Settings", 0.26f * 1.12f) + 16.f;
+        float const wForget = textWidth("Forget Level", 0.26f * 1.12f) + 16.f;
+        float const allX = W - PAD - 6.f - wAll / 2.f, forgetX = allX - wAll / 2.f - 5.f - wForget / 2.f;
+        boxButtonFit(m_settingsMenu, "Forget Level", {forgetX, 69.f}, ccColor3B{255, 255, 255}, [] {
             if (s_sim.inLevelWithSpots()) s_sim.forgetSpots();
             else Notification::create("Open the level first (pause it), then press forget level", NotificationIcon::None, 1.8f)->show();
-        });
-        boxButton(m_settingsMenu, "all settings", {W - PAD - 38.f, 70.f}, 62.f, 11.f, C_BTN, C_LAV, 0.21f, [this] {
+        }, 0.26f, 13.f, C_BTN_SEL);
+        boxButtonFit(m_settingsMenu, "All Settings", {allX, 69.f}, C_LAV, [this] {
             setVisible(false); // out of the way of the settings popup; comes back with the window key
             openSettingsPopup(Mod::get());
-        });
-        addToggle(colL, 55.f, "Show paths", "show-paths", false);
-        addToggle(colR, 55.f, "Learn from attempts", "learn-spots", true);
-        addToggle(colL, 39.f, "Log: more detail", "log-safe-clicks", false);
-        addToggle(colR, 39.f, "Small while playing", "compact-play", true);
+        }, 0.26f, 13.f, C_BTN);
+        addToggle(colL, 55.f, "Show Paths", "show-paths", false);
+        addToggle(colR, 55.f, "Learn From Attempts", "learn-spots", true);
+        addToggle(colL, 39.f, "Log: More Detail", "log-safe-clicks", false);
+        addToggle(colR, 39.f, "Small While Playing", "compact-play", true);
 
         // -- Discord (2.1): a violet pill like the version badge, white bold text,
         // centred under the cards. Clicking it copies the name. (The "Left Alt:
@@ -8743,7 +9279,7 @@ protected:
             bool const ok = geode::utils::clipboard::write(AUTHOR_DISCORD);
             Notification::create(ok ? fmt::format("Copied {}", AUTHOR_DISCORD) : fmt::format("Discord: {}", AUTHOR_DISCORD),
                                  NotificationIcon::None, 1.5f)->show();
-        }, 0.22f, 12.f, C_BTN_SEL);
+        }, 0.22f, 14.f, C_BTN_SEL);
     }
 
     // ---- modes page ------------------------------------------------------------------
@@ -8757,32 +9293,29 @@ protected:
         float const cardBottom = top - 18.f - static_cast<float>(perCol - 1) * 24.f - 12.f;
         for (int c = 0; c < 2; c++) card(colX[c], cardBottom, colW, top + 7.f - cardBottom, nullptr);
         auto caption = [&](char const* text, float x, float y, ccColor3B col, float scale, bool left = false) {
-            auto* l = CCLabelBMFont::create(text, "bigFont.fnt");
-            l->setScale(scale);
-            l->setColor(col);
+            auto* l = bodyLabel(text, scale, col);
             if (left) l->setAnchorPoint({0.f, 0.5f});
             l->setPosition({x, y});
             m_settingsLabels->addChild(l);
         };
         for (int c = 0; c < 2; c++) {
-            caption("normal", colX[c] + colW - 52.f, top, C_LAV, 0.2f);
-            caption("mini", colX[c] + colW - 20.f, top, C_LAV, 0.2f);
+            caption("NORMAL", colX[c] + colW - 52.f, top, C_LAV, 0.3f);
+            caption("MINI", colX[c] + colW - 20.f, top, C_LAV, 0.3f);
         }
         for (int i = 0; i < MODE_TOGGLE_COUNT; i++) {
             int const col = i / perCol, row = i % perCol;
             float const x = colX[col];
             float const y = top - 18.f - static_cast<float>(row) * 24.f;
-            caption(MODE_TOGGLES[i].label, x + 8.f, y, COL_WHITE, 0.3f, true);
+            caption(MODE_TOGGLES[i].label, x + 10.f, y, COL_WHITE, 0.37f, true);
             for (int mini = 0; mini < 2; mini++) {
                 std::string const id = mini ? fmt::format("mini-{}", MODE_TOGGLES[i].id) : std::string(MODE_TOGGLES[i].id);
-                auto* tog = CCMenuItemExt::createTogglerWithStandardSprites(0.42f, [id](CCMenuItemToggler*) {
+                addSwitch({x + colW - (mini ? 20.f : 52.f), y}, modeOn(id), [id] {
                     auto* mod = Mod::get();
-                    mod->setSavedValue<bool>("mode-on-" + id, !mod->getSavedValue<bool>("mode-on-" + id, true));
+                    bool const v = !mod->getSavedValue<bool>("mode-on-" + id, true);
+                    mod->setSavedValue<bool>("mode-on-" + id, v);
                     s_sim.settingsChanged();
+                    return v;
                 });
-                tog->toggle(modeOn(id));
-                tog->setPosition({x + colW - (mini ? 20.f : 52.f), y});
-                m_settingsMenu->addChild(tog);
             }
         }
         auto setAll = [this](bool on) {
@@ -8795,10 +9328,10 @@ protected:
             showTab(TAB_MODES);
         };
         float const by = std::min(cardBottom - 12.f, contentBottom() + 12.f);
-        boxButton(m_settingsMenu, "all on", {PAD + 24.f, by}, 44.f, 13.f, C_BTN, COL_GREEN, 0.24f, [setAll] { setAll(true); });
-        boxButton(m_settingsMenu, "all off", {PAD + 74.f, by}, 44.f, 13.f, C_BTN, COL_ORANGE, 0.24f, [setAll] { setAll(false); });
-        auto* hint = CCLabelBMFont::create("Off = clicks in that mode go through raw", "chatFont.fnt");
-        hint->setScale(0.45f);
+        boxButton(m_settingsMenu, "All On", {PAD + 24.f, by}, 44.f, 13.f, C_BTN, COL_GREEN, 0.24f, [setAll] { setAll(true); });
+        boxButton(m_settingsMenu, "All Off", {PAD + 74.f, by}, 44.f, 13.f, C_BTN, COL_ORANGE, 0.24f, [setAll] { setAll(false); });
+        auto* hint = IBLabel::make("Off = clicks in that mode go through raw", "chatFont.fnt");
+        hint->setScale(0.5f);
         hint->setColor({255, 255, 255});
         hint->setAnchorPoint({1.f, 0.5f});
         hint->setPosition({W - PAD - 4.f, by});
@@ -8810,7 +9343,7 @@ protected:
     //  YOUR STATS  this level / all levels, saved between sessions
     //  REPORT      export everything to a file (and the clipboard) to send
     void toolsLine(float x, float y, std::string const& text, ccColor3B col, float maxW, float scale = 0.42f) {
-        auto* l = CCLabelBMFont::create(text.c_str(), "chatFont.fnt");
+        auto* l = IBLabel::make(text.c_str(), "chatFont.fnt");
         l->setScale(scale);
         l->setColor(col);
         l->setAnchorPoint({0.f, 0.5f});
@@ -8824,39 +9357,37 @@ protected:
     void buildTools() {
         float const cx = PAD, cw = W - 2.f * PAD;
         ccColor3B const white{255, 255, 255};
-        float const bx = cx + 104.f, bw = W - PAD - 6.f - bx;
+        float const bx = cx + 108.f, bw = W - PAD - 6.f - bx;
 
-        // ASSISTS (118..176)
-        card(cx, 118.f, cw, 58.f, "ASSISTS");
-        addToggle(cx + 4.f, 156.f, "Orb helper", "orb-helper", false);
-        toolsLine(bx, 156.f, "an early click waits for the next orb (up to 5 frames)", white, bw);
-        addToggle(cx + 4.f, 141.f, "Click guide", "click-guide", false);
-        toolsLine(bx, 141.f, "dots where the level scan's inputs go", white, bw);
-        addToggle(cx + 4.f, 126.f, "Snap to scan", "route-snap", false);
-        toolsLine(bx, 126.f, "early clicks wait for the scanned input (within your stage)", white, bw);
+        // ASSISTS (132..176)
+        card(cx, 132.f, cw, 44.f, "ASSISTS");
+        addToggle(cx + 4.f, 156.f, "Orb Helper", "orb-helper", false);
+        toolsLine(bx, 156.f, "An early click waits for the next orb (up to 5 frames)", white, bw);
+        addToggle(cx + 4.f, 141.f, "Snap To Scan", "route-snap", false);
+        toolsLine(bx, 141.f, "Early clicks wait for the scanned input (within your stage)", white, bw);
 
-        // LEVEL SCAN (64..114)
-        card(cx, 64.f, cw, 50.f, "LEVEL SCAN");
-        addToggle(cx + 4.f, 74.f, "Show scan", "scan-view", true);
-        addToggle(cx + cw * 0.36f, 74.f, "Real game (practice)", "real-scan", false);
-        boxButton(m_settingsMenu, "scan level", {cx + 44.f, 92.f}, 76.f, 14.f, C_BTN_SEL, white, 0.24f, [this] {
+        // LEVEL SCAN (66..128)
+        card(cx, 66.f, cw, 62.f, "LEVEL SCAN");
+        addToggle(cx + 4.f, 78.f, "Show Scan", "scan-view", true);
+        addToggle(cx + cw * 0.36f, 78.f, "Real Game (Practice)", "real-scan", false);
+        boxButton(m_settingsMenu, "Scan Level", {cx + 44.f, 99.f}, 76.f, 15.f, C_BTN_SEL, white, 0.24f, [this] {
             s_sim.startScan(PlayLayer::get());
             m_scanShown.clear();
             refresh();
         });
-        m_scanLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_scanLabel = IBLabel::make("", "chatFont.fnt");
         m_scanLabel->setScale(0.42f);
         m_scanLabel->setColor(white);
         m_scanLabel->setAnchorPoint({0.f, 0.5f});
-        m_scanLabel->setPosition({cx + 88.f, 92.f});
+        m_scanLabel->setPosition({cx + 88.f, 99.f});
         m_settingsLabels->addChild(m_scanLabel);
         m_scanShown.clear();
-        toolsLine(cx + 88.f, 104.f, "play it once as far as you can, then pause + scan (stay paused)", C_MUTED,
+        toolsLine(cx + 88.f, 112.f, "PLAY IT ONCE AS FAR AS YOU CAN, THEN PAUSE + SCAN (STAY PAUSED)", C_MUTED,
                   W - PAD - 6.f - (cx + 88.f), 0.36f);
 
         // YOUR STATS + report (18..60)
         card(cx, 18.f, cw, 42.f, "YOUR STATS");
-        boxButton(m_settingsMenu, "export report", {W - PAD - 42.f, 53.f}, 76.f, 11.f, C_BTN_SEL, white, 0.21f, [] {
+        boxButtonFit(m_settingsMenu, "Export Report", {W - PAD - 40.f, 52.f}, white, [] {
             std::string const text = s_sim.buildReport();
             auto const file = s_sim.saveReport(text);
             bool const copied = geode::utils::clipboard::write(text);
@@ -8865,7 +9396,7 @@ protected:
 #endif
             Notification::create(fmt::format("Report saved{} - {}", copied ? " and copied" : "", file.filename().string()),
                                  NotificationIcon::None, 2.5f)->show();
-        });
+        }, 0.27f, 13.f, C_BTN_SEL);
         auto const lv = s_sim.levelStats();
         auto const life = s_sim.lifeStats();
         std::string const name = s_sim.levelName();
@@ -8878,7 +9409,7 @@ protected:
                   fmt::format("All levels:  {} attempts  -  {} deaths  -  {} completions  -  {} clicks buffered",
                               life.attempts, life.deaths, life.completions, life.buffered),
                   white, cw - 12.f);
-        toolsLine(cx + 6.f, 23.f, "export report: Log, Stats, settings and system in one file (also copied) - send it over",
+        toolsLine(cx + 6.f, 23.f, "Export Report: Log, Stats, settings and system in one file (also copied) - send it over",
                   C_MUTED, cw - 12.f, 0.36f);
     }
 
@@ -8894,8 +9425,7 @@ protected:
 
         // One "Name [-] value [+]" group, 0.5-frame steps.
         auto group = [&](char const* label, float& value, float gx) {
-            auto* l = CCLabelBMFont::create(label, "bigFont.fnt");
-            l->setScale(0.25f);
+            auto* l = bodyLabel(label, 0.34f);
             l->setAnchorPoint({0.f, 0.5f});
             l->setPosition({gx, y});
             m_settingsLabels->addChild(l);
@@ -8905,9 +9435,7 @@ protected:
                 *v = std::max(CUSTOM_MIN_FRAMES, *v - 0.5f);
                 showTab(TAB_SETTINGS);
             });
-            auto* num = CCLabelBMFont::create(fmt::format("{:g}", value).c_str(), "bigFont.fnt");
-            num->setScale(0.3f);
-            num->setColor(COL_WHITE);
+            auto* num = bodyLabel(fmt::format("{:g}", value).c_str(), 0.36f);
             num->setPosition({bx + 14.f, y});
             m_settingsLabels->addChild(num);
             boxButton(m_settingsMenu, "+", {bx + 28.f, y}, 12.f, 12.f, C_BTN, C_LAV, 0.3f, [this, v] {
@@ -8936,7 +9464,532 @@ protected:
         return pl && !pl->m_isPaused;
     }
 
+    // A vertical gradient (top colour -> bottom colour) with round corners:
+    // thin horizontal bands, each inset by the corner's curve.
+    static void roundedGradient(CCDrawNode* dn, float w, float h, float r, ccColor4B top, ccColor4B bot) {
+        constexpr int BANDS = 48;
+        r = std::clamp(r, 0.f, std::min(w, h) / 2.f);
+        auto inset = [&](float y) {
+            float const d = std::min(y, h - y); // distance to the nearest edge
+            if (d >= r) return 0.f;
+            float const dy = r - d;
+            return r - std::sqrt(std::max(0.f, r * r - dy * dy));
+        };
+        for (int i = 0; i < BANDS; i++) {
+            float const y0 = h * static_cast<float>(i) / BANDS, y1 = h * static_cast<float>(i + 1) / BANDS;
+            float const t = (y0 + y1) * 0.5f / h; // 0 bottom .. 1 top
+            float const a = (bot.a + (top.a - bot.a) * t) / 255.f;
+            float const cr = (bot.r + (top.r - bot.r) * t) / 255.f, cg = (bot.g + (top.g - bot.g) * t) / 255.f,
+                        cb = (bot.b + (top.b - bot.b) * t) / 255.f;
+            float const i0 = inset(y0), i1 = inset(y1);
+            CCPoint pts[4] = {{i0, y0}, {w - i0, y0}, {w - i1, y1 + 0.05f}, {i1, y1 + 0.05f}};
+            dn->drawPolygon(pts, 4, ccColor4F{cr * a, cg * a, cb * a, a}, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
+        }
+    }
+
+    // ---- sidebar sky (2.2): a spiral galaxy behind the title and faint stars.
+    // (Your icons run across the bottom - see the runners.)
+    CCNode* buildSideSky() {
+        auto* root = CCNode::create();
+        root->setContentSize({SIDE_W, H});
+        unsigned seed = 9001u;
+        float const a = std::clamp(m_alpha, 0.3f, 1.f);
+        float const x0 = 7.f, x1 = SIDE_W - 3.f, y0 = 25.f;
+        auto* dn = CCDrawNode::create();
+        root->addChild(dn);
+        // the galaxy: a glowing core and two spiral arms, tilted - up behind
+        // the title, out of the way of the tabs
+        float const gx = SIDE_W * 0.56f, gy = H - 24.f;
+        float const R = 29.f;
+        float const gy0 = H - 46.f, gy1 = H - 5.f; // the arms stay inside this band
+        nebula(dn, gx, gy, R * 1.05f, R * 0.62f, ccColor3B{86, 52, 190}, 0.45f * a);  // halo
+        nebula(dn, gx, gy, R * 0.55f, R * 0.32f, ccColor3B{170, 110, 255}, 0.4f * a); // inner glow
+        nebula(dn, gx, gy, R * 0.2f, R * 0.13f, ccColor3B{255, 225, 255}, 0.55f * a); // core
+        float const tilt = 0.55f, rot = -0.35f;
+        for (int arm = 0; arm < 2; arm++) {
+            for (int i = 0; i < 120; i++) {
+                float const t = static_cast<float>(i) / 120.f;                   // 0 core .. 1 tip
+                float const th = t * 4.4f + static_cast<float>(arm) * 3.14159265f;
+                float const r = R * (0.12f + 0.9f * t);
+                float const jx = galRand(seed, -2.f, 2.f) * (0.4f + t), jy = galRand(seed, -2.f, 2.f) * (0.4f + t);
+                float const px = std::cos(th) * r + jx, py = std::sin(th) * r * tilt + jy;
+                float const qx = gx + px * std::cos(rot) - py * std::sin(rot), qy = gy + px * std::sin(rot) + py * std::cos(rot);
+                if (qx < x0 || qx > x1 || qy < gy0 || qy > gy1) continue;
+                float const b = (0.55f - 0.4f * t) * a;
+                ccColor3B const c = galRand(seed, 0.f, 1.f) < 0.3f ? ccColor3B{150, 170, 255} : ccColor3B{220, 180, 255};
+                float const rr = galRand(seed, 0.7f, 1.7f) * (1.f - 0.4f * t);
+                drawCircle(dn, qx, qy, rr, rr * 0.8f, ccColor4F{c.r / 255.f * b * 0.4f, c.g / 255.f * b * 0.4f, c.b / 255.f * b * 0.4f, b * 0.4f}, 10);
+                if (galRand(seed, 0.f, 1.f) < 0.25f) drawCircle(dn, qx, qy, 0.4f, 0.4f, ccColor4F{b, b, b, b}, 6); // a star in the arm
+            }
+        }
+        // a light starfield
+        for (int i = 0; i < 26; i++) {
+            float const x = galRand(seed, x0, x1), y = galRand(seed, y0, H - 8.f);
+            float const b = galRand(seed, 0.25f, 0.7f) * a, r = galRand(seed, 0.25f, 0.55f);
+            drawCircle(dn, x, y, r, r, ccColor4F{b, b, b, b}, 8);
+        }
+        return root;
+    }
+
+    // ---- galaxy (2.2) -------------------------------------------------------------
+    static float galRand(unsigned& seed, float lo, float hi) {
+        seed = seed * 1664525u + 1013904223u;
+        return lo + (hi - lo) * static_cast<float>((seed >> 8) & 0xFFFF) / 65535.f;
+    }
+    static void drawCircle(CCDrawNode* dn, float cx, float cy, float rx, float ry, ccColor4F col, int n = 18) {
+        std::vector<CCPoint> pts(static_cast<size_t>(n));
+        for (int k = 0; k < n; k++) {
+            float const a = 6.2831853f * static_cast<float>(k) / static_cast<float>(n);
+            pts[static_cast<size_t>(k)] = CCPoint{cx + rx * std::cos(a), cy + ry * std::sin(a)};
+        }
+        dn->drawPolygon(pts.data(), static_cast<unsigned>(n), col, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
+    }
+    // A soft glow: stacked faint ellipses, brighter towards the middle.
+    static void nebula(CCDrawNode* dn, float cx, float cy, float rx, float ry, ccColor3B c, float strength) {
+        constexpr int RINGS = 12;
+        for (int i = 0; i < RINGS; i++) {
+            float const t = 1.f - static_cast<float>(i) / RINGS;          // 1 = outer
+            float const a = strength / RINGS;                              // each layer adds a little
+            ccColor4F const col{c.r / 255.f * a, c.g / 255.f * a, c.b / 255.f * a, a}; // premultiplied
+            drawCircle(dn, cx, cy, rx * t, ry * t, col, 28);
+        }
+    }
+    // The sky for a w x h area (stars only between y0..y1, x0..x1).
+    // `level`: 1 = full, lower = subtler (fewer, dimmer stars; softer clouds)
+    CCNode* buildGalaxy(float w, float h, float y0, float y1, float x0, float x1, int constellations, unsigned seed,
+                        float level = 1.f) {
+        auto* root = CCNode::create();
+        root->setContentSize({w, h});
+        auto* dn = CCDrawNode::create();
+        root->addChild(dn);
+        float const a = std::clamp(m_alpha, 0.3f, 1.f) * level;
+        // nebula: violet and deep blue clouds (kept inside the area - nothing spills out of the window)
+        auto cloud = [&](float fx0, float fx1, float fy0, float fy1, float frx, float fry, ccColor3B c, float k) {
+            float const cx = x0 + (x1 - x0) * galRand(seed, fx0, fx1), cy = y0 + (y1 - y0) * galRand(seed, fy0, fy1);
+            float const rx = std::min({(x1 - x0) * frx, cx - x0, x1 - cx}), ry = std::min({(y1 - y0) * fry, cy - y0, y1 - cy});
+            if (rx > 2.f && ry > 2.f) nebula(dn, cx, cy, rx, ry, c, k * a);
+        };
+        cloud(0.3f, 0.42f, 0.55f, 0.65f, 0.42f, 0.38f, ccColor3B{124, 64, 220}, 0.38f);
+        cloud(0.6f, 0.72f, 0.3f, 0.42f, 0.38f, 0.34f, ccColor3B{48, 72, 200}, 0.34f);
+        cloud(0.45f, 0.6f, 0.4f, 0.6f, 0.22f, 0.2f, ccColor3B{214, 92, 196}, 0.2f);
+        // starfield
+        int const count = static_cast<int>((x1 - x0) * (y1 - y0) / 230.f * level);
+        for (int i = 0; i < count; i++) {
+            float const x = galRand(seed, x0, x1), y = galRand(seed, y0, y1);
+            float const r = galRand(seed, 0.25f, 0.75f);
+            float const b = galRand(seed, 0.35f, 1.f) * a;
+            float const tint = galRand(seed, 0.f, 1.f);
+            ccColor3B const c = tint < 0.2f ? ccColor3B{255, 226, 180} : tint < 0.45f ? ccColor3B{190, 205, 255} : ccColor3B{255, 255, 255};
+            drawCircle(dn, x, y, r, r, ccColor4F{c.r / 255.f * b, c.g / 255.f * b, c.b / 255.f * b, b}, 8);
+        }
+        // constellations: a few brighter stars joined by thin lines
+        for (int k = 0; k < constellations; k++) {
+            int const n = static_cast<int>(galRand(seed, 4.f, 7.f));
+            ccColor3B const lc = (k % 2 == 0) ? ccColor3B{235, 178, 196} : ccColor3B{96, 132, 255};
+            // low down, under the tabs
+            float px = galRand(seed, x0 + 12.f, x1 - 12.f), py = galRand(seed, y0 + 8.f, y0 + (y1 - y0) * 0.3f);
+            std::vector<CCPoint> pts{{px, py}};
+            for (int i = 1; i < n; i++) {
+                float const ang = galRand(seed, 0.f, 6.2831853f);
+                float const len = galRand(seed, 12.f, 30.f);
+                px = std::clamp(px + std::cos(ang) * len, x0 + 4.f, x1 - 4.f);
+                py = std::clamp(py + std::sin(ang) * len, y0 + 4.f, y1 - 4.f);
+                pts.push_back({px, py});
+            }
+            float const la = 0.32f * a;
+            for (size_t i = 1; i < pts.size(); i++) {
+                dn->drawSegment(pts[i - 1], pts[i], 0.28f, ccColor4F{lc.r / 255.f * la, lc.g / 255.f * la, lc.b / 255.f * la, la});
+            }
+            for (auto const& q : pts) {
+                drawCircle(dn, q.x, q.y, 1.6f, 1.6f, ccColor4F{0.25f * a, 0.22f * a, 0.35f * a, 0.25f * a}, 12); // halo
+                drawCircle(dn, q.x, q.y, 0.75f, 0.75f, ccColor4F{a, a, a, a}, 10);
+            }
+        }
+        // twinkling stars (fade in and out on their own beat)
+        for (int i = 0; i < static_cast<int>(10.f * level); i++) {
+            auto* st = CCLayerColor::create(ccColor4B{255, 255, 255, 255}, 1.1f, 1.1f);
+            st->setPosition({galRand(seed, x0, x1), galRand(seed, y0, y1)});
+            GLubyte const lo = static_cast<GLubyte>(30.f * a), hi = static_cast<GLubyte>(galRand(seed, 170.f, 255.f) * a);
+            st->setOpacity(lo);
+            float const t = galRand(seed, 0.8f, 2.2f);
+            st->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(galRand(seed, 0.f, 2.f)),
+                                                                     CCFadeTo::create(t, hi), CCFadeTo::create(t, lo), nullptr)));
+            root->addChild(st);
+        }
+        return root;
+    }
+
+    // ---- runners (2.2): your cube jumps, your ship flies, your UFO flaps and
+    // your wave zigzags across the sidebar - your icons, your colours, with
+    // GD-style particles and trails.
+    struct TrailPt { float x, y, age; };
+    struct Runner {
+        SimplePlayer* icon = nullptr;
+        float x = 0.f, y = 0.f, vy = 0.f, rot = 0.f, timer = 0.f, emit = 0.f;
+        int dir = 1;
+        bool ground = true, held = false;
+        float dead = 0.f;            // > 0: exploded, back in this many seconds
+        std::deque<TrailPt> oldTrail; // wave: the last run's trail, fading out
+        float oldFade = 0.f;
+        std::deque<TrailPt> trail;   // streak / wave trail points
+        CCDrawNode* trailNode = nullptr;
+    };
+    Runner m_cube, m_ship, m_ufo, m_wave;
+    CCNode* m_trails = nullptr;      // particles
+    ccColor3B m_col1{255, 255, 255}, m_col2{255, 255, 255};
+    static constexpr float RUN_SCALE = 0.25f;
+    static constexpr float RUN_WAVE_SCALE = 0.26f;
+    static constexpr float RUN_UFO_SCALE = 0.31f;
+    static constexpr float RUN_HALF = 3.7f;    // half the icon's size at that scale (about)
+    static constexpr float RUN_GROUND = 24.5f; // the line above the system name
+
+    SimplePlayer* makeIcon(int id, IconType type) {
+        auto* gm = GameManager::sharedState();
+        auto* p = SimplePlayer::create(1);
+        if (!p) return nullptr;
+        p->updatePlayerFrame(id, type);
+        p->setColor(m_col1);
+        p->setSecondColor(m_col2);
+        if (gm->getPlayerGlow()) p->setGlowOutline(gm->colorForIdx(gm->getPlayerGlowColor()));
+        p->setScale(RUN_SCALE);
+        m_body->addChild(p, 1);
+        return p;
+    }
+    // Your icons and colours, as a number: changes when you pick another icon.
+    static long long iconSig() {
+        auto* gm = GameManager::sharedState();
+        if (!gm) return 0;
+        long long h = 17;
+        for (int v : {gm->getPlayerFrame(), gm->getPlayerBird(), gm->getPlayerDart(), gm->getPlayerColor(),
+                      gm->getPlayerColor2(), gm->getPlayerGlow() ? 1 : 0, gm->getPlayerGlowColor()}) h = h * 1000003 + v;
+        return h;
+    }
+    long long m_iconSig = 0;
+    float     m_iconCheck = 0.f;
+    void makeIcons() {
+        auto* gm = GameManager::sharedState();
+        if (!gm) return;
+        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
+            if (r->icon) r->icon->removeFromParent();
+            r->icon = nullptr;
+        }
+        m_col1 = gm->colorForIdx(gm->getPlayerColor());
+        m_col2 = gm->colorForIdx(gm->getPlayerColor2());
+        m_cube.icon = makeIcon(gm->getPlayerFrame(), IconType::Cube);
+        m_ufo.icon = makeIcon(gm->getPlayerBird(), IconType::Ufo);
+        if (m_ufo.icon) m_ufo.icon->setScale(RUN_UFO_SCALE);
+        // your cube rides inside the UFO's dome, like in the game
+        if (m_ufo.icon) {
+            if (auto* rider = SimplePlayer::create(1)) {
+                rider->updatePlayerFrame(gm->getPlayerFrame(), IconType::Cube);
+                rider->setColor(m_col1);
+                rider->setSecondColor(m_col2);
+                rider->setScale(0.55f);
+                rider->setPosition({0.f, 5.f});
+                m_ufo.icon->addChild(rider, -1);
+            }
+        }
+        m_wave.icon = makeIcon(gm->getPlayerDart(), IconType::Wave);
+        if (m_wave.icon) m_wave.icon->setScale(RUN_WAVE_SCALE); // GD's wave is big next to its trail
+        m_iconSig = iconSig();
+        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) place(*r);
+    }
+
+    void buildRunners() {
+        auto* gm = GameManager::sharedState();
+        if (!gm) return;
+        m_col1 = gm->colorForIdx(gm->getPlayerColor());
+        m_col2 = gm->colorForIdx(gm->getPlayerColor2());
+        m_trails = CCNode::create();
+        m_body->addChild(m_trails, 1);
+        for (Runner* r : {&m_wave, &m_ufo}) {
+            r->trailNode = CCDrawNode::create();
+            m_body->addChild(r->trailNode, 1);
+        }
+        makeIcons();
+        m_cube.x = 12.f;  m_cube.y = RUN_GROUND + RUN_HALF; m_cube.timer = 0.6f;
+        m_ship.x = 30.f;  m_ship.y = RUN_GROUND + 34.f;
+        m_ufo.x = 45.f;   m_ufo.y = (RUN_GROUND + runTop()) / 2.f;
+        m_wave.x = 70.f;  m_wave.y = RUN_GROUND + 10.f; m_wave.timer = 0.3f;
+    }
+    // top of the runners' space under the tabs
+    float runTop() const {
+        return std::min(sideItemY(tabSlotsShown() - 1) - SIDE_ITEM_H / 2.f - 2.f, RUN_GROUND + 48.f);
+    }
+    static bool inSide(float x) { return x > 9.f && x < SIDE_W - 6.f; }
+    static void place(Runner& r) {
+        if (!r.icon) return;
+        r.icon->setVisible(inSide(r.x) && r.dead <= 0.f); // only inside the sidebar; across the edge it wraps round
+        r.icon->setPosition({r.x, r.y});
+        r.icon->setRotation(r.rot);
+    }
+    // A GD-style square particle: drifts, shrinks a little and fades out.
+    void particle(float x, float y, ccColor3B c, float size, CCPoint drift, float life, GLubyte alpha = 230) {
+        if (!m_trails || !inSide(x)) return;
+        auto* d = CCLayerColor::create(ccColor4B{c.r, c.g, c.b, alpha}, size, size);
+        d->setPosition({x - size / 2.f, y - size / 2.f});
+        d->runAction(CCMoveBy::create(life, drift));
+        d->runAction(CCSequence::create(CCFadeTo::create(life, 0), CCRemoveSelf::create(), nullptr));
+        m_trails->addChild(d);
+    }
+    // Trail: the last points of a runner's path, drawn as a line that fades
+    // towards its tail (the wave's solid trail, the UFO / ship streak).
+    void stepTrail(Runner& r, float dt, float life, float width, ccColor3B c, float alpha, float yOff = 0.f) {
+        if (!r.trailNode) return;
+        for (auto& p : r.trail) p.age += dt;
+        while (!r.trail.empty() && r.trail.front().age > life) r.trail.pop_front();
+        if (inSide(r.x)) r.trail.push_back({r.x, r.y + yOff, 0.f});
+        r.trailNode->clear();
+        for (size_t i = 1; i < r.trail.size(); i++) {
+            TrailPt const& p0 = r.trail[i - 1];
+            TrailPt const& p1 = r.trail[i];
+            if (std::fabs(p1.x - p0.x) > 20.f) continue; // wrapped round
+            float const a = alpha * std::max(0.f, 1.f - p1.age / life);
+            float const w = width * (0.8f + 0.2f * (1.f - p1.age / life));
+            r.trailNode->drawSegment(CCPoint{p0.x, p0.y}, CCPoint{p1.x, p1.y}, w,
+                                     ccColor4F{c.r / 255.f * a, c.g / 255.f * a, c.b / 255.f * a, a});
+        }
+    }
+    void stepRunners(float dt) {
+        dt = std::min(dt, 0.05f);
+        // picked another icon / colour in the garage: swap them in
+        m_iconCheck -= dt;
+        if (m_iconCheck <= 0.f) {
+            m_iconCheck = 0.5f;
+            if (iconSig() != m_iconSig) makeIcons();
+        }
+        // exploded ones come back from the left after a moment
+        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
+            if (r->dead <= 0.f) continue;
+            r->dead -= dt;
+            if (r->dead <= 0.f) {
+                r->x = 2.f;
+                r->vy = 0.f;
+                r->trail.clear();
+            }
+        }
+        float const top = std::max(RUN_GROUND + 14.f, runTop());
+        auto wrap = [](Runner& r) { if (r.x > SIDE_W + 6.f) r.x = 2.f; };
+        // cube: runs, jumps now and then (a half turn per jump, lands flat),
+        // kicking up little squares behind it while it's on the ground
+        if (m_cube.icon && m_cube.dead <= 0.f) {
+            Runner& c = m_cube;
+            c.x += 31.f * dt;
+            if (c.ground) {
+                c.timer -= dt;
+                if (c.timer <= 0.f) { c.vy = 66.f; c.ground = false; c.timer = starRand(0.35f, 1.2f); }
+                c.emit -= dt;
+                if (c.emit <= 0.f) {
+                    c.emit = 0.035f;
+                    particle(c.x - RUN_HALF, RUN_GROUND + 0.8f, m_col1, starRand(0.8f, 1.7f),
+                             CCPoint{-starRand(4.f, 10.f), starRand(1.f, 6.f)}, starRand(0.25f, 0.45f));
+                }
+            } else {
+                c.vy -= 300.f * dt;
+                c.rot += 420.f * dt;
+            }
+            c.y += c.vy * dt;
+            if (c.y <= RUN_GROUND + RUN_HALF) {
+                c.y = RUN_GROUND + RUN_HALF;
+                c.vy = 0.f;
+                if (!c.ground) c.rot = std::round(c.rot / 90.f) * 90.f;
+                c.ground = true;
+            }
+            wrap(c);
+            place(c);
+        }
+        // ship: hold to rise, let go to fall - gently, tilting with its speed,
+        // a streak and fire behind it (in your colours)
+        if (m_ship.icon) {
+            Runner& s = m_ship;
+            s.x += 17.f * dt;
+            float const lo = RUN_GROUND + RUN_HALF + 4.f, hi = std::max(lo + 10.f, H - 70.f);
+            s.timer -= dt;
+            if (s.timer <= 0.f) { s.held = !s.held; s.timer = starRand(0.25f, 0.7f); }
+            if (s.y > hi - 4.f) s.held = false;
+            if (s.y < lo + 4.f) s.held = true;
+            s.vy += (s.held ? 95.f : -95.f) * dt;
+            s.vy = std::clamp(s.vy, -38.f, 38.f);
+            s.y = std::clamp(s.y + s.vy * dt, lo, hi);
+            s.rot = std::clamp(-s.vy * 0.9f, -28.f, 28.f);
+            stepTrail(s, dt, 0.45f, 1.8f, ccColor3B{255, 255, 255}, 0.28f);
+            s.emit -= dt;
+            if (s.emit <= 0.f) {
+                s.emit = 0.03f;
+                ccColor3B const fc = starRand(0.f, 1.f) < 0.5f ? m_col1 : m_col2;
+                particle(s.x - RUN_HALF * 1.1f, s.y - 0.5f, fc, starRand(0.8f, 1.8f),
+                         CCPoint{-starRand(6.f, 14.f), starRand(-3.f, 3.f)}, starRand(0.25f, 0.5f));
+            }
+            wrap(s);
+            place(s);
+        }
+        // UFO: flaps up, falls back; a soft streak and a puff of squares per flap
+        if (m_ufo.icon && m_ufo.dead <= 0.f) {
+            Runner& u = m_ufo;
+            u.x += 27.f * dt;
+            u.vy -= 170.f * dt;
+            u.timer -= dt;
+            float const floorY = RUN_GROUND + RUN_HALF + 6.f;
+            float const mid = (floorY + top - RUN_HALF) / 2.f + u.dir * 3.f; // bobs a little above / below the middle
+            if ((u.timer <= 0.f && u.y < mid && u.vy < 0.f) || u.y < floorY + 2.f) {
+                u.vy = 42.f;
+                u.timer = starRand(0.18f, 0.4f);
+                if (starRand(0.f, 1.f) < 0.3f) u.dir = -u.dir;
+                for (int i = 0; i < 4; i++) {
+                    particle(u.x - starRand(0.f, RUN_HALF), u.y - RUN_HALF * 0.6f, i % 2 ? m_col1 : ccColor3B{255, 255, 255},
+                             starRand(0.8f, 1.6f), CCPoint{-starRand(3.f, 9.f), -starRand(3.f, 8.f)}, starRand(0.3f, 0.55f));
+                }
+            }
+            u.y += u.vy * dt;
+            if (u.y > top - RUN_HALF) { u.y = top - RUN_HALF; u.vy = std::min(u.vy, 0.f); }
+            if (u.y < floorY) { u.y = floorY; u.vy = std::max(u.vy, 0.f); }
+            u.rot = std::clamp(-u.vy * 0.25f, -12.f, 12.f);
+            stepTrail(u, dt, 0.4f, 1.6f, ccColor3B{255, 255, 255}, 0.3f, -RUN_HALF * 0.3f);
+            u.emit -= dt;
+            if (u.emit <= 0.f) {
+                u.emit = 0.07f;
+                particle(u.x - RUN_HALF, u.y - RUN_HALF * 0.4f, ccColor3B{255, 255, 255}, starRand(0.6f, 1.2f),
+                         CCPoint{-starRand(4.f, 8.f), starRand(-2.f, 2.f)}, starRand(0.25f, 0.45f), 200);
+            }
+            wrap(u);
+            place(u);
+        }
+        // wave: 45 degree zigzag with its solid trail, like in GD
+        if (m_wave.icon && m_wave.dead <= 0.f) {
+            Runner& w = m_wave;
+            float const sp = 25.f;
+            // waiting for the last line to wipe away: the next arrow starts after it
+            bool const waiting = w.oldFade > 0.f;
+            if (!waiting) w.x += sp * dt;
+            if (!waiting) w.y += static_cast<float>(w.dir) * sp * dt;
+            w.timer -= dt;
+            float const lo = RUN_GROUND + RUN_HALF + 1.f, hi = top - RUN_HALF;
+            if (w.timer <= 0.f || w.y > hi || w.y < lo) {
+                if (w.y > hi) w.dir = -1;
+                else if (w.y < lo) w.dir = 1;
+                else w.dir = -w.dir;
+                w.y = std::clamp(w.y, lo, hi);
+                w.timer = starRand(0.18f, 0.55f);
+            }
+            w.rot = w.dir > 0 ? -45.f : 45.f;
+            // trail as thick as about 40% of the arrow, like in GD
+            float tw = 1.8f;
+            // as thick as the back notch of the arrow (about a quarter of its height)
+            if (w.icon && w.icon->m_firstLayer) tw = std::clamp(w.icon->m_firstLayer->boundingBox().size.height * RUN_WAVE_SCALE * 0.24f, 1.f, 2.4f);
+            // the whole line stays until the wave leaves the side; then it fades
+            // out in one go while the next arrow starts from the left
+            if (w.x > SIDE_W + 6.f && !waiting) {
+                w.oldTrail = std::move(w.trail);
+                w.trail.clear();
+                w.oldFade = 0.5f; // the wipe takes half a second
+                w.x = SIDE_W + 7.f; // parked off the edge until it's done
+            }
+            if (w.oldFade > 0.f) {
+                w.oldFade = std::max(0.f, w.oldFade - dt);
+                if (w.oldFade <= 0.f) w.x = 2.f; // then the next arrow starts from the left
+            }
+            if (w.trailNode) {
+                if (inSide(w.x)) w.trail.push_back({w.x, w.y, 0.f});
+                w.trailNode->clear();
+                // `wipe` 0..1: how far along (from the start) the line has faded away
+                auto line = [&](std::deque<TrailPt> const& pts, float wipe) {
+                    size_t const n = pts.size();
+                    for (size_t i = 1; i < n; i++) {
+                        float const f = static_cast<float>(i) / static_cast<float>(n);
+                        float const a = std::clamp((f - wipe) * 5.f, 0.f, 1.f); // a soft edge sweeping forward
+                        if (a <= 0.f) continue;
+                        ccColor4F const c{m_col1.r / 255.f * a, m_col1.g / 255.f * a, m_col1.b / 255.f * a, a};
+                        w.trailNode->drawSegment(CCPoint{pts[i - 1].x, pts[i - 1].y}, CCPoint{pts[i].x, pts[i].y}, tw, c);
+                    }
+                };
+                if (w.oldFade > 0.f) line(w.oldTrail, 1.2f * (1.f - w.oldFade / 0.5f) - 0.2f);
+                else w.oldTrail.clear();
+                line(w.trail, -1.f);
+            }
+            if (w.oldFade <= 0.f) wrap(w); // (parked while the old line wipes away)
+            place(w);
+            // Line the arrow up with its trail like GD: the trail runs into the
+            // back of the arrow (measured from the wave sprite as drawn, so it's
+            // right for any wave icon), turned with the arrow.
+            if (w.icon && w.icon->m_firstLayer) {
+                CCRect const bb = w.icon->m_firstLayer->boundingBox(); // in the icon's own space, unscaled
+                // the trail ends in the arrow's back notch: just inside its back edge
+                float const lx = bb.origin.x + bb.size.width * 0.2f, ly = bb.getMidY();
+                float const r = w.rot * 3.14159265f / 180.f;          // cocos turns clockwise
+                float const ox = (lx * std::cos(r) + ly * std::sin(r)) * RUN_WAVE_SCALE;
+                float const oy = (-lx * std::sin(r) + ly * std::cos(r)) * RUN_WAVE_SCALE;
+                w.icon->setPosition({w.x - ox, w.y - oy});
+            }
+        }
+    }
+
+    // GD death: a burst ring, squares flying out in your colours, the sound.
+    void explode(Runner& r) {
+        CCPoint const at = r.icon ? r.icon->getPosition() : CCPoint{r.x, r.y};
+        r.dead = 1.1f;
+        if (r.icon) r.icon->setVisible(false);
+        r.trail.clear();
+        if (r.trailNode) r.trailNode->clear();
+        if (auto* wave = CCCircleWave::create(1.f, RUN_HALF * 4.5f, 0.35f, false, true)) {
+            wave->m_color = m_col1;
+            wave->setPosition(at);
+            m_body->addChild(wave, 3);
+        }
+        for (int i = 0; i < 18; i++) {
+            float const ang = starRand(0.f, 6.2831853f), dist = starRand(8.f, 20.f);
+            ccColor3B const c = i % 3 == 0 ? ccColor3B{255, 255, 255} : (i % 3 == 1 ? m_col1 : m_col2);
+            float const sz = starRand(1.f, 2.2f);
+            auto* d = CCLayerColor::create(ccColor4B{c.r, c.g, c.b, 255}, sz, sz);
+            d->setPosition({at.x - sz / 2.f, at.y - sz / 2.f});
+            float const life = starRand(0.35f, 0.6f);
+            d->runAction(CCEaseOut::create(CCMoveBy::create(life, CCPoint{std::cos(ang) * dist, std::sin(ang) * dist}), 2.f));
+            d->runAction(CCSequence::create(CCFadeTo::create(life, 0), CCRemoveSelf::create(), nullptr));
+            if (m_trails) m_trails->addChild(d);
+        }
+        if (auto* fm = FMODAudioEngine::sharedEngine()) fm->playEffect("explode_11.ogg");
+    }
+
+    float starRand(float lo, float hi) {
+        m_starSeed = m_starSeed * 1664525u + 1013904223u;
+        return lo + (hi - lo) * static_cast<float>((m_starSeed >> 8) & 0xFFFF) / 65535.f;
+    }
+    // One streak: a thin line, bright at its head and fading to nothing at its
+    // tail, sliding down-left across the page while it fades in and out.
+    void spawnStar() {
+        if (!m_stars) return;
+        float const len = starRand(22.f, 52.f);
+        GLubyte const peak = static_cast<GLubyte>(starRand(170.f, 255.f));
+        auto* s = CCLayerGradient::create(ccColor4B{215, 190, 255, 0}, ccColor4B{255, 255, 255, 255}, CCPoint{1.f, 0.f});
+        s->setContentSize({len, 1.0f});
+        s->ignoreAnchorPointForPosition(false);
+        s->setAnchorPoint({1.f, 0.5f}); // the head leads
+        float const angle = starRand(14.f, 22.f);
+        s->setRotation(-angle + 180.f); // pointing down-left
+        float const travel = starRand(70.f, 130.f);
+        float const rad = angle * 3.14159265f / 180.f;
+        CCPoint const dir{-std::cos(rad) * travel, -std::sin(rad) * travel};
+        // start inside the page so the whole streak stays inside the window
+        float const x0 = starRand(len + travel * 0.6f, W - 10.f);
+        float const y0 = starRand(FOOT_H + travel * 0.4f + 6.f, H - TITLE_H - 6.f);
+        s->setPosition({x0, y0});
+        s->setOpacity(0);
+        float const t = starRand(0.9f, 1.5f);
+        s->runAction(CCMoveBy::create(t, dir));
+        s->runAction(CCSequence::create(CCFadeTo::create(t * 0.25f, peak), CCDelayTime::create(t * 0.35f),
+                                        CCFadeTo::create(t * 0.4f, 0), CCRemoveSelf::create(), nullptr));
+        m_stars->addChild(s);
+    }
+
     void update(float dt) override {
+        // background stars and the runners, only while the full window shows
+        if (isVisible() && !m_compactNow) stepRunners(dt);
+        if (m_stars && isVisible() && !m_compactNow) {
+            m_starIn -= dt;
+            if (m_starIn <= 0.f) {
+                m_starIn = starRand(0.12f, 0.38f);
+                spawnStar();
+            }
+        }
         // Display-only while the level runs: buttons off so clicks stay jumps.
         bool const interactive = !levelRunning();
         if (interactive != m_interactive) {
@@ -8965,6 +10018,7 @@ protected:
         }
         m_refreshAt -= dt;
         m_statsAge += dt;
+        m_badgeTapAge += dt;
         if (m_compactNow) {
             if (m_refreshAt <= 0.f && isVisible()) {
                 m_refreshAt = 0.25f;
@@ -8983,14 +10037,24 @@ protected:
         CCDirector::sharedDirector()->getTouchDispatcher()->addTargetedDelegate(this, PRIO_WINDOW, true);
     }
 
-    bool insideLocal(CCPoint p) const { return p.x >= 0.f && p.y >= 0.f && p.x <= W && p.y <= H; }
+    bool insideLocal(CCPoint p) const { return p.x >= 0.f && p.y >= 0.f && p.x <= FULL_W && p.y <= H; }
 
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
         if (!isVisible() || levelRunning()) return false;
         CCPoint const p = convertToNodeSpace(touch->getLocation());
         if (!insideLocal(p)) return false;
-        m_dragging = p.y >= H - TITLE_H;
-        m_scrollDrag = !m_dragging && isList(m_tab) && p.y > contentBottom() && p.y < contentTop();
+        // clicked one of the running icons: it dies like in GD
+        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
+            if (!r->icon || !r->icon->isVisible() || r->dead > 0.f) continue;
+            CCPoint const c = r->icon->getPosition();
+            if (std::hypot(p.x - c.x, p.y - c.y) <= RUN_HALF * 1.8f) {
+                explode(*r);
+                return true;
+            }
+        }
+        // drag: by the page header, or the sidebar's title block
+        m_dragging = p.y >= H - TITLE_H || (p.x < SIDE_W && p.y >= H - 40.f);
+        m_scrollDrag = !m_dragging && p.x >= SIDE_W && isList(m_tab) && p.y > contentBottom() && p.y < contentTop();
         m_dragAccum = 0.f;
         return true; // swallow: nothing behind the window gets this touch
     }
