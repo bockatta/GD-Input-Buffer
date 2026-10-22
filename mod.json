@@ -53,6 +53,12 @@
 			"default": "LeftAlt",
 			"category": "gameplay"
 		},
+		"pause-button": {
+			"type": "bool",
+			"name": "Pause Menu Button",
+			"description": "Shows the Input Buffer button (the green circle) in the pause menu, which opens the window. On phones it's the only way to open it, so leave it on there.",
+			"default": true
+		},
 		"window-size": {
 			"type": "float",
 			"name": "Window Size",

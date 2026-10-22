@@ -21,6 +21,7 @@
 - Click Guide removed (the level scan still feeds Snap To Scan). Tools: ASSISTS has Orb Helper and Snap To Scan; LEVEL SCAN has more room.
 - Dev mode (hidden): click the V2.2 badge 5 times quickly to turn it on / off. It shows the Stats tab (now hidden otherwise, to keep the sidebar short) and the Dev tab: what's happening right now - your player (mode, position, speed, holding), the last input (decision, delay vs window, what the click as made would do, the search), the input queue, your ship / wave rhythm, one-tick prediction accuracy per mode and the scan's internals. "Copy All" copies it plus the newest trace lines to paste to Claude.
 - The hints use the keys you set: the footer says your Window Key ("Left Alt to toggle", or e.g. "Ctrl+B to toggle"), and the Stage card says your Stage Cycle Key ("F6 cycles stages"); any key or key combo shows by name.
+- New setting "Pause Menu Button" (Geode mod settings, on by default): turn it off to hide the green Input Buffer button in the pause menu. (On phones it is the way to open the window.)
 - The pill at the top right shows your stage ("STAGE 2", "EXTREME", "CUSTOM", "OFF") instead of just "ON".
 - The page only slides in when you switch tabs - picking a stage, +/- or Apply no longer makes it jump.
 

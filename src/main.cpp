@@ -10188,6 +10188,8 @@ class $modify(BufMouse, CCMouseDispatcher) {
 class $modify(BufPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
+        // "Pause Menu Button" setting (2.2): turned off = no button.
+        if (!Mod::get()->getSettingValue<bool>("pause-button")) return;
         // GD's own green circle button (same base, rings, outline and shading as
         // the gear next to it) with the mod's icon on top. If the icon isn't in
         // the build (resources\ folder missing), fall back to the old text
