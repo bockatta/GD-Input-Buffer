@@ -1008,4 +1008,124 @@ AimPick pickOrbTick(int lo, int hi, int fineSpan, int maxTests, Probe&& probe) {
     return p;
 }
 
+// ----------------------------------------------------------------------------
+//  Wave rays (2.2)
+//
+//  A wave only ever moves in two straight lines: up or down at a fixed slope
+//  (1 px up per px forward, 2 for mini wave) at its forward speed. So "what
+//  happens if this input goes in d ticks late" is two line segments: the
+//  current direction for d ticks, then the new one. Casting those as rays
+//  against the hitboxes around you is hundreds of times cheaper than running
+//  the game's physics tick by tick - the trick wave bots use to keep up with
+//  spam (the cyan / green lines to the red squares).
+//
+//  Here it only PICKS which delay to test: the buffer still confirms that one
+//  delay with the full prediction before using it, so nothing the rays don't
+//  know (slopes, orbs, portals, moving parts) can make a click worse. And it
+//  only ever moves YOUR input inside your window - it never makes one.
+// ----------------------------------------------------------------------------
+struct RayBox {
+    float x = 0.f, y = 0.f, w = 0.f, h = 0.f; // origin (bottom-left) + size
+    float r = 0.f;      // > 0: a round hitbox (saws), centre of the box, this radius
+    bool  solid = false; // block: you can slide along its top / bottom, its sides kill
+};
+
+struct WaveRayIn {
+    float x = 0.f, y = 0.f;   // centre of your hitbox
+    float hw = 0.f, hh = 0.f; // half its width / height
+    float vx = 0.f;           // forward px per tick (negative going left)
+    float vy = 0.f;           // vertical px per tick, > 0 (|vx| x slope)
+    int   dirNow = 1;         // +1 going up, -1 going down (on screen) before the input
+    int   dirNew = -1;        // ... and after it
+};
+
+struct WaveRayHit {
+    int   tick = -1;        // first tick touching something deadly; -1 = clear all the way
+    float x = 0.f, y = 0.f; // where you are on that tick (or at the end, if clear)
+};
+
+namespace detail {
+inline bool rayTouches(float cx, float cy, float hw, float hh, RayBox const& b) {
+    if (b.r > 0.f) {
+        float const bx = b.x + b.w * 0.5f, by = b.y + b.h * 0.5f;
+        float const dx = std::max(std::fabs(cx - bx) - hw, 0.f);
+        float const dy = std::max(std::fabs(cy - by) - hh, 0.f);
+        return dx * dx + dy * dy < b.r * b.r;
+    }
+    return cx + hw > b.x && cx - hw < b.x + b.w && cy + hh > b.y && cy - hh < b.y + b.h;
+}
+} // namespace detail
+
+// Fly straight in `dir` from (x, y) for up to `n` ticks. Blocks' tops and
+// bottoms are floors / ceilings you slide along; their sides and every hazard
+// kill. Returns the first deadly tick (1 = the first step) and where you end.
+inline WaveRayHit waveRay(float x, float y, float hw, float hh, float vx, float vy, int dir, int n,
+                          std::vector<RayBox> const& boxes) {
+    constexpr float EPS = 0.01f;
+    WaveRayHit out;
+    for (int t = 1; t <= n; t++) {
+        float const px = x, py = y;
+        x += vx;
+        y += vy * static_cast<float>(dir);
+        bool dead = false;
+        for (auto const& b : boxes) {
+            if (!detail::rayTouches(x, y, hw, hh, b)) continue;
+            if (b.solid && b.r <= 0.f) {
+                // came down onto its top / up into its bottom: slide along it
+                if (dir < 0 && py - hh >= b.y + b.h - EPS) { y = b.y + b.h + hh; continue; }
+                if (dir > 0 && py + hh <= b.y + EPS)       { y = b.y - hh; continue; }
+                (void)px;
+            }
+            dead = true;
+            break;
+        }
+        if (!dead) {
+            // a slide can push you into another box: check once more
+            for (auto const& b : boxes) {
+                if (!detail::rayTouches(x, y, hw, hh, b)) continue;
+                if (b.solid && b.r <= 0.f && (std::fabs((y - hh) - (b.y + b.h)) < EPS || std::fabs((y + hh) - b.y) < EPS))
+                    continue; // resting on / under it
+                dead = true;
+                break;
+            }
+        }
+        if (dead) {
+            out.tick = t;
+            out.x = x;
+            out.y = y;
+            return out;
+        }
+    }
+    out.x = x;
+    out.y = y;
+    return out;
+}
+
+// The smallest delay d in [minD, maxD] that survives: `dirNow` for d ticks,
+// then `dirNew` for `commit` ticks (until your next input - after that, where
+// you go is that input's job). -1: none in the window. `nowHit` (optional)
+// gets the "on time" ray: where the input as made runs into something.
+inline int waveRayDelay(WaveRayIn const& in, int minD, int maxD, int commit, std::vector<RayBox> const& boxes,
+                        WaveRayHit* nowHit = nullptr) {
+    if (commit < 1) commit = 1;
+    // the path before the input goes in: dirNow, tick by tick
+    WaveRayHit const stay = waveRay(in.x, in.y, in.hw, in.hh, in.vx, in.vy, in.dirNow, std::max(maxD, 0), boxes);
+    int const lastD = stay.tick < 0 ? maxD : std::min(maxD, stay.tick - 1); // can't wait past a death
+    float x = in.x, y = in.y;
+    int best = -1;
+    for (int d = 0; d <= lastD; d++) {
+        if (d > 0) {
+            // one more tick in the old direction (same slide rules as waveRay)
+            WaveRayHit const step = waveRay(x, y, in.hw, in.hh, in.vx, in.vy, in.dirNow, 1, boxes);
+            if (step.tick >= 0) break;
+            x = step.x;
+            y = step.y;
+        }
+        WaveRayHit const go = waveRay(x, y, in.hw, in.hh, in.vx, in.vy, in.dirNew, commit, boxes);
+        if (d == 0 && nowHit) *nowHit = go;
+        if (d >= minD && go.tick < 0) { best = d; break; }
+    }
+    return best;
+}
+
 } // namespace ibcore

@@ -6,11 +6,11 @@
 		"android": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v2.2.0",
-	"id": "alquerez.inputbuffer",
-	"name": "Input Buffer",
+	"version": "v2.3.0",
+	"id": "alquerez.nova",
+	"name": "Nova",
 	"developer": "AlQuerez",
-	"description": "Discord: alquerez23",
+	"description": "Input buffer - Discord: alquerez23",
 	"resources": {
 		"sprites": [
 			"resources/*.png"
@@ -27,7 +27,7 @@
 		"stage": {
 			"type": "string",
 			"name": "Stage",
-			"description": "How much the buffer helps (how early a click can be and still be saved). Off = raw input. Stage 1: 1 frame. Stage 2: 2 frames. Stage 3: 3 frames (2 ship). Stage 4: 5 frames (4 wave, 2 ship). Extreme: 20 frames (12 wave, 2 ship). Custom: your own frames, set in the window (Left Alt) with Apply. F6 cycles through them.",
+			"description": "How much the buffer helps (how early a click can be and still be saved). Off = raw input. Stage 1: 1 frame. Stage 2: 2 frames. Stage 3: 3 frames (2 ship). Stage 4: 5 frames (4 wave, 2 ship). Extreme: 20 frames (12 wave, 2 ship). Custom: your own frames, set in the window (Left Alt). F6 cycles through them.",
 			"default": "Stage 1",
 			"one-of": [
 				"Off",
@@ -49,20 +49,20 @@
 		"window-key-v3": {
 			"type": "keybind",
 			"name": "Window Key",
-			"description": "Shows / hides the Input Buffer window (Log, Stats, Stage).",
+			"description": "Shows / hides the Nova window (Log, Stats, Stage).",
 			"default": "LeftAlt",
 			"category": "gameplay"
 		},
 		"pause-button": {
 			"type": "bool",
 			"name": "Pause Menu Button",
-			"description": "Shows the Input Buffer button (the green circle) in the pause menu, which opens the window. On phones it's the only way to open it, so leave it on there.",
+			"description": "Shows the Nova button (the green circle) in the pause menu, which opens the window. On phones it's the only way to open it, so leave it on there.",
 			"default": true
 		},
 		"window-size": {
 			"type": "float",
 			"name": "Window Size",
-			"description": "Size of the Input Buffer window.",
+			"description": "Size of the Nova window.",
 			"default": 1.0,
 			"min": 0.5,
 			"max": 2.0,
@@ -75,7 +75,7 @@
 		"window-opacity": {
 			"type": "float",
 			"name": "Window Opacity",
-			"description": "How see-through the Input Buffer window's background is (text stays solid).",
+			"description": "How see-through the Nova window's background is (text stays solid).",
 			"default": 0.95,
 			"min": 0.3,
 			"max": 1.0,
@@ -84,6 +84,12 @@
 				"slider": true,
 				"slider-step": 0.05
 			}
+		},
+		"online-count": {
+			"type": "bool",
+			"name": "Show Online Users",
+			"description": "Shows how many people have Nova and how many are online (top of the window). To count you, the game sends the Nova server an anonymous random ID every 90 seconds - nothing else about you. Turn off to stop sending it.",
+			"default": true
 		}
 	}
 }

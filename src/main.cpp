@@ -888,9 +888,15 @@
 // ============================================================================
 
 #include <Geode/Geode.hpp>
+#include <random>
+#include <unordered_set>
+#include <queue>
+#include <cctype>
 #include <Geode/ui/Notification.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 #include <Geode/ui/OverlayManager.hpp>
+#include <Geode/utils/web.hpp>
+#include <Geode/utils/async.hpp>
 #ifdef GEODE_IS_DESKTOP
 // keyboard hook header: desktop only (it doesn't compile on iOS - no
 // CCKeyboardDispatcher constructor address there; only macOS uses the hook)
@@ -924,6 +930,7 @@
 #include <unordered_map>
 #include <vector>
 #include "BufferCore.hpp"
+#include "NovaCourse.hpp"
 
 #if defined(GEODE_IS_MACOS) || defined(GEODE_IS_IOS)
 #include <sys/sysctl.h>
@@ -1167,7 +1174,6 @@ constexpr int    WAVE_GRACE_BASE         = 4;
 // 50 ms) instead of the 12-frame hold cap (2.1). A held release keeps the wave
 // going up, so a long hold read as "late" or "ignored" - past this it goes
 // through as you made it.
-constexpr int    WAVE_RELEASE_MAX_BASE   = 12;
 // Ship, light touch (2.2): a ship input is held at most 8 ticks (2 frames,
 // ~33 ms), and only for a crash in the next 24 ticks (100 ms) - anything later
 // is your next input's job. Holding ship inputs longer pulled you down off a
@@ -1198,6 +1204,21 @@ constexpr int    SCAN_REWIND_KEEP        = 12;    // ... the last 12 of them
 constexpr float  SCAN_REWIND_PX          = 120.f; // stuck: back up about 4 blocks
 constexpr float  SCAN_WIDE_PAST          = 90.f;  // and try harder until 3 blocks past the stuck spot
 constexpr float  SCAN_SKIP_PAST          = 30.f;  // last resort: go through the spot, 1 block past it
+constexpr int    SCAN_TRIES              = 3;     // (2.2) tries per stuck spot before going through it
+// (2.2) Ship: GD players straight fly - quick taps to stay level - instead of
+// long holds. A ship version pays a little for flying at an angle (per step,
+// full tilt), so of the ways through the scan keeps the level one.
+constexpr float  SCAN_SHIP_LEVEL         = 0.03f;
+constexpr float  SHIP_TILT_VY            = 6.f;   // m_yVelocity that counts as full tilt
+constexpr int    SCAN_ASTAR_MS           = 400;   // (2.2) A* time for one stuck spot (paused)
+constexpr int    SCAN_ASTAR_MAX          = 20000; // (2.2) ... and states at most
+constexpr float  END_SLACK               = 60.f;  // (2.2) this close to the level end = the end
+constexpr float  GROUND_Y                = 90.f;  // (2.2) top of GD's ground (a cube stands at y 105)
+constexpr float  LEVEL_MARGIN            = 150.f; // (2.2) how far past every object a scan version may go
+constexpr int    KILL_OUT_OF_LEVEL       = -2;    // (2.2) kill type: left the level's height range
+constexpr int    KILL_OFF_PATH           = -3;    // (2.2) kill type: nothing of the level near it
+constexpr float  OFF_PATH_PX             = 300.f; // (2.2) 10 blocks: a level's path is never further from its obstacles
+constexpr float  SIM_EXTRA_PAD           = 45.f;  // (2.2) objects this close to the hidden player always get checked
 constexpr int    REAL_DECIDE_TICKS       = 2;     // real-game scan: an input decision every 2 ticks
 constexpr int    REAL_CP_EVERY           = 8;     // a checkpoint every 8 decisions (16 ticks)
 constexpr int    REAL_CP_KEEP            = 48;    // keep the last 48 (~3 s to back up through)
@@ -1208,6 +1229,7 @@ constexpr float  ANCHOR_SAFE             = 90.f;  // ... and only kept if you go
 constexpr float  ROUTE_OFF_Y             = 300.f; // real player this far (10 blocks) off the scanned path ...
 constexpr int    ROUTE_OFF_CHECKS        = 90;    // ... for this many checks (every 4 ticks, ~1.5s) drops that part
 constexpr float  ROUTE_SNAP_Y_TOL        = 10.f; // you're on the scanned path if this close in height
+constexpr float  ROUTE_ON_PATH_Y         = 12.f; // (2.2) ... at your x (the pink line), to use it at all
 // A held click the live check never approves, with no click-time plan to fall
 // back on, goes in after this many base ticks (1 frame).
 constexpr int    LIVE_GIVEUP_BASE        = 4;
@@ -1306,6 +1328,10 @@ struct CustomFrames {
     }
 };
 
+// Custom Min / Max options (2.2, Stage tab, Custom stage only): in physics ticks, 240 a second
+// (4 ticks = 1 frame; the Log's "+6t" is ticks). Max 80 = no limit (Extreme's 20 frames).
+constexpr int MAX_TICKS_LIMIT = 80;
+
 int stageFromSetting(std::string const& v) {
     for (int i = 0; i < STAGE_COUNT; i++) if (v == STAGES[i].setting) return i;
     return 1;
@@ -1330,7 +1356,7 @@ struct Config {
     bool  autoWindow   = false; // (feature kept in code, not exposed)
     float autoWindowMax = 4.0f;
     bool  calibReset   = false;
-    bool  overlay      = false;
+    bool  rayView      = false; // Tools (2.2): Show Rays
     bool  orbHelper    = false; // Tools tab (2.1): an early click waits for the next orb
     bool  clickGuide   = false; // Tools tab (2.1): dots where the level scan's inputs go
     bool  routeSnap    = false; // Tools tab (2.1): early clicks snap to the scanned inputs (off by default)
@@ -1353,6 +1379,8 @@ struct Config {
     int   extremeHoldCap  = 48;   // base ticks @240 (12 frames) for ship/wave (live re-planning keeps it safe)
     float extremeAim      = 0.0f; // earliest safe delay (+ margin)
     bool  custom          = false; // Custom stage: your frames, Extreme's engine
+    int   minTicks        = 1;     // (2.2) Custom Min: smallest shift a buffered click gets, ticks @240 (Custom only)
+    int   maxTicks        = 80;    // (2.2) Custom Max: no click goes in later than this, ticks @240 (Custom only)
 
     static Config load() {
         auto* mod = Mod::get();
@@ -1376,12 +1404,17 @@ struct Config {
         c.hudScale   = static_cast<float>(mod->getSettingValue<double>("window-size"));
         c.hud        = mod->getSavedValue<bool>("window-shown", true);
         c.hudVerbose = mod->getSavedValue<bool>("log-safe-clicks", false);
-        c.overlay    = mod->getSavedValue<bool>("show-paths", false);
-        c.orbHelper  = mod->getSavedValue<bool>("orb-helper", false);
+        c.rayView    = mod->getSavedValue<bool>("show-rays", false);
+        c.maxTicks   = std::clamp(static_cast<int>(std::lround(mod->getSavedValue<double>("max-ticks", 1.0))), 1, MAX_TICKS_LIMIT);
+        c.minTicks   = std::clamp(static_cast<int>(std::lround(mod->getSavedValue<double>("min-ticks", 1.0))), 1, c.maxTicks);
+        c.orbHelper  = mod->getSavedValue<bool>("orb-helper", true); // on by default since 2.2
         c.clickGuide = false; // removed in 2.2
         c.routeSnap  = mod->getSavedValue<bool>("route-snap", false);
         c.scanView   = mod->getSavedValue<bool>("scan-view", true);
-        c.realScan   = mod->getSavedValue<bool>("real-scan", false);
+        // Real game (practice) is off in 2.2: it drove the whole level while
+        // paused and backed up with practice respawns - too fragile (crashes,
+        // stray results). Code kept for a proper rebuild.
+        c.realScan   = false;
         c.learnSpots = mod->getSavedValue<bool>("learn-spots", true);
         // Accuracy tracking records the path of every prediction and checks it
         // 100ms later: diagnostics, so only with "Log: show safe clicks" (1.26.0).
@@ -1467,17 +1500,9 @@ struct ModeInfo {
             int ext = holdBased() ? c.extremeHoldCap : c.extremeWindow;
             ext = static_cast<int>(std::lround(ext * s));
             t = std::max(t, ext);
-            // Wave / ship releases: short cap (WAVE_RELEASE_MAX_BASE), never
-            // below the stage's own release window (ship too since 2.1: held
-            // ship releases kept you climbing into the ceiling).
-            if ((wave || ship) && !push) {
-                int const cap = static_cast<int>(std::lround(WAVE_RELEASE_MAX_BASE * s));
-                float ownF = 1e9f;
-                if (wave) ownF = std::min(ownF, c.window[W_WAVE_REL]);
-                if (ship) ownF = std::min(ownF, c.window[W_SHIP_REL]);
-                int const own = static_cast<int>(std::floor(ownF / dt + 0.001f));
-                t = std::min(t, std::max(cap, own));
-            }
+            // (2.2) Releases get the same window as presses. They had a short
+            // cap here (3 frames on Extreme, vs 12 for a wave press), so an
+            // early release couldn't wait for its moment like a press can.
         }
         return t;
     }
@@ -1804,6 +1829,8 @@ struct TruncInfo {
     bool           valid = false;
     GameObjectType type  = GameObjectType::Decoration;
     float          gap   = 0.f; // px between the player's leading edge and the object (<= 0: touching)
+    int            tick  = -1;  // (2.2) sim step it was found on
+    GameObject*    obj   = nullptr; // (2.2) the object (only used while the level is open)
 };
 
 std::string describeTrunc(TruncInfo const& t) {
@@ -2086,14 +2113,14 @@ struct LogConsole {
         s_out = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             OPEN_EXISTING, 0, nullptr);
         if (s_out == INVALID_HANDLE_VALUE) s_out = nullptr;
-        SetConsoleTitleA("Input Buffer - Log");
+        SetConsoleTitleA("Nova - Log");
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCtrlHandler(ctrlHandler, TRUE);
         if (HWND w = GetConsoleWindow()) {
             if (HMENU m = GetSystemMenu(w, FALSE)) DeleteMenu(m, SC_CLOSE, MF_BYCOMMAND);
         }
         s_on = true;
-        write("Input Buffer log - every buffered click, release and death shows up here.", {198, 166, 255});
+        write("Nova log - every buffered click, release and death shows up here.", {198, 166, 255});
         write("Close it with the console button on the Log tab (closing this window would close the game).", {150, 150, 170});
         return true;
 #else
@@ -2260,10 +2287,6 @@ class TrajectoryBufferSim {
     // Live accuracy: prediction vs reality. A buffered click's check starts
     // when it actually fires, so it is aligned to the real step.
     ibcore::PredictionTracker m_tracker;
-    bool  m_trackPending = false;
-    std::vector<ibcore::Point2> m_pendingPath;
-    int   m_pendingDelay = 0;
-    int   m_pendingCheck = 0;
 
     // Auto windows (kept across sessions).
     ibcore::Calibrator m_calib[W_COUNT];
@@ -2280,7 +2303,6 @@ class TrajectoryBufferSim {
     struct AccCount { int checks = 0; int hits = 0; int deaths = 0; double errSum = 0.0; double dxSum = 0.0, dySum = 0.0; };
     std::map<std::string, AccCount> m_accByMode;
     std::string m_trackMode;        // mode of the check in progress
-    std::string m_pendingMode;      // mode of a buffered check waiting to start
     float m_autoW[W_COUNT] = {};            // auto window per mode (0 = still learning)
     bool  m_calibDirty = false;
 
@@ -2409,6 +2431,7 @@ class TrajectoryBufferSim {
     // Wave spam ("stream"): one steady shift for the whole stream (1.16.0)
     double m_streamLast  = -1e9; // last wave input (game time)
     double m_streamShift = 0.0;  // shift of the stream's inputs so far (game time)
+    bool   m_streamStartPush = true; // (2.2) the kind of input (press / release) that started the shift
     int    m_streak        = 0;
 
     // CPU budget controller
@@ -2577,117 +2600,19 @@ class TrajectoryBufferSim {
     // ------------------------------------------------------------------------
     //  Trajectory overlay + badge
     // ------------------------------------------------------------------------
-    // ---- Show paths: live preview ---------------------------------------------
-    // The path your NEXT input would take if made right now (press if you're
-    // not holding, release if you are), redrawn continuously: a line along the
-    // path plus the player hitbox (red outer, blue inner) at the start and at
-    // the predicted end. Green = safe, red = dies, yellow = cut short by an
-    // orb / portal the prediction can't see past. While a click is held back,
-    // it shows the "fire now?" path the live re-planner is testing.
-    static ccColor4F previewColor(SimEnd e) {
-        switch (e) {
-            case SimEnd::Died:      return ccColor4F{1.f, 0.3f, 0.3f, 0.9f};
-            case SimEnd::Truncated: return ccColor4F{1.f, 0.85f, 0.3f, 0.9f};
-            default:                return ccColor4F{0.2f, 0.85f, 0.25f, 0.9f};
-        }
-    }
-
-    bool ensureOverlay(PlayLayer* pl) {
-        if (!pl || !pl->m_objectLayer) return false;
-        if (!m_overlay.data()) {
-            m_overlay = CCDrawNode::create();
-            if (!m_overlay.data()) return false;
-        }
-        if (!m_overlay->getParent()) pl->m_objectLayer->addChild(m_overlay.data(), 9999);
-        return true;
-    }
-
-    void drawHitbox(CCPoint c, float rotDeg, float size, ccColor4F col, float width) {
-        float const h = size * 0.5f;
-        float const r = -rotDeg * 3.14159265f / 180.f;
-        float const cs = std::cos(r), sn = std::sin(r);
-        CCPoint pts[4];
-        float const corner[4][2] = {{-h, -h}, {h, -h}, {h, h}, {-h, h}};
-        for (int i = 0; i < 4; i++) {
-            pts[i] = CCPoint{c.x + corner[i][0] * cs - corner[i][1] * sn,
-                             c.y + corner[i][0] * sn + corner[i][1] * cs};
-        }
-        m_overlay->drawPolygon(pts, 4, ccColor4F{0.f, 0.f, 0.f, 0.f}, width, col);
-    }
-
-    // Circle outline (2.1: the path ends used to be squares).
-    void drawRing(CCPoint c, float radius, ccColor4F col, float width) {
-        constexpr int N = 20;
-        CCPoint pts[N];
-        for (int i = 0; i < N; i++) {
-            float const a = 6.2831853f * static_cast<float>(i) / static_cast<float>(N);
-            pts[i] = CCPoint{c.x + radius * std::cos(a), c.y + radius * std::sin(a)};
-        }
-        m_overlay->drawPolygon(pts, N, ccColor4F{0.f, 0.f, 0.f, 0.f}, width, col);
-    }
-
-    void drawPlayerBox(CCPoint c, float rotDeg, float size) {
-        (void)rotDeg;
-        drawRing(c, size * 0.5f, ccColor4F{1.f, 0.35f, 0.55f, 0.95f}, 1.0f);   // outer (pink)
-        drawRing(c, size * 0.18f, ccColor4F{0.25f, 0.45f, 1.f, 0.95f}, 1.0f);  // inner (blue)
-    }
-
-    void drawPreview(PlayLayer* pl, std::vector<ibcore::Point2> const& path, ccColor4F lineCol) {
-        if (path.size() < 2 || !ensureOverlay(pl)) return;
-        PlayerObject* p1 = pl->m_player1;
-        m_overlay->clear();
-        size_t const step = path.size() > 200 ? 2 : 1;
-        CCPoint prev = p1 ? p1->getPosition() : CCPoint{path[0].x, path[0].y};
-        for (size_t i = 0; i < path.size(); i += step) {
-            CCPoint const cur{path[i].x, path[i].y};
-            m_overlay->drawSegment(prev, cur, 1.1f, lineCol);
-            prev = cur;
-        }
-        float const size = 30.f * std::clamp(p1 ? p1->m_vehicleSize : 1.f, 0.3f, 1.3f);
-        if (p1) drawPlayerBox(p1->getPosition(), p1->getRotation(), size);
-        drawPlayerBox(CCPoint{path.back().x, path.back().y}, path.back().rot, size);
-        m_overlay->setVisible(true);
-        m_overlayShown = true;
-    }
-
-    void clearPreview() {
-        if (m_overlayShown && m_overlay.data()) m_overlay->clear();
-        m_overlayShown = false;
-    }
-
-    // Idle preview (no click held): "your next input, right now".
-    void updatePreview(PlayLayer* pl) {
-        Config const& c = cfg();
-        if (!c.overlay || !m_active) { clearPreview(); return; }
-        if (m_live && m_queue.pending()) return; // liveStep draws the held click's path
-        bool const next = !m_physicalHolding;
-        Ctx x;
-        if (!makeCtx(pl, next, c, x)) { clearPreview(); return; }
-        int const budget = clickBudgetUs(c) / 3; // display only: never crowd out real clicks
-        m_hasDeadline = budget > 0;
-        if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
-        m_recordPath = true;
-        SimResult const r = runSim(x, 0);
-        m_hasDeadline = false;
-        if (r.end == SimEnd::OutOfBudget) return;
-        drawPreview(pl, m_path, previewColor(r.end));
-    }
-
-    void tickOverlay() {
-        if (!cfg().overlay) clearPreview();
-    }
-
-    void releaseOverlay() {
-        if (m_overlay.data() && m_overlay->getParent()) m_overlay->removeFromParent();
-        m_overlay.swap(nullptr);
-        m_overlayShown = false;
-    }
 
 public:
     // ------------------------------------------------------------------------
     //  2.1: report trace, saved stats, click guide
     // ------------------------------------------------------------------------
     static constexpr size_t MAX_TRACE = 2000;
+    // (2.2) ground / band checks: their own list, so the scan's many trace
+    // lines can't push them out before an export
+    std::vector<std::string> m_groundLines;
+    void groundLog(std::string line) {
+        if (m_groundLines.size() < 200) m_groundLines.push_back(line);
+        trace(std::move(line));
+    }
     void trace(std::string line) {
         // console + "Log: more detail": every click's decision too (log lines are shown already)
         if (LogConsole::on() && line.rfind("log ", 0) != 0 && cfg().hudVerbose) {
@@ -2737,6 +2662,10 @@ public:
         m_attemptPending = true;
         m_trace.clear();
         trace(fmt::format("level \"{}\" ({})", m_lvlName, m_lvlKey));
+        m_groundTraces = 0;
+        m_groundSeen = reinterpret_cast<GameObject*>(1);
+        m_groundLines.clear();
+        releaseRayIndex(); // (2.2) built again from this level on its first wave input
         // anchors belong to this level session
         m_anchors.clear();
         m_attemptAnchors.clear();
@@ -2766,7 +2695,11 @@ public:
             float a = 0.f, b = 0.f;
             while (din >> a >> b) m_scanned.emplace_back(a, b);
         }
-        loadAnchors();
+        // (2.2) Runs saved in earlier sessions are NOT loaded any more: on disk
+        // they lose what they were touching (level objects only exist while
+        // the level is open), and the scan carrying on from one crashed GD in
+        // its collision code (a ground / slope it thought it had but didn't).
+        // Runs from this session are complete and still used.
         drawGuide(pl);
     }
 
@@ -2945,6 +2878,78 @@ public:
         if (p->m_isSwing) return 7;
         return 0;
     }
+    // (2.2) The floor / ceiling GD puts at a ship / UFO / wave / swing / ball /
+    // spider portal: GD's heights (getGroundHeightForMode: 300, ball 240,
+    // spider 270), centred on the portal you came through, never below the
+    // ground (y 90). 0 = none (cube, robot).
+    static float bandHeight(int mc) {
+        switch (mc) {
+            case 1: case 3: case 4: case 7: return 300.f;
+            case 2: return 240.f;
+            case 6: return 270.f;
+            default: return 0.f;
+        }
+    }
+    static bool bandOf(PlayerObject* p, float& lo, float& hi, float fallbackY = 0.f) {
+        float const h = bandHeight(modeCode(p));
+        if (h <= 0.f) return false;
+        float const cy = std::fabs(p->m_lastPortalPos.y) > 0.01f ? p->m_lastPortalPos.y : fallbackY;
+        if (std::fabs(cy) < 0.01f) {
+            // no portal yet: the level starts in this gamemode - GD's band then
+            // sits on the ground (Denouement: 90 .. 390, your releases at 384)
+            lo = GROUND_Y;
+            hi = lo + h;
+            return true;
+        }
+        lo = std::max(GROUND_Y, cy - h * 0.5f);
+        hi = lo + h;
+        return true;
+    }
+    // Scan / A* / pathfinder: keep the hidden player inside its band the way
+    // GD keeps you - you slide along the floor / ceiling, you don't fly out.
+    // Only when it was inside the band a tick ago (`prevY`): a band guess that
+    // doesn't match where you are (a start position, no portal yet) is left alone.
+    void bandClamp(PlayerObject* p, float prevY) {
+        float lo = 0.f, hi = 0.f;
+        if (!p || !bandOf(p, lo, hi)) return; // (no portal yet: the band from the ground, see bandOf)
+        CCRect const& r = p->getObjectRect();
+        float const hh = std::max(1.f, r.size.height * 0.5f);
+        if (prevY - hh < lo - 2.f || prevY + hh > hi + 2.f) return;
+        float const y = p->getPositionY();
+        bool const flip = p->m_isUpsideDown;
+        if (y - hh < lo) {
+            p->setPositionY(lo + hh);
+            if (p->m_yVelocity < 0.0) p->m_yVelocity = 0.0;
+            if (!flip) p->m_isOnGround = true;
+            m_bandClamps++;
+        } else if (y + hh > hi) {
+            p->setPositionY(hi - hh);
+            if (p->m_yVelocity > 0.0) p->m_yVelocity = 0.0;
+            if (flip) p->m_isOnGround = true;
+            m_bandClamps++;
+        }
+    }
+    long long m_bandClamps = 0;
+    // Any solid / spike / slope of the level within OFF_PATH_PX of the player?
+    // (A level's path always runs along its obstacles.) No index: can't tell, yes.
+    bool nearLevel(PlayerObject* p) const {
+        if (m_rayObjs.empty() || !p) return true;
+        float const x = p->getPositionX(), y = p->getPositionY();
+        if (x >= m_scanEndX - END_SLACK) return true; // the end of a level is often empty
+        float const lo = x - OFF_PATH_PX, hi = x + OFF_PATH_PX;
+        auto it = std::lower_bound(m_rayObjs.begin(), m_rayObjs.end(), lo - m_rayMaxW,
+                                   [](RayObj const& a, float v) { return a.x0 < v; });
+        for (; it != m_rayObjs.end() && it->x0 <= hi; ++it) {
+            if (it->x1 < lo) continue;
+            GameObject* o = it->obj;
+            if (o->m_isDisabled || o->m_isGroupDisabled) continue;
+            CCRect const& r = o->getObjectRect();
+            float const dx = std::max({r.getMinX() - x, 0.f, x - r.getMaxX()});
+            float const dy = std::max({r.getMinY() - y, 0.f, y - r.getMaxY()});
+            if (dx * dx + dy * dy <= OFF_PATH_PX * OFF_PATH_PX) return true;
+        }
+        return false;
+    }
     static int portalMode(GameObjectType t) {
         switch (t) {
             case GameObjectType::CubePortal:   return 0;
@@ -2986,6 +2991,9 @@ public:
     long long m_scanModeSwitches = 0;
     int       m_scanPortalTraces = 0;
     int       m_lastRealMode = -1;
+    float     m_realBandMin = 1e9f, m_realBandMax = -1e9f, m_realBandY = 0.f; // (2.2) band check
+    GameObject* m_groundSeen = reinterpret_cast<GameObject*>(1); // (2.2) ground check (pointer only compared)
+    int       m_groundTraces = 0;
 
     // Level scan (2.1): the moving state of a sim player, saved as plain values.
     // A test starts from the REAL player (gamemode, size, hitbox - everything
@@ -3037,8 +3045,28 @@ public:
 #undef IB_SNAP_SET
         p->m_touchedRings.clear();
         for (int id : s.touchedRings) p->m_touchedRings.insert(id);
+        // Scan crash fix (2.2): run states saved to disk come back with their
+        // level-object pointers empty (they only mean something while the level
+        // is open) but the flags that go with them still set - "on a slope"
+        // with no slope. When the scan carried on from such a state (stuck on a
+        // big level -> "used your run"), GD's slope / collision code followed
+        // the empty pointer and the game crashed. A missing object now means
+        // "not touching it": the next collision step finds the real one again.
+        if (!p->m_currentSlope) {
+            p->m_isOnSlope = false;
+            p->m_wasOnSlope = false;
+            p->m_isCollidingWithSlope = false;
+            p->m_isCurrentSlopeTop = false;
+        }
     }
     PlayerSnap const* m_simSnap = nullptr; // set: tests start from this state (level scan)
+    // (2.2) dual in the level scan: player 2's saved state (set: it's in the
+    // test too), a dual / solo portal touched during a test (1 / 2), and
+    // whether player 2 was still in it at the end
+    PlayerSnap const* m_simSnap2 = nullptr;
+    int  m_simDualReq = 0;
+    bool m_simP2Live = false;
+    bool m_scanTwoPlayer = false;          // a 2-player level: P2 has its own button, the scan leaves it be
     float m_scanClr = 1e9f;                // level scan: closest a test came to a hazard (every tick)
 
     // ------------------------------------------------------------------------
@@ -3076,7 +3104,26 @@ public:
         int   mode = 0;           // index in m_scanModeNames
         int   modeCode = 0;       // modeCode(): decides tap vs hold inputs
         std::vector<GameObject*> orbs; // orbs this version has used
+        bool  mini = false;       // (2.2) mini size (mini wave: finer heights)
+        // (2.2) dual: player 2's state - it gets the same inputs and has to live too
+        bool  dual = false;
+        PlayerSnap snap2;
+        float y2 = 0.f;
+        // (2.2) a ship tap (press, let go a tick later) is two route inputs
+        bool  tapRel = false;
+        BeamHist pend2;
     };
+
+    // (2.2) One tick of a sprint (see spSlice): the hidden player(s) after it.
+    struct SpTick {
+        PlayerSnap s1, s2;
+        bool  dual = false;
+        float x = 0.f, y = 0.f, y2 = 0.f;
+        double vy = 0.0;
+        int   modeCode = 0, modeIdx = 0;
+        bool  mini = false;
+    };
+    std::vector<SpTick>* m_simTrail = nullptr; // (2.2) set: every tick's state goes here (the sprint)
 
     // Drops history no surviving version leads back to (parents always come
     // before children, so one pass in order rebuilds it).
@@ -3198,6 +3245,8 @@ public:
         return m_routeFile.parent_path() / (m_lvlKey + "-runs.bin");
     }
     void saveAnchors() {
+        // (2.2) not saved any more - they aren't loaded back (see loadLevelExtras)
+        m_anchorsDirty = false;
         if (!m_anchorsDirty) return;
         auto const f = anchorsFile();
         if (f.empty()) return;
@@ -3283,6 +3332,7 @@ public:
     float       m_rewindLastX = -1e9f;
     float       m_scanWideUntil = -1e9f;       // trying harder until here
     float       m_scanWideAt = -1e9f;          // last spot it backed up for
+    int         m_scanWideLevel = 1;           // (2.2) 1..SCAN_TRIES: how hard it's trying at that spot
     float       m_realTriedAt = -1e9f;         // last spot the real game was tried at
     bool        m_scanNoclip = false;          // sim: deaths don't count (going through a spot)
     int         m_scanSkips = 0, m_scanBackups = 0, m_scanReal = 0;
@@ -3314,11 +3364,18 @@ public:
             m_scanMsg = "let the attempt start first (unpause for a moment, then pause and scan)";
             return;
         }
-        if (pl->m_gameState.m_isDualMode || pl->m_player1->m_isPlatformer) { m_scanMsg = "can't scan dual or platformer parts"; return; }
+        m_scanTwoPlayer = pl->m_level && pl->m_level->m_twoPlayerMode;
+        // (2.2) dual is scanned (both players get the same inputs and both have
+        // to live); a 2-player level's dual isn't - player 2 has its own button
+        if ((pl->m_gameState.m_isDualMode && m_scanTwoPlayer) || pl->m_player1->m_isPlatformer) {
+            m_scanMsg = "can't scan 2-player dual or platformer parts";
+            return;
+        }
         Config const& c = cfg();
         Ctx x;
         if (!makeCtx(pl, true, c, x)) { m_scanMsg = "can't scan from here"; return; }
         ensureSimPlayers(pl);
+        if (!m_simPlayer2.data()) m_simPlayer2 = createSimPlayer(pl); // (2.2) for dual portals on the way
         m_scanDt = x.dt;
         m_scanS = x.s;
         m_scanMode = ModeInfo{};
@@ -3331,6 +3388,9 @@ public:
         m_rewind.clear();
         m_rewindLastX = -1e9f;
         m_scanWideUntil = m_scanWideAt = m_realTriedAt = -1e9f;
+        m_scanWideLevel = 1;
+        m_astarTriedAt = -1e9f;
+        m_scanAStar = 0;
         m_scanSkips = m_scanBackups = m_scanReal = 0;
         m_scanSkipRanges.clear();
         m_scanDeathPts.clear();
@@ -3349,12 +3409,23 @@ public:
         root.x = pl->m_player1->getPositionX();
         root.y = pl->m_player1->getPositionY();
         root.vy = pl->m_player1->m_yVelocity;
+        root.mini = pl->m_player1->m_vehicleSize > 0.f && pl->m_player1->m_vehicleSize < 0.99f;
+        if (pl->m_gameState.m_isDualMode && pl->m_player2) {
+            root.dual = true;
+            root.snap2 = snapFrom(pl->m_player2);
+            root.y2 = pl->m_player2->getPositionY();
+        }
         m_beamHist.push_back(BeamHist{-1, root.x, root.y, false, root.held, static_cast<uint8_t>(root.mode)});
         root.hist = 0;
         m_beam.push_back(std::move(root));
         m_scanStartX = m_scanX = pl->m_player1->getPositionX();
         m_scanEndX = std::max(m_scanStartX + 1.f, pl->m_levelLength);
         m_scanState = ScanState::Running;
+        m_wdX = m_scanX;
+        m_wdUs = 0;
+        m_spResumeX = -1e9f;
+        m_spRuns = 0;
+        spStart(m_beam.front(), pl); // (2.2) sprint first
         trace(fmt::format("scan start at ({:.1f},{:.1f}) mode={} speed={:.2f} level length={:.0f}", m_scanStartX,
                           pl->m_player1->getPositionY(), m_scanMode.name(), pl->m_player1->m_playerSpeed, pl->m_levelLength));
     }
@@ -3436,11 +3507,20 @@ public:
     }
 
     void finishScan(PlayLayer* pl, std::string msg, std::vector<BeamNode> const* keepFrom) {
+        if (m_spOn && !m_spSt.empty()) {
+            // stopped mid-sprint: what it found so far still counts (the
+            // version list is old then - the sprint has it)
+            std::vector<BeamNode> end{spNode(spEnd())};
+            commitSegment(end);
+            if (keepFrom == &m_beam) keepFrom = nullptr;
+        }
+        m_spOn = false;
         if (keepFrom) commitSegment(*keepFrom);
         drawGuide(pl);
         {
             std::string extra;
             auto add = [&](std::string t) { extra += extra.empty() ? t : ", " + t; };
+            if (m_scanAStar > 0) add(fmt::format("A* solved {} spot{}", m_scanAStar, m_scanAStar == 1 ? "" : "s"));
             if (m_scanBackups > 0) add(fmt::format("tried harder {}x", m_scanBackups));
             if (m_scanJumps > 0) add(fmt::format("used your run {}x", m_scanJumps));
             if (m_scanReal > 0) add(fmt::format("used the real game {}x", m_scanReal));
@@ -3476,15 +3556,53 @@ public:
             drawScanView(pl);
             return;
         }
+        // (2.2) the sprint goes first; the version search only where it's stuck
+        if (m_spOn) {
+            spSlice(pl, t0);
+            if (scanning()) drawScanView(pl);
+            return;
+        }
+        // (2.2) Watchdog: a scan always finishes. A spot the version search
+        // hasn't got 1 block past in 8 seconds of scanning is gone through
+        // (marked unsolved), and the scan carries on.
+        if (m_scanX > m_wdX + 30.f) { m_wdX = m_scanX; m_wdUs = 0; }
+        if (m_wdUs > 8000000) {
+            m_wdUs = 0;
+            m_wdX = m_scanX + 30.f;
+            trace(fmt::format("scan: no progress at x={:.0f} for 8 s - going through it", m_scanX));
+            if (scanSkip(pl, m_scanX, false)) {
+                if (scanning() && !m_beam.empty()) { spStart(m_beam.front(), pl); m_spResumeX = -1e9f; }
+                return;
+            }
+        }
+        // the version search got past the sprint's stuck spot: sprint on
+        if (!m_beam.empty() && m_scanX >= m_spResumeX && m_spResumeX > -1e8f && m_scanX >= m_scanWideUntil) {
+            size_t best = 0;
+            for (size_t i = 1; i < m_beam.size(); i++) {
+                if (m_beam[i].x > m_beam[best].x + 0.5f ||
+                    (std::fabs(m_beam[i].x - m_beam[best].x) <= 0.5f && m_beam[i].cost < m_beam[best].cost)) best = i;
+            }
+            m_spResumeX = -1e9f;
+            spStart(m_beam[best], pl);
+            trace(fmt::format("scan: past the spot at x={:.0f} - sprinting again", m_beam[best].x));
+            return;
+        }
+        struct WdTimer { long long& us; Clock::time_point t; ~WdTimer() { us += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t).count(); } } wdTimer{m_wdUs, t0};
         while (std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() < SCAN_SLICE_US) {
             if (m_realScan) break; // the real game took over (next frame)
             // Step length: finer while any version is a wave (all versions stay
             // on the same tick), and every tick while trying harder.
             bool const wide = m_scanX < m_scanWideUntil;
-            int const beamCap = wide ? SCAN_BEAM_WIDE : SCAN_BEAM;
-            float const bucket = wide ? SCAN_Y_BUCKET_WIDE : SCAN_Y_BUCKET;
-            bool anyWave = false;
-            for (auto const& b : m_beam) if (b.modeCode == 4) anyWave = true;
+            // (2.2) each retry at the same spot doubles the versions and halves
+            // the height buckets (256 / 512 / 1024, 1.5 / 0.75 / 0.375 px)
+            int const lvl = std::clamp(m_scanWideLevel, 1, SCAN_TRIES);
+            int const beamCap = wide ? SCAN_BEAM_WIDE << (lvl - 1) : SCAN_BEAM;
+            float const bucket = wide ? SCAN_Y_BUCKET_WIDE / static_cast<float>(1 << (lvl - 1)) : SCAN_Y_BUCKET;
+            bool anyWave = false, anyMiniWave = false;
+            for (auto const& b : m_beam) {
+                if (b.modeCode == 4) anyWave = true;
+                if (b.modeCode == 4 && b.mini) anyMiniWave = true;
+            }
             int const k = wide ? 1
                         : anyWave ? std::max(1, static_cast<int>(std::lround(SCAN_STEP_WAVE * m_scanS)))
                                   : std::max(1, scaleTicks(SCAN_STEP_BASE, m_scanS));
@@ -3497,10 +3615,22 @@ public:
                 // "switch" (press / let go). Everything else: "nothing" or a TAP
                 // (press, let go a tick later) - holding a cube just bunny-hops,
                 // and the guide wants one dot per jump (2.1).
-                bool const holdMode = n.modeCode == 1 || n.modeCode == 4 || n.modeCode == 5;
-                for (int sw = 0; sw < 2; sw++) {
-                    bool const toggle = sw == 1;
-                    bool const held = holdMode ? (toggle ? !n.held : n.held) : false;
+                // (2.2) Cube holds too: holding re-jumps the moment you land and
+                // carries a press into an orb - real tricks the tap-only scan
+                // never tried. Cube: keep / switch the button / a tap.
+                // (2.2) Ball and spider too: a press held into the landing
+                // (GD's buffer click - it fires the moment you touch down).
+                // Ship: also a quick tap (press, let go a tick later) - GD's
+                // straight fly is taps, not holds.
+                bool const cubeHold = n.modeCode == 0 || n.modeCode == 2 || n.modeCode == 6;
+                bool const shipTap = n.modeCode == 1;
+                bool const holdMode = n.modeCode == 1 || n.modeCode == 4 || n.modeCode == 5 || cubeHold;
+                for (int sw = 0; sw < ((cubeHold || shipTap) ? 3 : 2); sw++) {
+                    if (sw == 2 && n.held) continue; // a tap needs the button up
+                    bool const isTap = (!holdMode && sw == 1) || sw == 2;
+                    bool const toggle = sw >= 1;
+                    bool const held = isTap ? false : (holdMode ? (sw == 1 ? !n.held : n.held) : false);
+                    bool const inputPush = isTap ? true : held;
                     // run k ticks from this version
                     bool const g = m_gameHolding;
                     float const ph = m_phase;
@@ -3512,14 +3642,16 @@ public:
                     m_realUsedOrbs = m_scanSavedOrbs;
                     for (auto* o : n.orbs) m_realUsedOrbs.push_back(o);
                     m_simSnap = n.fromReal ? nullptr : &n.snap;
+                    m_simSnap2 = n.dual ? &n.snap2 : nullptr;
                     m_scanSim = true;
                     int const delay = toggle ? 0 : k;
                     FollowUp tap;
-                    if (!holdMode && toggle) { tap.at[0] = 1; tap.held[0] = false; } // let go a tick later
-                    SimResult const r = simulate(pl, pl->m_player1, nullptr, false, holdMode ? held : true, delay,
+                    if (isTap) { tap.at[0] = 1; tap.held[0] = false; } // let go a tick later
+                    SimResult const r = simulate(pl, pl->m_player1, nullptr, false, isTap ? true : held, delay,
                                                  k - delay, true, m_scanDt, m_scanS, tap);
                     m_scanSim = false;
                     m_simSnap = nullptr;
+                    m_simSnap2 = nullptr;
                     m_gameHolding = g;
                     m_phase = ph;
                     m_recordPath = rec;
@@ -3546,6 +3678,14 @@ public:
                     c.vy = s1->m_yVelocity;
                     c.mode = scanModeIndex(s1);
                     c.modeCode = modeCode(s1);
+                    c.mini = s1->m_vehicleSize > 0.f && s1->m_vehicleSize < 0.99f;
+                    // ship: flying at an angle costs a little (straight fly is kept)
+                    if (c.modeCode == 1) c.cost += SCAN_SHIP_LEVEL * std::min(1.f, static_cast<float>(std::fabs(c.vy)) / SHIP_TILT_VY);
+                    c.dual = m_simP2Live;
+                    if (c.dual && m_simPlayer2.data()) {
+                        c.snap2 = snapFrom(m_simPlayer2.data());
+                        c.y2 = m_simPlayer2->getPositionY();
+                    }
                     if (c.modeCode != n.modeCode && m_scanPortalTraces < 40) {
                         m_scanPortalTraces++;
                         trace(fmt::format("scan: mode {} -> {} at ({:.1f},{:.1f}) vy={:.2f} onGround={} lastPortalPos=({:.1f},{:.1f})",
@@ -3555,7 +3695,10 @@ public:
                     c.orbs = n.orbs;
                     if (m_simOrbObj) c.orbs.push_back(m_simOrbObj);
                     // a tap is recorded as one press (no release); ship / wave / robot keep both
-                    c.pend = BeamHist{n.hist, n.x, n.y, toggle, holdMode ? held : true, static_cast<uint8_t>(n.mode)};
+                    c.pend = BeamHist{n.hist, n.x, n.y, toggle, inputPush, static_cast<uint8_t>(n.mode)};
+                    // (2.2) a ship tap: its release too, half a step on
+                    c.tapRel = isTap && shipTap;
+                    if (c.tapRel) c.pend2 = BeamHist{-1, (n.x + c.x) * 0.5f, (n.y + c.y) * 0.5f, true, false, static_cast<uint8_t>(n.mode)};
                     next.push_back(std::move(c));
                 }
             }
@@ -3591,10 +3734,13 @@ public:
             std::vector<BeamNode> uniq;
             uniq.reserve(next.size());
             {
-                std::set<std::tuple<int, int, int, int>> seen;
+                // (2.2) mini wave: twice as steep - heights twice as fine; dual: player 2's height counts too
+                float const yb = anyMiniWave ? bucket * 0.5f : bucket;
+                std::set<std::tuple<int, int, int, int, int>> seen;
                 for (auto& c : next) {
-                    auto const key = std::make_tuple(c.held ? 1 : 0, static_cast<int>(std::lround(c.y / bucket)),
-                                                     static_cast<int>(std::lround(c.vy * 2.0)), c.mode);
+                    auto const key = std::make_tuple(c.held ? 1 : 0, static_cast<int>(std::lround(c.y / yb)),
+                                                     static_cast<int>(std::lround(c.vy * 2.0)), c.mode,
+                                                     c.dual ? static_cast<int>(std::lround(c.y2 / yb)) + 1 : 0);
                     if (!seen.insert(key).second) continue;
                     uniq.push_back(std::move(c));
                 }
@@ -3623,6 +3769,12 @@ public:
             for (auto& c : kept) {
                 m_beamHist.push_back(c.pend);
                 c.hist = static_cast<int>(m_beamHist.size()) - 1;
+                if (c.tapRel) {
+                    c.pend2.parent = c.hist;
+                    m_beamHist.push_back(c.pend2);
+                    c.hist = static_cast<int>(m_beamHist.size()) - 1;
+                    c.tapRel = false;
+                }
             }
             m_beam = std::move(kept);
             // Through a gamemode portal: GD does more on a real portal entry
@@ -3690,19 +3842,34 @@ public:
     // So the scan always reaches the end.
     bool scanRecover(PlayLayer* pl, bool trunc) {
         float const stuckX = m_scanX;
-        if (!trunc && stuckX > m_scanWideAt + 30.f && !m_rewind.empty()) {
+        // (2.2) at the end of the level nothing is left to solve: done. (It used
+        // to "go through" spot after spot past the end - 39 000 of them.)
+        if (stuckX >= m_scanEndX - END_SLACK) {
+            finishScan(pl, "done - to the end of the level", &m_beam);
+            return true;
+        }
+        // (2.2) A* first: a tick-by-tick search of the spot from a few blocks back.
+        if (!trunc && scanAStar(pl, stuckX)) return true;
+        // (2.2) Up to SCAN_TRIES tries per spot, each backing up further (4 / 8 /
+        // 12 blocks) with more versions and finer heights - it used to try once
+        // and then go through the spot unsolved.
+        bool const sameSpot = std::fabs(stuckX - m_scanWideAt) <= 60.f;
+        int const tryNo = sameSpot ? m_scanWideLevel + 1 : 1;
+        if (!trunc && tryNo <= SCAN_TRIES && !m_rewind.empty()) {
+            m_scanWideLevel = tryNo;
             size_t pick = 0;
-            for (size_t i = 0; i < m_rewind.size(); i++) if (m_rewind[i].first <= stuckX - SCAN_REWIND_PX) pick = i;
+            float const backPx = SCAN_REWIND_PX * static_cast<float>(tryNo);
+            for (size_t i = 0; i < m_rewind.size(); i++) if (m_rewind[i].first <= stuckX - backPx) pick = i;
             std::vector<BeamNode> back = m_rewind[pick].second;
             float const bx = m_rewind[pick].first;
             m_rewind.erase(m_rewind.begin() + static_cast<std::ptrdiff_t>(pick) + 1, m_rewind.end());
             m_rewindLastX = bx;
             m_beam = std::move(back);
-            m_scanWideAt = stuckX;
+            if (!sameSpot) m_scanWideAt = stuckX; // the spot stays where it first got stuck
             m_scanWideUntil = stuckX + SCAN_WIDE_PAST;
             m_scanBackups++;
-            trace(fmt::format("scan: every version dies at x={:.0f} ({}) - backing up to x={:.0f} and trying harder",
-                              stuckX, m_scanLastWhat, bx));
+            trace(fmt::format("scan: every version dies at x={:.0f} ({}) - backing up to x={:.0f}, try {} of {}",
+                              stuckX, m_scanLastWhat, bx, tryNo, SCAN_TRIES));
             return true;
         }
         if (scanJump(trunc ? "can't simulate what's ahead" : "every version dies")) {
@@ -3723,6 +3890,10 @@ public:
     // Last resort: the furthest version goes through the spot with deaths
     // ignored until a block past it, and the scan carries on from there.
     bool scanSkip(PlayLayer* pl, float stuckX, bool trunc) {
+        if (stuckX >= m_scanEndX - END_SLACK) { // (2.2) never past the end
+            finishScan(pl, "done - to the end of the level", &m_beam);
+            return true;
+        }
         if (m_beam.empty() || !pl) return false;
         size_t best = 0;
         for (size_t i = 1; i < m_beam.size(); i++) {
@@ -3730,7 +3901,8 @@ public:
                 (std::fabs(m_beam[i].x - m_beam[best].x) <= 0.5f && m_beam[i].cost < m_beam[best].cost)) best = i;
         }
         BeamNode cur = m_beam[best];
-        bool const holdMode = cur.modeCode == 1 || cur.modeCode == 4 || cur.modeCode == 5;
+        bool const holdMode = cur.modeCode == 1 || cur.modeCode == 4 || cur.modeCode == 5 || cur.modeCode == 0 ||
+                              cur.modeCode == 2 || cur.modeCode == 6;
         float const target = stuckX + SCAN_SKIP_PAST;
         for (int chunk = 0; chunk < 900 && cur.x < target; chunk++) {
             bool const g = m_gameHolding;
@@ -3743,6 +3915,7 @@ public:
             m_realUsedOrbs = m_scanSavedOrbs;
             for (auto* o : cur.orbs) m_realUsedOrbs.push_back(o);
             m_simSnap = cur.fromReal ? nullptr : &cur.snap;
+            m_simSnap2 = cur.dual ? &cur.snap2 : nullptr;
             m_scanSim = true;
             m_scanNoclip = true;
             int const k = std::max(1, scaleTicks(4, m_scanS));
@@ -3751,6 +3924,7 @@ public:
             m_scanNoclip = false;
             m_scanSim = false;
             m_simSnap = nullptr;
+            m_simSnap2 = nullptr;
             m_gameHolding = g;
             m_phase = ph;
             m_recordPath = rec;
@@ -3764,6 +3938,12 @@ public:
             cur.vy = s1->m_yVelocity;
             cur.mode = scanModeIndex(s1);
             cur.modeCode = modeCode(s1);
+            cur.mini = s1->m_vehicleSize > 0.f && s1->m_vehicleSize < 0.99f;
+            cur.dual = m_simP2Live;
+            if (cur.dual && m_simPlayer2.data()) {
+                cur.snap2 = snapFrom(m_simPlayer2.data());
+                cur.y2 = m_simPlayer2->getPositionY();
+            }
             if (nx <= cur.x + 0.01f) { cur.x = nx; break; } // not moving (stuck in a wall)
             cur.x = nx;
         }
@@ -3790,6 +3970,245 @@ public:
         trace(fmt::format("scan: couldn't solve x={:.0f} ({}) - went through to x={:.0f} and carried on", stuckX,
                           trunc ? "can't simulate it" : m_scanLastWhat, nx));
         return true;
+    }
+
+    // ------------------------------------------------------------------------
+    //  Sprint (2.2): the scan's fast way forward. One hidden player plays on
+    //  with the button as it is; when it dies, it goes back a little and tries
+    //  the input one step earlier at a time (latest first - like a player who
+    //  clicks as late as is safe), keeping the first that survives well past
+    //  the death with a little room from hazards. Mostly it's one simulation
+    //  per chunk of the level instead of dozens of versions every 2 ticks, so
+    //  the scan gets through long levels. Where no input in its last second
+    //  saves it, the version search (beam, A*, tries) takes that spot, and the
+    //  sprint carries on a few blocks past it.
+    // ------------------------------------------------------------------------
+    static constexpr int   SP_CHUNK_BASE  = 60;   // ticks (240 TPS) per forward run
+    static constexpr int   SP_BACK_BASE   = 240;  // how far back an input is tried (1 s)
+    static constexpr int   SP_MARGIN_BASE = 48;   // a try has to live this long past the old death
+    static constexpr float SP_SAFE_CLR    = 4.f;  // px from hazards for a try to count as "safe"
+    static constexpr float SP_RESUME_PX   = 90.f; // after the version search solved a spot, sprint again this far on
+    bool  m_spOn = false;
+    std::deque<SpTick> m_spSt;        // states: m_spSt[i] is the state at tick m_spBase + i
+    std::deque<uint8_t> m_spHeld;     // the button during tick m_spBase + i
+    std::map<int, bool> m_spEvents;   // inputs: tick -> press / release (taps: press only)
+    int   m_spBase = 0;
+    int   m_spHist = -1;              // the history entry the committed part ends on
+    int   m_spLastEvent = -1;         // never tries an input at or before the last one
+    int   m_spLastCommit = 0;         // ticks before this are in the history already
+    std::vector<GameObject*> m_spOrbs;
+    float m_spResumeX = -1e9f;
+    float m_wdX = -1e9f;              // watchdog: where the version search last made progress
+    long long m_wdUs = 0;             // ... and the scanning time since
+    long long m_spRuns = 0;
+
+    int spEnd() const { return m_spBase + static_cast<int>(m_spSt.size()) - 1; } // the newest tick
+    SpTick const& spAt(int t) const { return m_spSt[static_cast<size_t>(t - m_spBase)]; }
+    bool spHeldAt(int t) const {
+        if (t < m_spBase) return false;
+        size_t const i = static_cast<size_t>(t - m_spBase);
+        return i < m_spHeld.size() ? m_spHeld[i] != 0 : (m_spHeld.empty() ? false : m_spHeld.back() != 0);
+    }
+    static bool spTapMode(int mc) { return !(mc == 1 || mc == 4 || mc == 5); } // ship / wave / robot hold; the rest tap
+    static SpTick spFromBeam(BeamNode const& b, PlayLayer* pl) {
+        SpTick t;
+        t.s1 = b.fromReal && pl && pl->m_player1 ? snapFrom(pl->m_player1) : b.snap;
+        t.dual = b.dual;
+        t.s2 = b.snap2;
+        t.x = b.x; t.y = b.y; t.y2 = b.y2; t.vy = b.vy;
+        t.modeCode = b.modeCode; t.modeIdx = b.mode; t.mini = b.mini;
+        return t;
+    }
+
+    // Start sprinting from a version (its history goes on from it).
+    void spStart(BeamNode const& b, PlayLayer* pl) {
+        m_spSt.clear();
+        m_spHeld.clear();
+        m_spEvents.clear();
+        m_spSt.push_back(spFromBeam(b, pl));
+        m_spHeld.push_back(b.held ? 1 : 0);
+        m_spBase = 0;
+        m_spHist = b.hist;
+        m_spLastEvent = -1;
+        m_spLastCommit = 0;
+        m_spOrbs = b.orbs;
+        m_spOn = true;
+    }
+
+    // One run from tick `t`: `push` from its start (a tap: let go a tick later),
+    // `ticks` long. The states it lived through go to `trail`.
+    // `keep`: carry on as is (no new press / release - GD would take a second
+    // press of a held button as a fresh click).
+    SimResult spRun(PlayLayer* pl, int t, bool push, bool tap, int ticks, std::vector<SpTick>& trail, bool keep = false) {
+        SpTick const& from = spAt(t);
+        trail.clear();
+        bool const g = m_gameHolding;
+        float const ph = m_phase;
+        bool const rec = m_recordPath;
+        // the button going into tick t (carrying on: as it is during tick t)
+        m_gameHolding = keep ? spHeldAt(t) : (t > m_spBase ? spHeldAt(t - 1) : (m_spHeld.empty() ? false : m_spHeld.front() != 0));
+        m_phase = 0.f;
+        m_recordPath = false;
+        m_hasDeadline = false;
+        m_realUsedOrbs = m_scanSavedOrbs;
+        for (auto* o : m_spOrbs) m_realUsedOrbs.push_back(o);
+        m_simSnap = &from.s1;
+        m_simSnap2 = from.dual ? &from.s2 : nullptr;
+        m_scanSim = true;
+        m_simTrail = &trail;
+        FollowUp f;
+        if (tap) { f.at[0] = 1; f.held[0] = false; }
+        SimResult const r = keep ? simulate(pl, pl->m_player1, nullptr, false, push, ticks, 0, true, m_scanDt, m_scanS)
+                                 : simulate(pl, pl->m_player1, nullptr, false, push, 0, ticks, true, m_scanDt, m_scanS, f);
+        m_simTrail = nullptr;
+        m_scanSim = false;
+        m_simSnap = nullptr;
+        m_simSnap2 = nullptr;
+        m_gameHolding = g;
+        m_phase = ph;
+        m_recordPath = rec;
+        m_realUsedOrbs = m_scanSavedOrbs;
+        m_spRuns++;
+        m_scanSteps += ticks;
+        return r;
+    }
+
+    // Keep tick `t`'s states and everything before it, then add `trail` after it.
+    void spAppend(int t, bool held0, bool heldRest, std::vector<SpTick>& trail, GameObject* orb) {
+        size_t const keep = static_cast<size_t>(t - m_spBase + 1);
+        if (m_spSt.size() > keep) m_spSt.resize(keep);
+        m_spHeld.resize(keep);
+        for (size_t i = 0; i < trail.size(); i++) {
+            m_spSt.push_back(std::move(trail[i]));
+            m_spHeld.push_back(heldRest ? 1 : 0);
+        }
+        // m_spHeld[k] is the button during tick base+k: tick t itself
+        m_spHeld[keep - 1] = held0 ? 1 : 0;
+        m_spEvents.erase(m_spEvents.upper_bound(t - 1), m_spEvents.end());
+        float maxX = m_scanX;
+        for (size_t i = keep; i < m_spSt.size(); i++) maxX = std::max(maxX, m_spSt[i].x);
+        m_scanX = maxX;
+        if (orb) m_spOrbs.push_back(orb);
+    }
+
+    // History up to tick `upTo` (inputs, and a point every 8 ticks for the line).
+    void spCommit(int upTo) {
+        upTo = std::min(upTo, spEnd());
+        for (int t = std::max(m_spLastCommit, m_spBase); t < upTo; t++) {
+            SpTick const& s = spAt(t);
+            auto ev = m_spEvents.find(t);
+            if (ev != m_spEvents.end()) {
+                m_beamHist.push_back(BeamHist{m_spHist, s.x, s.y, true, ev->second, static_cast<uint8_t>(s.modeIdx)});
+                m_spHist = static_cast<int>(m_beamHist.size()) - 1;
+            } else if ((t & 7) == 0) {
+                m_beamHist.push_back(BeamHist{m_spHist, s.x, s.y, false, spHeldAt(t), static_cast<uint8_t>(s.modeIdx)});
+                m_spHist = static_cast<int>(m_beamHist.size()) - 1;
+            }
+        }
+        m_spLastCommit = std::max(m_spLastCommit, upTo);
+        // drop what's committed and far enough behind (memory: a long level)
+        int const back = 2 * scaleTicks(SP_BACK_BASE, m_scanS);
+        while (static_cast<int>(m_spSt.size()) > 1 && m_spBase < m_spLastCommit - back && m_spBase < m_spLastEvent) {
+            m_spSt.pop_front();
+            m_spHeld.pop_front();
+            m_spBase++;
+        }
+    }
+
+    // The sprint's state at tick t as a version (for the version search / the route).
+    BeamNode spNode(int t) {
+        spCommit(t);
+        SpTick const& s = spAt(t);
+        BeamNode b;
+        b.snap = s.s1;
+        b.fromReal = false;
+        b.held = t > m_spBase ? spHeldAt(t - 1) : spHeldAt(t); // the button going into tick t
+        b.x = s.x; b.y = s.y; b.vy = s.vy;
+        b.mode = s.modeIdx; b.modeCode = s.modeCode; b.mini = s.mini;
+        b.dual = s.dual; b.snap2 = s.s2; b.y2 = s.y2;
+        b.orbs = m_spOrbs;
+        b.hist = m_spHist;
+        return b;
+    }
+
+    // Hand over to the version search from tick t (the sprint is stuck after it).
+    void spToBeam(int t) {
+        BeamNode b = spNode(t);
+        m_spOn = false;
+        m_beam.clear();
+        m_beam.push_back(std::move(b));
+        m_rewind.clear();
+        m_rewindLastX = -1e9f;
+        m_scanLastMode = m_beam.front().modeCode;
+    }
+
+    // One frame of sprinting. Returns when the slice's time is used.
+    void spSlice(PlayLayer* pl, Clock::time_point t0) {
+        int const chunk = std::max(4, scaleTicks(SP_CHUNK_BASE, m_scanS));
+        int const back = std::max(8, scaleTicks(SP_BACK_BASE, m_scanS));
+        int const margin = std::max(4, scaleTicks(SP_MARGIN_BASE, m_scanS));
+        std::vector<SpTick> trail;
+        while (m_spOn && std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() < SCAN_SLICE_US) {
+            int const T = spEnd();
+            SpTick const& cur = spAt(T);
+            if (cur.x >= m_scanEndX - 1.f) {
+                std::vector<BeamNode> end{spNode(T)};
+                m_spOn = false;
+                finishScan(pl, "done - to the end of the level", &end);
+                return;
+            }
+            bool const held = spHeldAt(T);
+            SimResult const r = spRun(pl, T, held, false, chunk, trail, true);
+            if (r.end == SimEnd::Survived) {
+                spAppend(T, held, held, trail, m_simOrbObj);
+                if (spEnd() - m_spLastCommit > 4 * back) spCommit(spEnd() - back);
+                continue;
+            }
+            if (r.end != SimEnd::Died) { spToBeam(T); return; } // something it can't simulate: the version search decides
+            // It dies `trail.size()` ticks on. Keep what it lived through, then try
+            // an input one step earlier at a time (latest first), from just
+            // before the death back up to a second - never before the last input.
+            int const death = T + static_cast<int>(trail.size()) + 1;
+            m_scanLastWhat = deathWhat(r) + fmt::format(" - at ({:.0f},{:.0f})", m_simKillPos.x, m_simKillPos.y);
+            m_scanDeathPts.push_back(m_simKillPos);
+            if (m_scanDeathPts.size() > 300) m_scanDeathPts.pop_front();
+            spAppend(T, held, held, trail, nullptr);
+            int const mc = spAt(spEnd()).modeCode;
+            int const step = mc == 4 ? 1 : std::max(1, scaleTicks(2, m_scanS));
+            int const lo = std::max({m_spLastEvent + 1, m_spBase, death - back});
+            int bestJ = -1;
+            float bestClr = -1.f;
+            bool bestTap = false, bestPush = false;
+            GameObject* bestOrb = nullptr;
+            std::vector<SpTick> bestTrail;
+            for (int j = std::min(death - 1, spEnd()); j >= lo; j -= step) {
+                SpTick const& sj = spAt(j);
+                bool const tap = spTapMode(sj.modeCode) && !spHeldAt(j > m_spBase ? j - 1 : j);
+                bool const push = tap ? true : !spHeldAt(j > m_spBase ? j - 1 : j);
+                int const need = death - j + margin;
+                SimResult const rj = spRun(pl, j, push, tap, need, trail);
+                if (rj.end != SimEnd::Survived) continue;
+                float const clr = m_scanClr;
+                if (clr > bestClr) { bestClr = clr; bestJ = j; bestTap = tap; bestPush = push; bestTrail = trail; bestOrb = m_simOrbObj; }
+                if (clr >= SP_SAFE_CLR) break; // the latest safe one
+                if (std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() > SCAN_SLICE_US * 4) break;
+            }
+            if (bestJ < 0) {
+                // no input in reach saves it: the version search takes this spot
+                trace(fmt::format("scan: sprint stuck at x={:.0f} ({}) - the version search takes it", spAt(spEnd()).x, m_scanLastWhat));
+                m_spResumeX = spAt(spEnd()).x + SP_RESUME_PX;
+                // from a second back (its inputs after that are the search's to
+                // redo), on a tick without an input of its own
+                int h = std::min(spEnd(), std::max(m_spBase, death - back));
+                while (h > m_spBase && m_spEvents.count(h)) h--;
+                spToBeam(h);
+                return;
+            }
+            bool const after = bestTap ? false : bestPush;
+            spAppend(bestJ, bestTap ? true : bestPush, after, bestTrail, bestOrb);
+            m_spEvents[bestJ] = bestPush;
+            m_spLastEvent = bestJ;
+        }
     }
 
     // ---- scan view (2.1, Tools: "Show scan"): the versions' paths while it
@@ -3823,6 +4242,9 @@ public:
             }
         }
         for (auto const& d : m_scanDeathPts) {
+            // (2.2) only around where it's working now (10 blocks back): older
+            // dots from spots it already solved / backed up from were just noise
+            if (d.x < m_scanX - 300.f) continue;
             CCPoint pts[6];
             for (int i = 0; i < 6; i++) {
                 float const a = 6.2831853f * static_cast<float>(i) / 6.f;
@@ -3838,6 +4260,551 @@ public:
     void releaseScanView() {
         if (m_scanViewNode.data() && m_scanViewNode->getParent()) m_scanViewNode->removeFromParent();
         m_scanViewNode.swap(nullptr);
+    }
+
+    // ------------------------------------------------------------------------
+    //  A* pathfinding (2.2): the search behind the live pathfinder (Show Rays)
+    //  and the level scan's stuck spots.
+    //
+    //  A state = the hidden player after some ticks (its full saved state) +
+    //  whether the button is held. From each state two moves: keep doing what
+    //  you do, or switch (press / let go; cube-type modes: a tap) - each move
+    //  is `k` ticks of the real game physics (wave 1 tick, ship 2, the rest 4,
+    //  at 240 TPS). Cost g = ticks so far + 6 per input + a penalty for
+    //  brushing past spikes; estimate h = ticks still needed to reach the goal
+    //  at your speed. It always expands the state with the lowest g + h (ties:
+    //  the furthest one), never a state it has already seen (same tick, height,
+    //  falling speed, button, gamemode), and a state that dies is dropped - so
+    //  it goes deep along the best line, and backs up to the next best the
+    //  moment that line dies, instead of keeping a fixed set of versions.
+    // ------------------------------------------------------------------------
+    struct ANode {
+        PlayerSnap snap;
+        bool  useSnap = true;     // false: the real player as it is (paused scan start)
+        bool  held = false;
+        bool  inputPush = true;   // what the move into this state pressed (if toggled)
+        bool  toggled = false;
+        int   modeCode = 0;
+        int   modeIdx = 0;        // scan: index in m_scanModeNames
+        float x = 0.f, y = 0.f;
+        double vy = 0.0;
+        int   tick = 0;
+        float g = 0.f;
+        int   parent = -1;
+        int   hist = -1;          // scan: the start state's history entry
+        std::vector<GameObject*> orbs;
+        bool  mini = false;       // (2.2) mini size (mini wave: finer heights)
+        bool  dual = false;       // (2.2) player 2 is in it too (same inputs)
+        PlayerSnap snap2;
+        float y2 = 0.f;
+        bool  tapRel = false;     // (2.2) the move was a ship tap: a release half a step on
+    };
+    struct AStarRun {
+        std::vector<ANode> nodes;
+        std::priority_queue<std::tuple<float, int, int>> open; // (-f, tick, index)
+        std::unordered_set<uint64_t> seen;
+        float goalX = 0.f, dir = 1.f, speed = 0.05f;
+        float dt = BASE_DT, s = 1.f;
+        int   expansions = 0;
+        int   deepest = -1;       // furthest state so far
+        int   goal = -1;          // reached the goal
+    };
+    static constexpr float ASTAR_INPUT_COST = 6.f;  // an input "costs" 6 ticks: fewer inputs when it can
+    static constexpr float ASTAR_CLOSE_COST = 3.f;  // per move spent right at a spike
+    static constexpr float ASTAR_Y_BUCKET   = 1.5f; // states closer in height than this are the same
+
+    static int astarStep(int modeCode, float s) {
+        if (modeCode == 4) return std::max(1, scaleTicks(1, s)); // wave: every tick (release precision)
+        if (modeCode == 1) return std::max(1, scaleTicks(2, s)); // ship
+        return std::max(1, scaleTicks(4, s));
+    }
+    static uint64_t astarKey(ANode const& n) {
+        // (2.2) mini wave is twice as steep: heights twice as fine
+        float const yb = (n.modeCode == 4 && n.mini) ? ASTAR_Y_BUCKET * 0.5f : ASTAR_Y_BUCKET;
+        uint64_t h = static_cast<uint64_t>(n.tick) * 1000003ull;
+        h ^= static_cast<uint64_t>(static_cast<int64_t>(std::lround(n.y / yb)) + 1000000) * 0x9E3779B97F4A7C15ull;
+        if (n.dual) h ^= static_cast<uint64_t>(static_cast<int64_t>(std::lround(n.y2 / yb)) + 7000000) * 0xD6E8FEB86659FD93ull;
+        h ^= static_cast<uint64_t>(static_cast<int64_t>(std::lround(n.vy * 4.0)) + 100000) * 0xC2B2AE3D27D4EB4Full;
+        h ^= (n.held ? 1ull : 0ull) << 61;
+        h ^= static_cast<uint64_t>(n.modeCode & 15) << 56;
+        return h;
+    }
+    void astarPush(AStarRun& a, ANode&& n) {
+        if (!a.seen.insert(astarKey(n)).second) return; // been here
+        float const remain = std::max(0.f, (a.goalX - n.x) * a.dir);
+        float const f = n.g + remain / std::max(0.05f, a.speed);
+        int const idx = static_cast<int>(a.nodes.size());
+        int const tick = n.tick;
+        bool const furthest = a.deepest < 0 || (n.x - a.nodes[static_cast<size_t>(a.deepest)].x) * a.dir > 0.f;
+        a.nodes.push_back(std::move(n));
+        if (furthest) a.deepest = idx;
+        if ((a.nodes.back().x - a.goalX) * a.dir >= 0.f) { a.goal = idx; return; }
+        a.open.emplace(-f, tick, idx);
+    }
+    // One move from state `n`: 0 keep, 1 switch the button (cube-type: a
+    // tap), 2 a tap (cube, button up: cube holds re-jump / carry into orbs,
+    // so a cube has both). False = died / can't tell / not a move here.
+    bool astarMove(PlayLayer* pl, AStarRun const& a, ANode const& n, int move, std::vector<GameObject*> const& baseOrbs,
+                   ANode& out) {
+        // (2.2) ball / spider hold into a landing like the cube; the ship also taps (straight fly)
+        bool const cubeHold = n.modeCode == 0 || n.modeCode == 2 || n.modeCode == 6;
+        bool const shipTap = n.modeCode == 1;
+        bool const holdMode = n.modeCode == 1 || n.modeCode == 4 || n.modeCode == 5 || cubeHold;
+        if (move == 2 && (!(cubeHold || shipTap) || n.held)) return false;
+        bool const toggle = move >= 1;
+        bool const isTap = (!holdMode && move == 1) || move == 2;
+        int const k = astarStep(n.modeCode, a.s);
+        bool const held = isTap ? false : (holdMode ? (move == 1 ? !n.held : n.held) : false);
+        bool const g = m_gameHolding;
+        float const ph = m_phase;
+        bool const rec = m_recordPath;
+        m_gameHolding = holdMode ? n.held : false;
+        m_phase = 0.f;
+        m_recordPath = false;
+        m_hasDeadline = false;
+        m_realUsedOrbs = baseOrbs;
+        for (auto* o : n.orbs) m_realUsedOrbs.push_back(o);
+        m_simSnap = n.useSnap ? &n.snap : nullptr;
+        m_simSnap2 = n.dual ? &n.snap2 : nullptr;
+        m_scanSim = true;
+        int const delay = toggle ? 0 : k;
+        FollowUp tap;
+        if (isTap) { tap.at[0] = 1; tap.held[0] = false; }
+        SimResult const r = simulate(pl, pl->m_player1, nullptr, false, isTap ? true : held, delay, k - delay, true,
+                                     a.dt, a.s, tap);
+        m_scanSim = false;
+        m_simSnap = nullptr;
+        m_simSnap2 = nullptr;
+        m_gameHolding = g;
+        m_phase = ph;
+        m_recordPath = rec;
+        m_realUsedOrbs = baseOrbs;
+        if (r.end != SimEnd::Survived) {
+            if (r.end == SimEnd::Died && scanning()) {
+                m_scanLastWhat = deathWhat(r) + fmt::format(" - at ({:.0f},{:.0f})", m_simKillPos.x, m_simKillPos.y);
+                if (m_scanDeathPts.size() < 300) m_scanDeathPts.push_back(m_simKillPos);
+            }
+            return false;
+        }
+        PlayerObject* s1 = m_simPlayer1.data();
+        if (!s1) return false;
+        out = ANode{};
+        out.snap = snapFrom(s1);
+        out.useSnap = true;
+        out.held = held;
+        out.toggled = toggle;
+        out.inputPush = isTap ? true : held;
+        out.modeCode = modeCode(s1);
+        out.modeIdx = scanModeIndex(s1);
+        out.x = s1->getPositionX();
+        out.y = s1->getPositionY();
+        out.vy = s1->m_yVelocity;
+        out.tick = n.tick + k;
+        out.orbs = n.orbs;
+        if (m_simOrbObj) out.orbs.push_back(m_simOrbObj);
+        out.mini = s1->m_vehicleSize > 0.f && s1->m_vehicleSize < 0.99f;
+        out.dual = m_simP2Live;
+        if (out.dual && m_simPlayer2.data()) {
+            out.snap2 = snapFrom(m_simPlayer2.data());
+            out.y2 = m_simPlayer2->getPositionY();
+        }
+        out.tapRel = isTap && shipTap;
+        float const clr = m_scanClr;
+        float const close = clr < SCAN_SAFE_CLR ? (SCAN_SAFE_CLR - std::max(0.f, clr)) / SCAN_SAFE_CLR : 0.f;
+        out.g = n.g + static_cast<float>(k) + (toggle ? ASTAR_INPUT_COST : 0.f) + ASTAR_CLOSE_COST * close;
+        // ship: an angle costs a little - the level way through (straight fly) first
+        if (out.modeCode == 1) out.g += 0.25f * static_cast<float>(k) * std::min(1.f, static_cast<float>(std::fabs(out.vy)) / SHIP_TILT_VY);
+        return true;
+    }
+    // Expand states until `budgetUs` is used, the goal is reached, nothing is
+    // left, or `maxExp` states were expanded. True = finished (goal / no way / limit).
+    bool astarRun(PlayLayer* pl, AStarRun& a, int budgetUs, int maxExp) {
+        auto const t0 = Clock::now();
+        auto const baseOrbs = m_realUsedOrbs;
+        while (a.goal < 0 && !a.open.empty() && a.expansions < maxExp) {
+            if (std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count() >= budgetUs) {
+                m_realUsedOrbs = baseOrbs;
+                return false;
+            }
+            int const idx = std::get<2>(a.open.top());
+            a.open.pop();
+            a.expansions++;
+            for (int mv = 0; mv < 3 && a.goal < 0; mv++) {
+                ANode child;
+                if (!astarMove(pl, a, a.nodes[static_cast<size_t>(idx)], mv, baseOrbs, child)) continue;
+                child.parent = idx;
+                // speed for the estimate: the fastest move seen (px per tick)
+                ANode const& par = a.nodes[static_cast<size_t>(idx)];
+                int const kk = std::max(1, child.tick - par.tick);
+                a.speed = std::max(a.speed, std::fabs(child.x - par.x) / static_cast<float>(kk));
+                astarPush(a, std::move(child));
+            }
+        }
+        m_realUsedOrbs = baseOrbs;
+        return true;
+    }
+    // The states from a start to `end`, oldest first.
+    static std::vector<int> astarChain(AStarRun const& a, int end) {
+        std::vector<int> out;
+        for (int i = end; i >= 0; i = a.nodes[static_cast<size_t>(i)].parent) out.push_back(i);
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+
+    // Scan (2.2): every path dies at `stuckX` - A* from the versions saved a few
+    // blocks back, to a bit past the spot, one tick at a time in wave. While
+    // paused, so it may take a moment (at most SCAN_ASTAR_MS).
+    float m_astarTriedAt = -1e9f;
+    int   m_scanAStar = 0;
+    bool scanAStar(PlayLayer* pl, float stuckX) {
+        if (!pl || m_rewind.empty() || std::fabs(stuckX - m_astarTriedAt) <= 60.f) return false;
+        m_astarTriedAt = stuckX;
+        size_t pick = 0;
+        for (size_t i = 0; i < m_rewind.size(); i++) if (m_rewind[i].first <= stuckX - SCAN_REWIND_PX) pick = i;
+        std::vector<BeamNode> const from = m_rewind[pick].second;
+        if (from.empty()) return false;
+        AStarRun a;
+        a.dt = m_scanDt;
+        a.s = m_scanS;
+        a.dir = m_p1Dir < 0.f ? -1.f : 1.f;
+        a.goalX = stuckX + a.dir * SCAN_WIDE_PAST;
+        a.speed = std::max(0.05f, m_p1Speed * m_scanDt);
+        for (BeamNode const& b : from) {
+            ANode n;
+            n.snap = b.snap;
+            n.useSnap = !b.fromReal;
+            n.held = b.held;
+            n.modeCode = b.modeCode;
+            n.modeIdx = b.mode;
+            n.x = b.x;
+            n.y = b.y;
+            n.vy = b.vy;
+            n.hist = b.hist;
+            n.orbs = b.orbs;
+            n.mini = b.mini;
+            n.dual = b.dual;
+            n.snap2 = b.snap2;
+            n.y2 = b.y2;
+            astarPush(a, std::move(n));
+        }
+        astarRun(pl, a, SCAN_ASTAR_MS * 1000, SCAN_ASTAR_MAX);
+        trace(fmt::format("scan: A* at x={:.0f}: {} states, {}", stuckX, a.expansions,
+                          a.goal >= 0 ? "found a way through" : "no way through"));
+        if (a.goal < 0) return false;
+        // The way through becomes the scan's one version, with its history.
+        std::vector<int> const chain = astarChain(a, a.goal);
+        int hist = a.nodes[static_cast<size_t>(chain.front())].hist;
+        for (size_t i = 1; i < chain.size(); i++) {
+            ANode const& par = a.nodes[static_cast<size_t>(chain[i - 1])];
+            ANode const& cur = a.nodes[static_cast<size_t>(chain[i])];
+            m_beamHist.push_back(BeamHist{hist, par.x, par.y, cur.toggled, cur.inputPush, static_cast<uint8_t>(par.modeIdx)});
+            hist = static_cast<int>(m_beamHist.size()) - 1;
+            if (cur.tapRel) { // (2.2) a ship tap's release
+                m_beamHist.push_back(BeamHist{hist, (par.x + cur.x) * 0.5f, (par.y + cur.y) * 0.5f, true, false,
+                                              static_cast<uint8_t>(par.modeIdx)});
+                hist = static_cast<int>(m_beamHist.size()) - 1;
+            }
+        }
+        ANode const& end = a.nodes[static_cast<size_t>(a.goal)];
+        BeamNode b;
+        b.snap = end.snap;
+        b.fromReal = false;
+        b.held = end.held;
+        b.x = end.x;
+        b.y = end.y;
+        b.vy = end.vy;
+        b.mode = end.modeIdx;
+        b.modeCode = end.modeCode;
+        b.orbs = end.orbs;
+        b.hist = hist;
+        b.mini = end.mini;
+        b.dual = end.dual;
+        b.snap2 = end.snap2;
+        b.y2 = end.y2;
+        m_beam.clear();
+        m_beam.push_back(std::move(b));
+        m_rewind.erase(m_rewind.begin() + static_cast<std::ptrdiff_t>(pick) + 1, m_rewind.end());
+        m_rewindLastX = m_rewind.empty() ? -1e9f : m_rewind.back().first;
+        m_scanX = std::max(m_scanX, end.x);
+        m_scanAStar++;
+        return true;
+    }
+
+    // ------------------------------------------------------------------------
+    //  Show Rays (2.2, Tools): what the buffer sees and thinks, drawn in the
+    //  level as lines while you play.
+    //   * white outline: your hitbox;
+    //   * cyan line: where you go if you press now (until your usual release);
+    //     green line: if you let go / don't press. A red X where one dies.
+    //   * yellow line: the pathfinder - a live A* search ~1 s ahead (a press /
+    //     release choice every tick in wave, every 2 in ship, 4 elsewhere) for
+    //     inputs that get through; cyan / pink ticks on it = where to press /
+    //     let go. Orange = no way through found, shows how far it got.
+    //   * after a click: what the buffer tried - the click as made (red if it
+    //     dies), the delays it tested and rejected (faint red), the one it
+    //     picked (bright) - and a line of text saying why.
+    // ------------------------------------------------------------------------
+    struct PlanIn { float x = 0.f, y = 0.f; bool push = true; };
+    AStarRun m_planA;                           // the pathfinder's search in progress (A*)
+    bool  m_planActive = false;
+    std::vector<ibcore::Point2> m_aheadPath;     // last finished route
+    std::vector<PlanIn> m_aheadInputs;
+    bool  m_aheadDies = false;                   // every version died before the end
+    Ref<CCLabelBMFont> m_rayLabel;
+
+    struct Think {
+        bool valid = false;
+        double at = 0.0;
+        std::string label;
+        std::vector<ibcore::Point2> onTime;
+        bool onTimeDies = false;
+        std::vector<std::vector<ibcore::Point2>> rejected;
+        std::vector<ibcore::Point2> chosen;
+    };
+    Think m_think;
+    bool  m_thinkRec = false;                   // recording the current click's tests
+    std::vector<std::pair<int, std::vector<ibcore::Point2>>> m_thinkTests; // (delay, path), verdict-ok paths flagged by sign
+
+    bool ensureOverlay(PlayLayer* pl) {
+        if (!pl || !pl->m_objectLayer) return false;
+        if (!m_overlay.data()) {
+            m_overlay = CCDrawNode::create();
+            if (!m_overlay.data()) return false;
+        }
+        if (!m_overlay->getParent()) pl->m_objectLayer->addChild(m_overlay.data(), 9999);
+        return true;
+    }
+    void clearRays() {
+        if (m_overlayShown && m_overlay.data()) m_overlay->clear();
+        if (m_rayLabel.data()) m_rayLabel->setVisible(false);
+        m_overlayShown = false;
+    }
+    void releaseOverlay() {
+        if (m_overlay.data() && m_overlay->getParent()) m_overlay->removeFromParent();
+        m_overlay.swap(nullptr);
+        if (m_rayLabel.data() && m_rayLabel->getParent()) m_rayLabel->removeFromParent();
+        m_rayLabel.swap(nullptr);
+        m_overlayShown = false;
+        m_planActive = false;
+        m_planA = AStarRun{};
+        m_aheadPath.clear();
+        m_aheadInputs.clear();
+        m_think = Think{};
+    }
+
+    void rayLine(std::vector<ibcore::Point2> const& path, CCPoint from, float width, ccColor4F col, size_t maxPts = 400) {
+        if (path.empty()) return;
+        size_t const step = path.size() > maxPts ? (path.size() + maxPts - 1) / maxPts : 1;
+        CCPoint prev = from;
+        for (size_t i = 0; i < path.size(); i += step) {
+            CCPoint const cur{path[i].x, path[i].y};
+            m_overlay->drawSegment(prev, cur, width, col);
+            prev = cur;
+        }
+        CCPoint const last{path.back().x, path.back().y};
+        if (prev.x != last.x || prev.y != last.y) m_overlay->drawSegment(prev, last, width, col);
+    }
+    void rayCross(CCPoint at, float r, ccColor4F col) {
+        m_overlay->drawSegment({at.x - r, at.y - r}, {at.x + r, at.y + r}, 0.8f, col);
+        m_overlay->drawSegment({at.x - r, at.y + r}, {at.x + r, at.y - r}, 0.8f, col);
+    }
+
+    // ---- the pathfinder (A*, see AStarRun) ------------------------------------------
+    static constexpr int PLAN_HORIZON_BASE = 240; // ~1 s ahead at 240 TPS
+    static constexpr int PLAN_MAX_STATES = 2500;  // then it shows the furthest it got and starts over
+    void planReset(PlayLayer* pl) {
+        PlayerObject* p = pl->m_player1;
+        m_planA = AStarRun{};
+        m_planA.dt = getValidDt();
+        m_planA.s = BASE_DT / m_planA.dt;
+        m_planA.dir = m_p1Dir < 0.f ? -1.f : 1.f;
+        m_planA.speed = std::max(0.05f, m_p1Speed * m_planA.dt);
+        m_planA.goalX = p->getPositionX() + m_planA.dir * m_planA.speed * static_cast<float>(scaleTicks(PLAN_HORIZON_BASE, m_planA.s));
+        ANode root;
+        root.snap = snapFrom(p);
+        root.useSnap = true;
+        root.held = m_gameHolding;
+        root.modeCode = modeCode(p);
+        root.x = p->getPositionX();
+        root.y = p->getPositionY();
+        root.vy = p->m_yVelocity;
+        astarPush(m_planA, std::move(root));
+        m_planActive = true;
+    }
+    void planPublish() {
+        bool const found = m_planA.goal >= 0;
+        int const end = found ? m_planA.goal : m_planA.deepest;
+        m_planActive = false;
+        if (end < 0) return;
+        m_aheadPath.clear();
+        m_aheadInputs.clear();
+        std::vector<int> const chain = astarChain(m_planA, end);
+        for (size_t i = 0; i < chain.size(); i++) {
+            ANode const& n = m_planA.nodes[static_cast<size_t>(chain[i])];
+            m_aheadPath.push_back(ibcore::Point2{n.x, n.y, 0.f});
+            if (i > 0 && n.toggled) {
+                ANode const& par = m_planA.nodes[static_cast<size_t>(chain[i - 1])];
+                m_aheadInputs.push_back(PlanIn{par.x, par.y, n.inputPush});
+            }
+        }
+        m_aheadDies = !found;
+        m_planA = AStarRun{}; // free it
+    }
+    // One slice of the search (about `budgetUs` of CPU), between physics steps.
+    void planSlice(PlayLayer* pl, int budgetUs) {
+        PlayerObject* p = pl ? pl->m_player1 : nullptr;
+        if (!p || p->m_isDead || p->m_isPlatformer || pl->m_gameState.m_isDualMode || m_simulating) {
+            m_planActive = false;
+            m_planA = AStarRun{};
+            return;
+        }
+        if (!m_planActive) planReset(pl);
+        if (astarRun(pl, m_planA, budgetUs, PLAN_MAX_STATES)) planPublish();
+    }
+
+    // ---- what the buffer thought about the last click ------------------------------
+    void thinkCapture(bool push, Decision dec, SimResult const& r0, std::vector<ibcore::Point2> const& path0,
+                      int bestDelay, int windowTicks, std::string const& modeName) {
+        m_thinkRec = false;
+        Think t;
+        t.valid = true;
+        t.at = m_gameTime;
+        t.onTime = path0;
+        t.onTimeDies = r0.end == SimEnd::Died;
+        char const* act = push ? "PRESS" : "RELEASE";
+        std::string const why = r0.end == SimEnd::Died ? fmt::format("on time dies in {}t ({})", r0.ticks, deathWhat(r0))
+                                                        : std::string("on time is safe");
+        switch (dec) {
+            case Decision::Buffered:
+                t.label = fmt::format("{} held +{}t: {} - fires on the first safe tick [{}]", act, bestDelay, why, modeName);
+                break;
+            case Decision::PassSafe:
+                t.label = fmt::format("{}: {} - went in as made [{}]", act, why, modeName);
+                break;
+            case Decision::PassNoFix:
+                t.label = fmt::format("{}: {} - nothing in your {}t window saves it, went in as made [{}]", act, why,
+                                      windowTicks, modeName);
+                break;
+            case Decision::PassEscapable:
+                t.label = fmt::format("{}: {} - you can still save it yourself, went in as made [{}]", act, why, modeName);
+                break;
+            case Decision::PassTruncated:
+                t.label = fmt::format("{}: can't see past {} - went in as made [{}]", act, describeTrunc(r0.trunc), modeName);
+                break;
+            default:
+                t.label = fmt::format("{}: went in as made [{}]", act, modeName);
+                break;
+        }
+        for (auto& [d, path] : m_thinkTests) {
+            if (d == bestDelay && dec == Decision::Buffered) t.chosen = path;
+            else if (t.rejected.size() < 10) t.rejected.push_back(path);
+        }
+        m_thinkTests.clear();
+        m_think = std::move(t);
+    }
+
+    // ---- drawing (a few times a second) ------------------------------------------------
+    void updateRays(PlayLayer* pl) {
+        Config const& c = cfg();
+        if (!c.rayView || !m_active || !pl || !pl->m_player1) { clearRays(); return; }
+        if (!ensureOverlay(pl)) return;
+        PlayerObject* p1 = pl->m_player1;
+        CCPoint const me = p1->getPosition();
+        m_overlay->clear();
+
+        // your hitbox
+        {
+            CCRect const& r = p1->getObjectRect();
+            CCPoint const a{r.getMinX(), r.getMinY()}, b{r.getMaxX(), r.getMinY()}, cc{r.getMaxX(), r.getMaxY()},
+                d{r.getMinX(), r.getMaxY()};
+            ccColor4F const w{1.f, 1.f, 1.f, 0.9f};
+            m_overlay->drawSegment(a, b, 0.5f, w);
+            m_overlay->drawSegment(b, cc, 0.5f, w);
+            m_overlay->drawSegment(cc, d, 0.5f, w);
+            m_overlay->drawSegment(d, a, 0.5f, w);
+        }
+
+        // the pathfinder's route
+        if (m_aheadPath.size() > 1) {
+            // (only what's still ahead of you - the search started a moment ago)
+            float const dir = m_p1Dir < 0.f ? -1.f : 1.f;
+            size_t first = 0;
+            while (first < m_aheadPath.size() && (m_aheadPath[first].x - me.x) * dir < -2.f) first++;
+            std::vector<ibcore::Point2> const ahead(m_aheadPath.begin() + static_cast<std::ptrdiff_t>(first), m_aheadPath.end());
+            ccColor4F const yel = m_aheadDies ? ccColor4F{1.f, 0.6f, 0.2f, 0.8f} : ccColor4F{1.f, 0.9f, 0.25f, 0.85f};
+            if (ahead.size() > 1) rayLine(ahead, CCPoint{ahead[0].x, ahead[0].y}, 0.7f, yel);
+            for (auto const& in : m_aheadInputs) {
+                if ((in.x - me.x) * dir < -2.f) continue;
+                ccColor4F const col = in.push ? ccColor4F{0.3f, 0.9f, 1.f, 1.f} : ccColor4F{1.f, 0.45f, 0.75f, 1.f};
+                m_overlay->drawSegment({in.x, in.y - 7.f}, {in.x, in.y + 7.f}, 0.8f, col);
+            }
+        }
+
+        // the two rays: press now / let go (or keep not pressing)
+        Ctx x;
+        int const budget = clickBudgetUs(c) / 3;
+        for (int k = 0; k < 2; k++) {
+            bool const press = k == 0;
+            bool const want = press ? true : false;
+            if (!press && !m_physicalHolding) {
+                // not holding: "don't press" = the press, never made
+                if (!makeCtx(pl, true, c, x)) break;
+                m_hasDeadline = budget > 0;
+                if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
+                m_recordPath = true;
+                SimResult const r = runSim(x, x.horizon + 1);
+                m_recordPath = false;
+                m_hasDeadline = false;
+                if (r.end == SimEnd::OutOfBudget) continue;
+                rayLine(m_path, me, 0.55f, ccColor4F{0.3f, 1.f, 0.45f, 0.9f});
+                if (r.end == SimEnd::Died && !m_path.empty()) rayCross({m_path.back().x, m_path.back().y}, 4.f, {1.f, 0.15f, 0.15f, 1.f});
+                continue;
+            }
+            if (press && m_physicalHolding) continue; // already holding: no new press to show
+            if (!makeCtx(pl, want, c, x)) break;
+            m_hasDeadline = budget > 0;
+            if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
+            m_recordPath = true;
+            SimResult const r = runSim(x, 0);
+            m_recordPath = false;
+            m_hasDeadline = false;
+            if (r.end == SimEnd::OutOfBudget) continue;
+            ccColor4F const col = press ? ccColor4F{0.3f, 0.9f, 1.f, 0.9f} : ccColor4F{0.3f, 1.f, 0.45f, 0.9f};
+            rayLine(m_path, me, 0.55f, col);
+            if (r.end == SimEnd::Died && !m_path.empty()) rayCross({m_path.back().x, m_path.back().y}, 4.f, {1.f, 0.15f, 0.15f, 1.f});
+        }
+
+        // what the buffer thought about your last click (1.5 s)
+        bool const fresh = m_think.valid && (m_gameTime - m_think.at) < 90.0;
+        if (fresh) {
+            for (auto const& path : m_think.rejected) rayLine(path, me, 0.35f, ccColor4F{1.f, 0.3f, 0.3f, 0.35f}, 120);
+            if (!m_think.onTime.empty())
+                rayLine(m_think.onTime, CCPoint{m_think.onTime[0].x, m_think.onTime[0].y}, 0.5f,
+                        m_think.onTimeDies ? ccColor4F{1.f, 0.2f, 0.2f, 0.85f} : ccColor4F{0.3f, 1.f, 0.45f, 0.85f});
+            if (!m_think.chosen.empty())
+                rayLine(m_think.chosen, CCPoint{m_think.chosen[0].x, m_think.chosen[0].y}, 0.9f, ccColor4F{1.f, 1.f, 1.f, 0.95f});
+        }
+        if (!m_rayLabel.data()) {
+            m_rayLabel = CCLabelBMFont::create("", "chatFont.fnt");
+            if (m_rayLabel.data()) m_rayLabel->setAnchorPoint({0.f, 0.f});
+        }
+        if (m_rayLabel.data()) {
+            if (m_rayLabel->getParent() != pl->m_objectLayer) {
+                if (m_rayLabel->getParent()) m_rayLabel->removeFromParent();
+                pl->m_objectLayer->addChild(m_rayLabel.data(), 10000);
+            }
+            std::string const text = fresh ? m_think.label
+                                           : (m_aheadPath.size() > 1 ? (m_aheadDies ? "pathfinder: every path dies ahead"
+                                                                                  : "pathfinder: way through found (yellow)")
+                                                                    : std::string("looking ahead..."));
+            m_rayLabel->setString(text.c_str());
+            m_rayLabel->setScale(0.45f);
+            m_rayLabel->setColor(fresh ? ccColor3B{255, 255, 255} : ccColor3B{255, 230, 120});
+            m_rayLabel->setPosition({me.x - 20.f, me.y + 26.f});
+            m_rayLabel->setVisible(true);
+        }
+        m_overlay->setVisible(true);
+        m_overlayShown = true;
     }
 
     // ------------------------------------------------------------------------
@@ -4099,19 +5066,42 @@ public:
     // gamemode, same height on the path). 1 = inside its window (fine as it
     // is), 2 = early by no more than your stage window (hold until targetX),
     // 0 = not on the scanned route.
+    // The scanned line's height at x (false: not scanned there / a gap).
+    bool routePathY(float x, float& y) const {
+        if (m_routePath.size() < 2) return false;
+        auto it = std::lower_bound(m_routePath.begin(), m_routePath.end(), x,
+                                   [](ibcore::Point2 const& q, float v) { return q.x < v; });
+        if (it == m_routePath.end() || it == m_routePath.begin()) return false;
+        ibcore::Point2 const a = *(it - 1), b = *it;
+        if (b.x - a.x > 60.f) return false;
+        float const t = b.x - a.x > 0.01f ? (x - a.x) / (b.x - a.x) : 0.f;
+        y = a.y + t * (b.y - a.y);
+        return true;
+    }
     int routeMatch(PlayLayer* pl, bool push, ModeInfo const& mode, int windowTicks, float dt, float& targetX) const {
+        float ty = 0.f;
+        return routeMatch(pl, push, mode, windowTicks, dt, targetX, ty);
+    }
+    int routeMatch(PlayLayer* pl, bool push, ModeInfo const& mode, int windowTicks, float dt, float& targetX,
+                   float& targetY) const {
         if (m_route.empty() || !pl || !pl->m_player1) return 0;
         PlayerObject* p = pl->m_player1;
         float const px = p->getPositionX(), py = p->getPositionY();
         float const dir = m_p1Dir < 0.f ? -1.f : 1.f;
         float const reach = m_p1Speed * dt * static_cast<float>(std::max(0, windowTicks));
         std::string const name = mode.name();
+        // (2.2) Are you ON the scanned (pink) line right here? It used to compare
+        // your height now with the height at the scanned input up ahead - in a
+        // wave that's a different height (45 degrees), so it almost never
+        // matched. Now: your height vs the line's at your x; the input ahead
+        // is checked by the prediction (it puts you on it, or no snap).
+        float lineY = 0.f;
+        if (!routePathY(px, lineY) || std::fabs(py - lineY) > ROUTE_ON_PATH_Y) return 0;
         for (auto const& r : m_route) {
             if (r.push != push || r.mode != name) continue;
-            if (std::fabs(py - r.y) > ROUTE_SNAP_Y_TOL) continue;
             float const lo = dir > 0.f ? r.x0 : -r.x1, hi = dir > 0.f ? r.x1 : -r.x0, q = px * dir;
             if (q >= lo && q <= hi) return 1;
-            if (q < lo && lo - q <= reach + 0.5f) { targetX = dir > 0.f ? r.x0 : r.x1; return 2; }
+            if (q < lo && lo - q <= reach + 0.5f) { targetX = dir > 0.f ? r.x0 : r.x1; targetY = r.y; return 2; }
         }
         return 0;
     }
@@ -4127,13 +5117,13 @@ public:
         Config const& c = cfg();
         std::string out;
         auto line = [&](std::string const& t) { out += t; out += '\n'; };
-        line("Input Buffer report");
+        line("Nova report");
         line(fmt::format("mod {}  geode {}  gd {}", Mod::get()->getVersion().toVString(),
                          Loader::get()->getVersion().toVString(), Loader::get()->getGameVersion()));
         line(fmt::format("system: {}  device: {}", systemInfo().full, systemInfo().device));
         line(fmt::format("level: {} ({})  in level: {}", m_lvlName, m_lvlKey, PlayLayer::get() ? "yes" : "no"));
-        line(fmt::format("stage: {}  orb helper: {}  snap to scan: {}  show paths: {}  learn: {}  detail log: {}",
-                         STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].name, c.orbHelper, c.routeSnap, c.overlay,
+        line(fmt::format("stage: {}  orb helper: {}  snap to scan: {}  show rays: {}  learn: {}  detail log: {}",
+                         STAGES[std::clamp(c.stage, 0, STAGE_COUNT - 1)].name, c.orbHelper, c.routeSnap, c.rayView,
                          c.learnSpots, c.hudVerbose));
         line("");
         line("== Stats ==");
@@ -4170,6 +5160,72 @@ public:
         for (auto const& t : m_trace) line(t);
         return out;
     }
+    // Export Scan (2.2, Tools): this level's scan as a text file - where to
+    // press / release (in % and position), what it couldn't solve and why.
+    std::string buildScanExport() {
+        PlayLayer* pl = PlayLayer::get();
+        std::string out;
+        auto line = [&](std::string const& t) { out += t; out += '\n'; };
+        line(fmt::format("Nova (Input Buffer) - level scan export  ({} {})", m_lvlName, m_lvlKey));
+        line(fmt::format("mod {}  gd {}", Mod::get()->getVersion().toVString(), Loader::get()->getGameVersion()));
+        line(fmt::format("status: {}", scanStatus()));
+        std::string ranges;
+        for (auto const& r : m_scanned)
+            ranges += fmt::format("{}{:.0f}%-{:.0f}%", ranges.empty() ? "" : ", ", pctAt(pl, r.first), pctAt(pl, r.second));
+        line(fmt::format("scanned: {}", ranges.empty() ? std::string("nothing") : ranges));
+        line(fmt::format("last scan: tried harder {}x, used your run {}x, went through {} unsolved spot(s)", m_scanBackups,
+                         m_scanJumps, m_scanSkips));
+        line("");
+        line("== Spots it couldn't solve (it went through them ignoring deaths) ==");
+        if (m_scanSkipRanges.empty()) line("  none");
+        for (auto const& r : m_scanSkipRanges)
+            line(fmt::format("  {:.1f}% - {:.1f}%  (x {:.0f} - {:.0f})", pctAt(pl, r.first), pctAt(pl, r.second), r.first, r.second));
+        if (!m_scanLastWhat.empty()) line(fmt::format("  last thing that killed every path: {}", m_scanLastWhat));
+        line("");
+        line(fmt::format("level height range used: {:.0f} .. {:.0f}  (objects GD skipped, added: {}; held inside a portal's floor / ceiling: {}x)",
+                         m_levelBottom, m_levelTop, m_simExtraObjs, m_bandClamps));
+        line("");
+        line("== The scan's path (every ~1%) ==");
+        line("      %         x        y");
+        {
+            float lastPct = -10.f;
+            for (auto const& q : m_routePath) {
+                float const pc = pctAt(pl, q.x);
+                if (pc < lastPct + 1.f) continue;
+                lastPct = pc;
+                line(fmt::format("  {:6.2f}  {:8.1f} {:8.1f}", pc, q.x, q.y));
+            }
+            if (m_routePath.empty()) line("  (none saved)");
+        }
+        line("");
+        line("== What you stood on / your gamemode bands (from your own play this session) ==");
+        {
+            int shown = 0;
+            for (auto const& t : m_groundLines) {
+                line("  " + t);
+                if (++shown >= 120) break;
+            }
+            if (!shown) line("  (play the level a bit first, then export)");
+        }
+        line("");
+        line(fmt::format("== Where to press / release ({} inputs) ==", m_route.size()));
+        line("      %         x        y   input    gamemode");
+        for (auto const& r : m_route)
+            line(fmt::format("  {:6.2f}  {:8.1f} {:8.1f}   {:<7}  {}", pctAt(pl, r.x), r.x, r.y, r.push ? "press" : "release", r.mode));
+        return out;
+    }
+    std::filesystem::path saveScanExport(std::string const& text) {
+        std::error_code ec;
+        std::filesystem::path const dir = Mod::get()->getSaveDir() / "reports";
+        std::filesystem::create_directories(dir, ec);
+        long long const secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch()).count();
+        std::filesystem::path const file = dir / fmt::format("scan-{}-{}.txt", m_lvlKey.empty() ? "menu" : m_lvlKey, secs);
+        std::ofstream o(file, std::ios::binary | std::ios::trunc);
+        o << text;
+        return file;
+    }
+    bool hasLevel() const { return !m_lvlKey.empty() && PlayLayer::get(); }
     std::filesystem::path saveReport(std::string const& text) {
         std::error_code ec;
         std::filesystem::path const dir = Mod::get()->getSaveDir() / "reports";
@@ -4201,7 +5257,7 @@ private:
             m_badge = l;
             m_badgeText.clear();
         }
-        std::string text = c.custom ? "Input Buffer: CUSTOM" : c.extreme ? "Input Buffer: EXTREME" : "Input Buffer";
+        std::string text = c.custom ? "Nova: CUSTOM" : c.extreme ? "Nova: EXTREME" : "Nova";
         if (c.practiceOnly) text += " (practice)";
         if (text != m_badgeText) {
             m_badge->setString(text.c_str());
@@ -4715,6 +5771,13 @@ private:
         // own toggles, and it remembers the portal (where GD keeps it per
         // player). Normal predictions still stop at them.
         if (m_scanSim) {
+            if (type == GameObjectType::DualPortal || type == GameObjectType::SoloPortal) {
+                if (overlapping && player == m_simPlayer1.data() && markUsed(obj)) {
+                    m_objRestore.emplace_back(obj, obj->m_isActivated);
+                    if (!m_scanTwoPlayer) m_simDualReq = type == GameObjectType::DualPortal ? 1 : 2;
+                }
+                return; // modelled
+            }
             int const pm = portalMode(type);
             if (pm >= 0) {
                 if (overlapping && markUsed(obj)) {
@@ -4802,6 +5865,8 @@ private:
         m_simTrunc.valid = true;
         m_simTrunc.type  = obj->m_objectType;
         m_simTrunc.gap   = gap;
+        m_simTrunc.tick  = m_simTick;
+        m_simTrunc.obj   = obj;
     }
 
     // ------------------------------------------------------------------------
@@ -4813,6 +5878,11 @@ private:
         SimResult out;
         PlayerObject* s1 = m_simPlayer1.data();
         PlayerObject* s2 = (simP2 && realP2) ? m_simPlayer2.data() : nullptr;
+        // (2.2) the level scan's dual: player 2 from its own saved state
+        bool const scanP2 = m_scanSim && m_simSnap2 && m_simPlayer2.data();
+        if (scanP2) s2 = m_simPlayer2.data();
+        m_simDualReq = 0;
+        m_simP2Live = false;
         if (!s1 || !realP1) {
             out.ticks = horizon;
             return out;
@@ -4837,6 +5907,7 @@ private:
         m_prevRing[1] = (simP2 && realP2) ? touchingOrb(realP2) : nullptr;
         m_simMover = false;
         m_simKillType = -1;
+        m_simKillPos = realP1 ? realP1->getPosition() : CCPoint{};
         m_simKillMover = false;
         m_simKillDy = 0.f;
         m_simStartY = realP1 ? realP1->getPositionY() : 0.f;
@@ -4848,11 +5919,15 @@ private:
         if (m_recordPath) m_path.clear();
 
         syncSimPlayer(s1, realP1);
-        if (s2) syncSimPlayer(s2, realP2);
+        if (s2) syncSimPlayer(s2, realP2 ? realP2 : realP1);
         if (m_simSnap) {
             setSimMode(s1, m_simSnap->mode); // the scan may be past a gamemode portal
             applySnap(s1, *m_simSnap); // level scan: a saved state on top of the real player's
             m_simStartY = s1->getPositionY();
+        }
+        if (scanP2) {
+            setSimMode(s2, m_simSnap2->mode);
+            applySnap(s2, *m_simSnap2);
         }
         m_simHeld = m_gameHolding; // until the action lands, the button keeps the game's current state
 
@@ -4887,6 +5962,7 @@ private:
             if (i == follow.at[0]) setHeld(s1, s2, follow.held[0]);
             if (i == follow.at[1]) setHeld(s1, s2, follow.held[1]);
 
+            float const prevY1 = s1->getPositionY();
             s1->update(dt);
             s1->updateRotation(dt);
             if (s2) {
@@ -4912,23 +5988,70 @@ private:
             m_tickClr = 1e9f;
             m_tickRing[0] = m_tickRing[1] = nullptr;
             resetCollisionLog(s1);
-            // CRASH DIAGNOSTIC: temporarily skip simulated collision processing.
-            // If the access violation stops, the crash is in/under GD collision
-            // handling for the hidden simulation player. Predictions are NOT
-            // valid with this diagnostic enabled; restore/replace this after testing.
-            // pl->checkCollisions(s1, dt, false);
+            // (2.2: back on - a crash test had switched this off, which left the
+            // buffer blind. The scan crash it was chasing is fixed in applySnap.)
+            pl->checkCollisions(s1, dt, false);
+            extraCollisions(pl, s1, dt);
+            if (m_scanSim && !m_simDead) bandClamp(s1, prevY1); // (2.2) the portal's floor / ceiling
+            if (m_scanSim && !m_simDead && !m_scanNoclip && !nearLevel(s1)) {
+                // (2.2) nothing of the level near it (no block / spike / slope
+                // within OFF_PATH_PX): walking under the level, flying off it -
+                // not inputs that get you through
+                m_simDead = true;
+                m_simKillType = KILL_OFF_PATH;
+                m_simKillPos = s1->getPosition();
+                m_simKillDy = s1->getPositionY() - m_simStartY;
+            }
+            if (m_scanSim && !m_simDead && !m_scanNoclip &&
+                (s1->getPositionY() > m_levelTop || s1->getPositionY() < m_levelBottom)) {
+                m_simDead = true; // (2.2) flew out of the level: not a way through
+                m_simKillType = KILL_OUT_OF_LEVEL;
+                m_simKillPos = s1->getPosition();
+                m_simKillDy = s1->getPositionY() - m_simStartY;
+            }
             if (m_simDead) { out.end = SimEnd::Died; break; }
             m_scanClr = std::min(m_scanClr, m_tickClr);
             m_prevRing[0] = m_tickRing[0]; // what it touches now = "already touching" next step
             applyGdRing(s1, 0);
+            // (2.2) level scan through a dual portal: player 2 appears where
+            // player 1 is, gravity flipped, same gamemode and button - like GD.
+            // A solo portal takes it away again.
+            if (m_simDualReq == 1 && !s2 && m_simPlayer2.data()) {
+                s2 = m_simPlayer2.data();
+                PlayerSnap const now = snapFrom(s1);
+                syncSimPlayer(s2, realP1);
+                setSimMode(s2, now.mode);
+                applySnap(s2, now);
+                s2->flipGravity(!s1->m_isUpsideDown, true);
+                if (m_simHeld) s2->pushButton(PlayerButton::Jump);
+                else s2->releaseButton(PlayerButton::Jump);
+                m_track[1] = SimTrack{s2->getPositionX(), m_track[0].dir, m_track[0].stepPx};
+            } else if (m_simDualReq == 2) {
+                s2 = nullptr;
+            }
+            m_simDualReq = 0;
+            if (m_scanSim && s2 && !m_simDead) bandClamp(s2, s2->getPositionY());
 
             if (s2) {
                 resetCollisionLog(s2);
-                // CRASH DIAGNOSTIC: keep player-2 simulation collision disabled too.
-                // pl->checkCollisions(s2, dt, false);
+                pl->checkCollisions(s2, dt, false);
+                extraCollisions(pl, s2, dt);
                 if (m_simDead) { out.end = SimEnd::Died; break; }
                 m_prevRing[1] = m_tickRing[1];
                 applyGdRing(s2, 1);
+            }
+            if (m_simTrail) { // (2.2) the sprint keeps every tick
+                SpTick t;
+                t.s1 = snapFrom(s1);
+                t.dual = s2 != nullptr;
+                if (s2) { t.s2 = snapFrom(s2); t.y2 = s2->getPositionY(); }
+                t.x = s1->getPositionX();
+                t.y = s1->getPositionY();
+                t.vy = s1->m_yVelocity;
+                t.modeCode = modeCode(s1);
+                t.modeIdx = scanModeIndex(s1);
+                t.mini = s1->m_vehicleSize > 0.f && s1->m_vehicleSize < 0.99f;
+                m_simTrail->push_back(std::move(t));
             }
             // Orb aim: alive a few ticks past the next orb = that orb is your next
             // click's job; the rest of the path doesn't matter (CPU).
@@ -4983,6 +6106,7 @@ private:
         for (auto it = m_objRestore.rbegin(); it != m_objRestore.rend(); ++it) it->first->m_isActivated = it->second;
         m_objRestore.clear();
 
+        m_simP2Live = s2 != nullptr;
         out.mover = m_simMover;
         out.killType = m_simKillType;
         out.killMover = m_simKillMover;
@@ -5015,6 +6139,8 @@ private:
 
     // "hits spike at +40px, via orb" - what a predicted death runs into.
     static std::string deathWhat(SimResult const& r) {
+        if (r.killType == KILL_OUT_OF_LEVEL) return fmt::format("flew out of the level ({:+.0f}px)", r.killDy);
+        if (r.killType == KILL_OFF_PATH) return fmt::format("left the level's path (nothing near, {:+.0f}px)", r.killDy);
         std::string what = r.killType >= 0 ? objectName(static_cast<GameObjectType>(r.killType)) : "a block edge";
         if (r.killMover) what = "moving " + what;
         return fmt::format("hits {} at {:+.0f}px{}", what, r.killDy, r.orbUsed ? ", after using an orb" : "");
@@ -5362,7 +6488,6 @@ private:
         if (!pl) return;
         Config const& c = cfg();
         updateBadge(pl, c);
-        tickOverlay();
         if (c.hud) windowEnsure();
     }
 
@@ -5384,6 +6509,8 @@ public:
         m_cheapClicks = 0;
         m_inputsSeen = m_hookMissing = 0;
         m_followOnTime = m_followSpacing = 0;
+        m_rayPicks = m_rayConfirmed = m_rayRejected = 0;
+        m_simExtraObjs = 0;
         m_routeHits = m_routeSnaps = 0;
         m_oneStep.clear();
         m_osPending = false;
@@ -5416,7 +6543,6 @@ public:
         m_lastPressAt = m_lastReleaseAt = -1.0;
         m_accByMode.clear();
         m_tracker = ibcore::PredictionTracker{};
-        m_trackPending = false;
         invalidateCfg();
         loadPersisted(cfg());
         refreshFlags();
@@ -5445,6 +6571,7 @@ public:
         releaseSimPlayers();
         releaseOverlay();
         releaseBadge();
+        releaseRayIndex();
         m_simulating = false;
         m_firingBuffered = false;
         onReset();
@@ -5724,7 +6851,6 @@ public:
         m_realUsedOrbs.clear();
         orbCalDrop();
         orbTableSave();
-        m_trackPending = false;
         m_physicalHolding = false;
         m_gameHolding = false;
         m_lastInputTime = -1e9;
@@ -5916,15 +7042,23 @@ public:
         if (!vec) return m_scratch;
         int const n = std::min<int>(count, static_cast<int>(vec->size()));
         SimTrack const& tr = m_track[(player == m_simPlayer2.data()) ? 1 : 0];
-        for (int i = 0; i < n; i++) {
-            GameObject* obj = (*vec)[i];
-            if (!obj) continue;
+        // (2.2) what GD handed this sim player this tick (so the extras below
+        // never repeat one)
+        if (m_passTick != m_simTick || m_passPlayer != player || m_passStep != m_simStepsTotal) {
+            m_passTick = m_simTick;
+            m_passPlayer = player;
+            m_passStep = m_simStepsTotal;
+            m_passed.clear(); // (a flat list: a few dozen objects, cheaper than a hash set every tick)
+            m_passAdded.clear();
+            m_passExtra = false;
+        }
+        auto take = [&](GameObject* obj) {
             switch (classify(obj->m_objectType)) {
                 case ObjClass::Collide:
                     if ((m_simModern || m_simMovers) && isHazard(obj->m_objectType)) {
                         // Hazards: measure how close the path comes (clearance) and,
                         // if it moves, test it where it will be instead of where it is.
-                        if (hazardForSim(player, obj)) continue; // handled here, not by GD
+                        if (hazardForSim(player, obj)) return; // handled here, not by GD
                     }
                     m_scratch.push_back(obj);
                     break;
@@ -5945,9 +7079,57 @@ public:
                 default:
                     break;
             }
+        };
+        for (int i = 0; i < n; i++) {
+            GameObject* obj = (*vec)[i];
+            if (!obj) continue;
+            // already added below on an earlier call this tick: don't check it twice
+            if (!m_passAdded.empty() && std::find(m_passAdded.begin(), m_passAdded.end(), obj) != m_passAdded.end()) continue;
+            m_passed.push_back(obj);
+            take(obj);
+        }
+        // (2.2) Blocks / spikes / slopes right around the hidden player that GD
+        // didn't hand over: GD only gives a player the objects of the level
+        // sections it has loaded for collisions, and the hidden player was
+        // missing some - invisible floors it fell straight through in every
+        // prediction (and the scan / pathfinder) while you stood on them. Every
+        // solid, hazard and slope near it now comes from the mod's own list of
+        // the level, once per tick.
+        if (!m_passExtra && !m_rayObjs.empty()) {
+            m_passExtra = true;
+            CCRect const& pr = player->getObjectRect();
+            float const lo = pr.getMinX() - SIM_EXTRA_PAD, hi = pr.getMaxX() + SIM_EXTRA_PAD;
+            float const ylo = pr.getMinY() - SIM_EXTRA_PAD, yhi = pr.getMaxY() + SIM_EXTRA_PAD;
+            auto it = std::lower_bound(m_rayObjs.begin(), m_rayObjs.end(), lo - m_rayMaxW,
+                                       [](RayObj const& a, float v) { return a.x0 < v; });
+            for (; it != m_rayObjs.end() && it->x0 <= hi; ++it) {
+                GameObject* o = it->obj;
+                if (it->x1 < lo || o->m_isDisabled || o->m_isGroupDisabled) continue;
+                CCRect const& r = o->getObjectRect();
+                if (r.getMaxX() < lo || r.getMinX() > hi || r.getMaxY() < ylo || r.getMinY() > yhi) continue;
+                if (std::find(m_passed.begin(), m_passed.end(), o) != m_passed.end()) continue; // GD gave it already
+                m_simExtraObjs++;
+                m_passAdded.push_back(o);
+                take(o);
+            }
         }
         return m_scratch;
     }
+    // GD skipped its object check for this hidden player this tick (nothing in
+    // its loaded sections): run it with just the mod's own nearby objects.
+    void extraCollisions(PlayLayer* pl, PlayerObject* p, float dt) {
+        if (m_rayObjs.empty() || (m_passPlayer == p && m_passStep == m_simStepsTotal && m_passExtra)) return;
+        static gd::vector<GameObject*> none;
+        none.clear();
+        pl->collisionCheckObjects(p, &none, 0, dt);
+    }
+    std::vector<GameObject*> m_passed;    // objects GD handed over this tick (this sim player)
+    std::vector<GameObject*> m_passAdded; // ... and the ones added from the mod's list
+    int  m_passTick = -1;
+    long long m_passStep = -1;
+    PlayerObject* m_passPlayer = nullptr;
+    bool m_passExtra = false;
+    long long m_simExtraObjs = 0; // objects added that GD's collision hadn't handed over
 
     static bool isHazard(GameObjectType t) {
         return t == GameObjectType::Hazard || t == GameObjectType::AnimatedHazard;
@@ -5994,6 +7176,9 @@ public:
             m_simKillType = static_cast<int>(obj->m_objectType);
             m_simKillMover = true;
             m_simKillDy = player->getPositionY() - m_simStartY;
+            // (2.2) where it died, for the scan's red dots - it kept the last
+            // death's spot, so a dot showed up somewhere it didn't happen
+            m_simKillPos = CCPoint{obj->getPositionX() + dx, obj->getPositionY() + dy};
         }
         else m_tickClr = std::min(m_tickClr, gap);
         return true;
@@ -6125,9 +7310,36 @@ public:
             std::error_code ec;
             std::filesystem::remove(m_spotFile, ec);
         }
-        Notification::create("Input Buffer - forgot what it learned on this level", NotificationIcon::None, 1.5f)->show();
+        Notification::create("Nova - forgot what it learned on this level", NotificationIcon::None, 1.5f)->show();
     }
     bool inLevelWithSpots() const { return !m_spotFile.empty(); }
+    // Forget Scan (2.2, Tools): this level's scanned route, its guide path,
+    // what's marked scanned and your saved runs - in memory and on disk.
+    bool forgetScan() {
+        if (m_routeFile.empty()) return false;
+        if (m_realScan) realScanAbort(PlayLayer::get(), "forgot the scan");
+        releaseScan(); // stops a running scan too
+        releaseScanView();
+        releaseGuide();
+        m_route.clear();
+        m_routePath.clear();
+        m_scanned.clear();
+        m_anchors.clear();
+        m_attemptAnchors.clear();
+        m_anchorLastX = -1e9f;
+        m_anchorsDirty = false;
+        m_scanDeathPts.clear();
+        m_scanSkipRanges.clear();
+        m_scanMsg.clear();
+        std::error_code ec;
+        auto const dir = m_routeFile.parent_path();
+        std::filesystem::remove(m_routeFile, ec);
+        std::filesystem::remove(dir / (m_lvlKey + "-path.txt"), ec);
+        std::filesystem::remove(dir / (m_lvlKey + "-done.txt"), ec);
+        std::filesystem::remove(anchorsFile(), ec);
+        trace("scan forgotten for this level");
+        return true;
+    }
 
     // An input reached the game (raw or buffered): it is now the one that gets
     // the credit or the blame.
@@ -6246,10 +7458,15 @@ public:
     void setStage(int stage, bool notify = false) {
         stage = std::clamp(stage, 0, STAGE_COUNT - 1);
         Mod::get()->setSettingValue<std::string>("stage", STAGES[stage].setting);
+        // (2.2) Custom Min / Max are Custom's own: any other stage puts them back
+        if (stage != STAGE_CUSTOM) {
+            Mod::get()->setSavedValue<double>("min-ticks", 1.0);
+            Mod::get()->setSavedValue<double>("max-ticks", 1.0); // (2.3: Custom Max starts at 1 too)
+        }
         invalidateCfg();
         refreshFlags();
         clearBuffer();
-        if (notify) Notification::create(fmt::format("Input Buffer - {}", STAGES[stage].name), NotificationIcon::None, 1.2f)->show();
+        if (notify) Notification::create(fmt::format("Nova - {}", STAGES[stage].name), NotificationIcon::None, 1.2f)->show();
         log::info("[InputBuffer] {}", STAGES[stage].name);
         refreshHud(PlayLayer::get(), true);
     }
@@ -6367,7 +7584,7 @@ public:
     }
     // Dev tab "Copy All": the tab plus the newest trace lines.
     std::string devCopyText() {
-        std::string out = fmt::format("Input Buffer dev info - {} - {}\n", Mod::get()->getVersion().toVString(), systemInfo().full);
+        std::string out = fmt::format("Nova dev info - {} - {}\n", Mod::get()->getVersion().toVString(), systemInfo().full);
         for (auto const& r : devRows()) {
             std::string t = r.first;
             if (!t.empty() && t[0] == '\x01') { out += "\n== " + t.substr(1) + " ==\n"; continue; }
@@ -6385,15 +7602,6 @@ public:
             std::string const rep = h.repeat > 1 ? fmt::format(" (x{})", h.repeat) : std::string();
             LogConsole::write(fmt::format("{:8.2f}s  {:<6}  {}{}", h.t, h.tag, h.text, rep), logTagColor(h.tag));
         }
-    }
-    // Latest Log line (for the in-game pill).
-    bool lastLog(std::string& tag, std::string& text, ccColor3B& color) const {
-        if (m_history.empty()) return false;
-        HistEntry const& e = m_history.back();
-        tag = e.tag;
-        text = e.text;
-        color = e.color;
-        return true;
     }
     // Bumped on every log change: the window only rebuilds the Log when it moved.
     unsigned long long logVersion() const { return m_logVersion; }
@@ -6512,8 +7720,7 @@ public:
             if (c.extreme) {
                 bool const holdW = w == W_SHIP || w == W_SHIP_REL || w == W_WAVE || w == W_WAVE_REL;
                 f = std::max(f, static_cast<float>(holdW ? c.extremeHoldCap : c.extremeWindow) * BASE_DT);
-                // wave releases: short cap (2.1), same math as windowTicks
-                if (w == W_WAVE_REL || w == W_SHIP_REL) f = std::min(f, std::max(WAVE_RELEASE_MAX_BASE * BASE_DT, e.window[w]));
+                // (releases: the same window as presses since 2.2)
             }
             kv(fmt::format("  {}", winLabel(w)), fmt::format("{:g}f{}", std::round(f * 100.f) / 100.f, autoOn ? " (auto)" : ""),
                autoOn ? COL_GREEN : COL_WHITE);
@@ -6543,6 +7750,13 @@ public:
         if (!m_route.empty()) {
             kv("Scanned route", fmt::format("{} inputs; {} clicks in a window, {} snapped", m_route.size(), m_routeHits, m_routeSnaps));
         }
+        if (m_simExtraObjs > 0) {
+            kv("Objects GD skipped", fmt::format("{} blocks / spikes added to predictions (invisible floors etc.)", m_simExtraObjs));
+        }
+        if (m_rayPicks > 0) {
+            kv("Wave rays", fmt::format("{} picks: {} confirmed, {} rejected (full search)", m_rayPicks, m_rayConfirmed,
+                                        m_rayRejected));
+        }
         if (m_followOnTime + m_followSpacing > 0) {
             kv("Wave / ship follow-ups", fmt::format("{} on time, {} kept spacing", m_followOnTime, m_followSpacing));
         }
@@ -6564,7 +7778,7 @@ public:
             if (!si.device.empty()) kv("Device", si.device);
             kv("Geometry Dash", Loader::get()->getGameVersion());
             kv("Geode", Loader::get()->getVersion().toVString());
-            kv("Input Buffer", Mod::get()->getVersion().toVString());
+            kv("Nova", Mod::get()->getVersion().toVString());
         }
 
         // ---- details (debugging), only with "Log: show safe clicks"
@@ -6627,7 +7841,7 @@ public:
             mod->setSavedValue<std::string>(std::string("calib-") + WINDOW_KEYS[i], "");
         }
         m_calibDirty = false;
-        Notification::create("Input Buffer - calibration cleared", NotificationIcon::None, 1.0f)->show();
+        Notification::create("Nova - calibration cleared", NotificationIcon::None, 1.0f)->show();
     }
 
     // A setting was changed from the menu.
@@ -6663,6 +7877,135 @@ public:
         int   waveCommit = 0; // wave (2.1): a death within this many ticks is the input's fault
     };
 
+    // ---- Wave rays (2.2) ------------------------------------------------------
+    //  See ibcore::waveRay: a wave input is two straight lines, so the delay
+    //  to try is found by casting them against the level's hitboxes instead
+    //  of running the physics for every candidate. The pick is then checked
+    //  once with the real prediction - the rays only save the search.
+    struct RayObj {
+        float x0 = 0.f, x1 = 0.f; // left / right edge when the level loaded
+        GameObject* obj = nullptr;
+        bool slope = false;       // (2.2) slopes: in the list for the sim, not for the rays
+    };
+    std::vector<RayObj> m_rayObjs;               // solids + hazards, by left edge
+    std::vector<float> m_speedXs;                // (2.2) where the speed portals are
+    float m_rayMaxW = 0.f;                       // widest one (query slack)
+    PlayLayer* m_rayLayer = nullptr;             // level the index belongs to
+    std::vector<ibcore::RayBox> m_rayScratch;
+    long long m_rayPicks = 0, m_rayConfirmed = 0, m_rayRejected = 0;
+
+    static bool waveOnly(ModeInfo const& m) {
+        return m.wave && !(m.ship || m.ufo || m.swing || m.robot || m.cubeLike);
+    }
+    void releaseRayIndex() {
+        m_speedXs.clear();
+        m_rayObjs.clear();
+        m_rayObjs.shrink_to_fit();
+        m_rayLayer = nullptr;
+        m_rayMaxW = 0.f;
+        m_levelBottom = -1e9f;
+        m_levelTop = 1e9f;
+    }
+    // Once per level (first wave input): every solid block and hazard. The
+    // boxes themselves are read live when used, so things that moved
+    // up / down are where they are now.
+    void buildRayIndex(PlayLayer* pl) {
+        releaseRayIndex();
+        m_rayLayer = pl;
+        if (!pl || !pl->m_objects) return;
+        for (auto* o : CCArrayExt<GameObject*>(pl->m_objects)) {
+            if (!o) continue;
+            GameObjectType const t = o->m_objectType;
+            bool const solid = t == GameObjectType::Solid;
+            bool const slope = t == GameObjectType::Slope;
+            float spd = 0.f;
+            if (t == GameObjectType::Modifier && speedForPortal(o->m_objectID, spd)) { m_speedXs.push_back(o->getPositionX()); continue; }
+            if (!solid && !slope && !isHazard(t)) continue;
+            if (o->m_isNoTouch || (solid && o->m_isPassable)) continue;
+            CCRect const& r = o->getObjectRect();
+            if (r.size.width <= 0.f || r.size.height <= 0.f) continue;
+            m_rayObjs.push_back(RayObj{r.getMinX(), r.getMaxX(), o, slope});
+            m_rayMaxW = std::max(m_rayMaxW, std::min(r.size.width, 3000.f));
+        }
+        std::sort(m_rayObjs.begin(), m_rayObjs.end(), [](RayObj const& a, RayObj const& b) { return a.x0 < b.x0; });
+        // (2.2) the level's height range: everything placed in it (any object),
+        // plus a margin. A scan / pathfinder version outside it has flown out of
+        // the level (the hidden player isn't held inside the floor / ceiling GD
+        // puts at a ship / wave / UFO portal) - it can't be a way through.
+        float lo = 1e9f, hi = -1e9f;
+        for (auto* o : CCArrayExt<GameObject*>(pl->m_objects)) {
+            if (!o) continue;
+            CCRect const& r = o->getObjectRect();
+            if (r.size.height <= 0.f || r.size.height > 3000.f) continue; // giant backgrounds don't count
+            lo = std::min(lo, r.getMinY());
+            hi = std::max(hi, r.getMaxY());
+        }
+        m_levelBottom = lo < hi ? lo - LEVEL_MARGIN : -1e9f;
+        m_levelTop = lo < hi ? hi + LEVEL_MARGIN : 1e9f;
+    }
+    float m_levelBottom = -1e9f, m_levelTop = 1e9f;
+    // Hitboxes inside [lo, hi] x [ylo, yhi], as they are right now.
+    void rayBoxes(float lo, float hi, float ylo, float yhi, std::vector<ibcore::RayBox>& out, bool* slopeNear = nullptr) const {
+        out.clear();
+        if (slopeNear) *slopeNear = false;
+        auto it = std::lower_bound(m_rayObjs.begin(), m_rayObjs.end(), lo - m_rayMaxW,
+                                   [](RayObj const& a, float v) { return a.x0 < v; });
+        for (; it != m_rayObjs.end() && it->x0 <= hi + m_rayMaxW; ++it) {
+            GameObject* o = it->obj;
+            if (o->m_isDisabled || o->m_isGroupDisabled) continue;
+            CCRect const& r = o->getObjectRect();
+            if (r.getMaxX() < lo || r.getMinX() > hi || r.getMaxY() < ylo || r.getMinY() > yhi) continue;
+            if (it->slope) { // (2.2) a slope isn't a box: say it's there
+                if (slopeNear) *slopeNear = true;
+                continue;
+            }
+            ibcore::RayBox b;
+            b.x = r.origin.x;
+            b.y = r.origin.y;
+            b.w = r.size.width;
+            b.h = r.size.height;
+            b.solid = o->m_objectType == GameObjectType::Solid;
+            if (!b.solid && o->m_objectRadius > 0.f) b.r = std::min(r.size.width, r.size.height) * 0.5f; // saws
+            out.push_back(b);
+            if (out.size() >= 800) break;
+        }
+    }
+    // Your wave right now as two rays: where you are, your hitbox, speed and
+    // slope, which way you're going and which way this input sends you.
+    bool waveRayInput(PlayLayer* pl, ModeInfo const& mode, bool push, float dt, ibcore::WaveRayIn& in) const {
+        PlayerObject* p = pl ? pl->m_player1 : nullptr;
+        if (!p || p->m_isDead || p->m_isSideways || p->m_isPlatformer || !waveOnly(mode)) return false;
+        if (pl->m_gameState.m_isDualMode || m_p1Speed < 0.01f || dt <= 0.f) return false;
+        CCRect const& r = p->getObjectRect();
+        in.x = r.getMidX();
+        in.y = r.getMidY();
+        in.hw = r.size.width * 0.5f;
+        in.hh = r.size.height * 0.5f;
+        in.vx = m_p1Speed * dt * (m_p1Dir < 0.f ? -1.f : 1.f);
+        in.vy = std::fabs(in.vx) * (mode.miniWave ? 2.f : 1.f);
+        bool const flip = p->m_isUpsideDown;
+        in.dirNow = (m_gameHolding != flip) ? 1 : -1;
+        in.dirNew = (push != flip) ? 1 : -1;
+        return true;
+    }
+    // The delay the rays pick for this input (-1: none in [minD, maxD],
+    // -2: rays can't be used here). `nowHit`: where it hits as made.
+    int wavePick(PlayLayer* pl, Ctx const& x, int minD, int maxD, ibcore::WaveRayHit* nowHit = nullptr) {
+        ibcore::WaveRayIn in;
+        if (!waveRayInput(pl, x.mode, x.push, x.dt, in)) return -2;
+        if (m_rayLayer != pl) buildRayIndex(pl);
+        int const n = std::max(0, maxD) + std::max(1, x.waveCommit) + 2;
+        float const reachX = std::fabs(in.vx) * static_cast<float>(n) + in.hw + 2.f;
+        float const reachY = in.vy * static_cast<float>(n) + in.hh + 2.f;
+        bool slope = false;
+        rayBoxes(in.x - reachX, in.x + reachX, in.y - reachY, in.y + reachY, m_rayScratch, &slope);
+        // (2.2) the rays are straight lines at one speed: with a slope (the
+        // wave slides along it in GD) or a speed portal in reach, the full
+        // simulation decides instead
+        if (slope) return -2;
+        for (float sx : m_speedXs) if (sx >= in.x - reachX && sx <= in.x + reachX) return -2;
+        return ibcore::waveRayDelay(in, minD, maxD, std::max(1, x.waveCommit), m_rayScratch, nowHit);
+    }
     // Wave / ship: how long an input answers for the path - until your next
     // input at your own rhythm plus a short grace (wave), or 100 ms (ship).
     int holdCommit(ModeInfo const& m, bool push, float dt, float s) const {
@@ -6730,13 +8073,17 @@ public:
             if (r.end != SimEnd::Died) return SAFE;
             return std::max(0, r.deathStep - follow);
         };
+        // (2.2) Your spacing first: the follow-up keeps the held input's shift,
+        // so the hold / gap is exactly what you made. "On time when safe" (2.1)
+        // shortened a delayed release's gap every time - in spam that added up
+        // and shot you up. On time only when keeping the spacing dies and on
+        // time doesn't (or lives longer) - the 2.1 case: a +18t mini-wave
+        // press whose release, moved 18t too, killed you.
         double pick = spacing;
-        int const a = test(onTime);
-        if (a == SAFE) {
-            pick = onTime;
-        } else {
-            int const b = test(spacing);
-            if (b != SAFE && a >= 0 && b >= 0 && a > b) pick = onTime;
+        int const b = test(spacing);
+        if (b != SAFE) {
+            int const a = test(onTime);
+            if (a == SAFE || (a >= 0 && b >= 0 && a > b)) pick = onTime;
         }
         m_recordPath = rec;
         m_hasDeadline = false;
@@ -6764,6 +8111,7 @@ public:
                                MIN_HORIZON, MAX_SIM_STEPS);
         x.noLanding = x.mode.noLanding();
         x.window = x.mode.windowTicks(effectiveCfg(c), push, x.dt);
+        if (c.custom) x.window = std::min(x.window, std::max(1, scaleTicks(c.maxTicks, x.s))); // Custom Max (2.2)
 
         m_orbPredict = c.orbPredict;
         m_padPredict = c.padPredict;
@@ -6956,7 +8304,6 @@ public:
             bool const relMatters = rp && (rp->m_isDart || rp->m_isShip || rp->m_isRobot);
             if (push || relMatters) {
                 m_tracker.invalidate();
-                m_trackPending = false;
             }
         }
 
@@ -7008,10 +8355,11 @@ public:
         mode.add(p1);
         mode.add(p2);
 
-        // Wave stream: inputs closer together than STREAM_GAP_FRAMES are one
-        // stream (spam). A pause ends it and drops the steady shift.
+        // Wave / ship stream: inputs closer together than STREAM_GAP_FRAMES are
+        // one stream (spam). A pause ends it and drops the steady shift.
+        // (2.2: ship too - its spam drifted up the same way.)
         bool inStream = false;
-        if (mode.wave) {
+        if (mode.holdBased()) {
             inStream = (m_gameTime - m_streamLast) < STREAM_GAP_FRAMES;
             m_streamLast = m_gameTime;
         }
@@ -7041,7 +8389,11 @@ public:
         int horizon = static_cast<int>(std::lround(mode.baseHorizon() * s * m_horizonScale));
         horizon = std::clamp(horizon, MIN_HORIZON, MAX_SIM_STEPS);
 
-        int const windowTicks = mode.windowTicks(effectiveCfg(c), push, dt);
+        // Custom Max (2.2, Stage tab, Custom stage only): a hard cap - the
+        // window, held clicks, the orb helper and snap to scan never go past it.
+        int const maxCap = c.custom ? std::max(1, scaleTicks(c.maxTicks, s)) : (1 << 20);
+        int const windowTicks = std::min(mode.windowTicks(effectiveCfg(c), push, dt), maxCap);
+        auto capT = [&](int t) { return std::min(t, maxCap); };
 
         ClickNote base;
         base.push = push;
@@ -7062,28 +8414,8 @@ public:
             // Wave / ship (2.1): on time instead, when that's the safe one.
             double const minGap = static_cast<double>(dt) * 0.999;
             bool placed = false;
-            bool snapped = false;
-            // Snap to scan (2.1): the input that ends a gesture - the release
-            // after a press that snapped to a cyan dot - snaps to ITS scanned
-            // spot (pink dot) too. It used to just keep the press's delay (or go
-            // on time), so presses lined up with the guide and releases didn't.
-            if (c.routeSnap && !m_route.empty() && windowTicks > 0 && push != m_queue.lastPush()) {
-                float tx = 0.f;
-                int const m = routeMatch(pl, push, mode, windowTicks, dt, tx);
-                float const step = m_p1Speed * dt;
-                if (m == 1) {
-                    placed = m_queue.pushAt(push, m_gameTime, m_gameTime, minGap);
-                } else if (m == 2 && step > 0.01f) {
-                    int const k = std::clamp(static_cast<int>(std::ceil(std::fabs(tx - p1->getPositionX()) / step)), 1,
-                                             windowTicks);
-                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
-                    placed = m_queue.pushAt(push, gridStart + static_cast<double>(k) * dt, m_gameTime, minGap);
-                }
-                if (placed) {
-                    snapped = true;
-                    m_routeSnaps++;
-                }
-            }
+            // (2.2: releases no longer snap to the scan unchecked - they keep
+            // your spacing from the held press, like any follow-up.)
             if (!placed && push != m_queue.lastPush() && mode.holdBased() && !modernEngine(mode)) {
                 placed = m_queue.pushAt(push, pickFollowUpTime(pl, c, push, minGap), m_gameTime, minGap);
             }
@@ -7096,7 +8428,6 @@ public:
             m_lastInputTime = m_gameTime;
             ClickNote n = base;
             n.d = Decision::Queued;
-            n.route = snapped;
             n.delay = m_queue.pending()
                 ? std::max(0, static_cast<int>(std::ceil((m_queue.nextAt() - m_gameTime) / dt - 1e-3)))
                 : static_cast<int>(std::lround(m_queue.shift() / dt));
@@ -7115,50 +8446,82 @@ public:
             return pass(Decision::PassRelease);
         }
 
-        // 2.0 Scanned route (2.1, Tools tab): an input that matches one the level
-        //     scan found is decided from the scan - no prediction (cheap, and
-        //     the scan already knows that spot). Inside its window: as made.
-        //     Early (within your stage window): held until the window starts.
+        // 2.0 Scanned route (Tools: Snap To Scan). 2.2: checked by the prediction.
+        //     It used to trust the scan blindly - a click on the scanned spot went
+        //     in raw even when it would die, and an early one was held until you
+        //     reached the scanned x (up to your whole window, +32t in mini wave)
+        //     wherever your height had drifted to by then. Now:
+        //      * on the scanned spot: decided normally below (the prediction);
+        //      * early: held only if the prediction puts you on the scanned
+        //        point (x AND height) on that tick, and pressing there survives.
+        //     Anything else: decided normally below.
+        // (2.2) Only while you're on the scanned line (routeMatch): a release
+        // snapped to where the scan let go while you were on another path
+        // changed your hold - wave releases came out late.
         if (c.routeSnap && !m_route.empty() && windowTicks > 0) {
-            float tx = 0.f;
-            int const m = routeMatch(pl, push, mode, windowTicks, dt, tx);
-            if (m == 1) {
-                m_routeHits++;
-                if (mode.wave) m_streamShift = 0.0;
-                return pass(Decision::PassSafe);
-            }
+            float tx = 0.f, ty = 0.f;
+            int const m = routeMatch(pl, push, mode, windowTicks, dt, tx, ty);
+            if (m == 1) m_routeHits++;
             float const step = m_p1Speed * dt;
-            if (m == 2 && step > 0.01f) {
-                int const k = std::clamp(static_cast<int>(std::ceil(std::fabs(tx - p1->getPositionX()) / step)), 1, windowTicks);
-                double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
-                auto at = [&](double ticks) { return gridStart + ticks * dt; };
-                m_planTrust = false;
-                m_liveRescue = false;
-                m_orbHelpHold = false;
-                m_liveSpotHold = false;
-                m_routeHold = true;
-                m_spotTargetX = tx;
-                m_spotTargetDir = m_p1Dir < 0.f ? -1.f : 1.f;
-                m_queue.start(push, m_gameTime, std::max(0.0, at(k) - m_gameTime));
-                m_live = true;
-                m_liveState.startClick(m_gameTime, dt, at(k), at(k + scaleTicks(2, s)) + TIME_EPS,
-                                       at(k + scaleTicks(1, s)) + TIME_EPS);
-                m_liveArrive = m_gameTime;
-                m_livePlanTicks = k;
-                m_liveWaited = false;
-                m_liveWaitWhy = 0;
-                for (int& v : m_refuse) v = 0;
-                m_refuseHave = false;
-                m_last.liveTicks = -1;
-                m_last.liveReason = ibcore::FireReason::None;
-                m_trackPending = false;
-                m_routeSnaps++;
-                ClickNote n = base;
-                n.d = Decision::Buffered;
-                n.delay = k;
-                n.route = true;
-                note(c, mode, dt, n);
-                return false;
+            Ctx rx;
+            if (m == 2 && step > 0.01f && makeCtx(pl, push, c, rx)) {
+                int const budget = clickBudgetUs(c);
+                m_hasDeadline = budget > 0;
+                if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
+                bool const rec = m_recordPath;
+                // where you are on each tick if the click waits
+                m_recordPath = true;
+                SimResult const idle = runSim(rx, windowTicks + 1, FollowUp{}, 1);
+                std::vector<ibcore::Point2> const path = m_path;
+                m_recordPath = false;
+                int k = -1;
+                if (idle.end != SimEnd::OutOfBudget) {
+                    float best = 1e9f;
+                    for (int d = 1; d <= windowTicks && static_cast<size_t>(d) <= path.size(); d++) {
+                        if (idle.end == SimEnd::Died && idle.deathStep >= 0 && d > idle.deathStep) break;
+                        ibcore::Point2 const& q = path[static_cast<size_t>(d - 1)];
+                        float const dx = std::fabs(q.x - tx), dy = std::fabs(q.y - ty);
+                        if (dx <= step * 0.75f + 0.5f && dy <= ROUTE_SNAP_Y_TOL && dx + dy < best) { best = dx + dy; k = d; }
+                    }
+                }
+                if (k > 0) {
+                    SimResult const r = runSim(rx, k);
+                    bool bh = false;
+                    ibcore::Verdict const v = verdictFor(rx, k, r, -1000000, bh);
+                    if (v != ibcore::Verdict::Good) k = -1;
+                }
+                m_recordPath = rec;
+                m_hasDeadline = false;
+                if (k > 0) {
+                    double const gridStart = m_gameTime - static_cast<double>(tickPhase()) * dt;
+                    auto at = [&](double ticks) { return gridStart + ticks * dt; };
+                    m_planTrust = false;
+                    m_liveRescue = false;
+                    m_orbHelpHold = false;
+                    m_liveSpotHold = false;
+                    m_routeHold = true;
+                    m_spotTargetX = tx;
+                    m_spotTargetDir = m_p1Dir < 0.f ? -1.f : 1.f;
+                    m_queue.start(push, m_gameTime, std::max(0.0, at(k) - m_gameTime));
+                    m_live = true;
+                    // fire on the checked tick (or on reaching the spot, if a hair sooner)
+                    m_liveState.startClick(m_gameTime, dt, at(k), at(capT(k + 1)) + TIME_EPS, at(k) + TIME_EPS);
+                    m_liveArrive = m_gameTime;
+                    m_livePlanTicks = k;
+                    m_liveWaited = false;
+                    m_liveWaitWhy = 0;
+                    for (int& v : m_refuse) v = 0;
+                    m_refuseHave = false;
+                    m_last.liveTicks = -1;
+                    m_last.liveReason = ibcore::FireReason::None;
+                    m_routeSnaps++;
+                    ClickNote n = base;
+                    n.d = Decision::Buffered;
+                    n.delay = k;
+                    n.route = true;
+                    note(c, mode, dt, n);
+                    return false;
+                }
             }
         }
 
@@ -7169,7 +8532,7 @@ public:
         if (push && c.orbHelper && !mode.wave && !touchingOrb(p1)) {
             Ctx ox;
             if (makeCtx(pl, true, c, ox)) {
-                int const look = scaleTicks(ORB_HELP_BASE, s);
+                int const look = capT(scaleTicks(ORB_HELP_BASE, s));
                 int const budget = clickBudgetUs(c);
                 m_hasDeadline = budget > 0;
                 if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
@@ -7177,7 +8540,22 @@ public:
                 m_recordPath = false;
                 int k = -1;
                 RingObject* ring = nullptr;
-                SimResult const idle = runSim(ox, look + 1, FollowUp{}, 1); // no press within `look`
+                // (2.2) Never take over a good click: a press that survives as
+                // made goes in as made - unless it's a cube / ball / spider press
+                // in the air, which does nothing until an orb anyway. (On by
+                // default since 2.2, it held normal jumps near orbs for the orb.)
+                bool const airPress = mode.cubeLike && !(mode.ship || mode.ufo || mode.swing || mode.robot) &&
+                                      !p1->m_isOnGround;
+                bool helpOk = airPress;
+                if (!helpOk) {
+                    SimResult const now = runSim(ox, 0);
+                    bool bh0 = false;
+                    ibcore::Verdict const v0 = verdictFor(ox, 0, now, -1000000, bh0);
+                    helpOk = now.end != SimEnd::OutOfBudget && v0 != ibcore::Verdict::Good;
+                }
+                SimResult idle;
+                idle.end = SimEnd::OutOfBudget; // "not looked" unless the helper may act
+                if (helpOk) idle = runSim(ox, look + 1, FollowUp{}, 1); // no press within `look`
                 if (idle.end != SimEnd::OutOfBudget && idle.firstRing && idle.firstRingTick >= 1 &&
                     idle.firstRingTick <= look &&
                     !(idle.end == SimEnd::Died && idle.deathStep >= 0 && idle.deathStep <= idle.firstRingTick)) {
@@ -7187,6 +8565,21 @@ public:
                     bool bh = false;
                     ibcore::Verdict const v = verdictFor(ox, k, atOrb, -1000000, bh);
                     if (!(v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial)) k = -1;
+                } else if (idle.end == SimEnd::Truncated && idle.trunc.obj && isOrb(idle.trunc.type) &&
+                           !isModelledOrb(idle.trunc.type) && idle.trunc.tick >= 0) {
+                    // (2.2) Dash / spider / teleport / custom orbs: the prediction
+                    // can't play them (it stops right before one), so an early
+                    // click went through raw and missed the orb. Now: if doing
+                    // nothing gets you to the orb alive, the press waits and goes
+                    // in the tick you touch it - what you clicked for.
+                    float const step = std::max(0.01f, m_p1Speed * ox.dt);
+                    int const extra = idle.trunc.gap > 0.f ? static_cast<int>(std::ceil(idle.trunc.gap / step)) : 0;
+                    int const kk = idle.trunc.tick + std::max(1, extra);
+                    auto* r = typeinfo_cast<RingObject*>(idle.trunc.obj);
+                    if (r && kk >= 1 && kk <= look && !realUsedOrb(r)) {
+                        k = kk;
+                        ring = r;
+                    }
                 }
                 m_recordPath = rec;
                 m_hasDeadline = false;
@@ -7201,7 +8594,7 @@ public:
                     m_routeHold = false;
                     m_queue.start(true, m_gameTime, std::max(0.0, at(k) - m_gameTime));
                     m_live = true;
-                    m_liveState.startClick(m_gameTime, dt, at(k), at(k + scaleTicks(2, s)) + TIME_EPS, at(k) + TIME_EPS);
+                    m_liveState.startClick(m_gameTime, dt, at(k), at(capT(k + scaleTicks(2, s))) + TIME_EPS, at(k) + TIME_EPS);
                     m_liveArrive = m_gameTime;
                     m_livePlanTicks = k;
                     m_liveWaited = false;
@@ -7210,7 +8603,6 @@ public:
                     m_refuseHave = false;
                     m_last.liveTicks = -1;
                     m_last.liveReason = ibcore::FireReason::None;
-                    m_trackPending = false;
                     ClickNote n = base;
                     n.d = Decision::Buffered;
                     n.delay = k;
@@ -7231,7 +8623,7 @@ public:
             if (makeCtx(pl, push, c, sx)) {
                 // Keep the stream's shift exactly (it only resets after a pause):
                 // shrinking it 1 tick per tap shortened a gap by a tick each time.
-                int const S = std::max(0, static_cast<int>(std::lround(m_streamShift / dt)));
+                int const S = std::min(maxCap, std::max(0, static_cast<int>(std::lround(m_streamShift / dt))));
                 int const budgetUs0 = clickBudgetUs(c);
                 m_hasDeadline = budgetUs0 > 0;
                 if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budgetUs0);
@@ -7242,12 +8634,20 @@ public:
                     ibcore::Verdict const v = verdictFor(sx, d, r, -1000000, bh);
                     return v == ibcore::Verdict::Good || v == ibcore::Verdict::Partial;
                 };
-                // On time first (1.25.9): if this input is safe with no delay, the
-                // stream drops its shift right here - before, one delay stayed on
-                // every input until you paused (input lag for the whole burst).
+                // Balanced (2.2): the shift only drops on the SAME kind of input
+                // that started it. A delayed release makes that hold longer; if
+                // the next press then went on time ("on time first", 1.25.9) the
+                // extra hold was never paid back - every such pair pushed you up
+                // a little, and spam shot you up. Now the opposite input keeps
+                // the shift (your gap / hold stays as you made it) and the next
+                // input of the starting kind may drop it (that hold / gap is
+                // shortened by the same amount): the sum of your holds stays
+                // yours. On time is still used whenever keeping the shift dies.
+                bool const mayDrop = push == m_streamStartPush;
                 int chosen = -1;
-                if (okAt(0)) chosen = 0;
+                if (mayDrop && okAt(0)) chosen = 0;
                 else if (okAt(S)) chosen = S;
+                else if (!mayDrop && okAt(0)) chosen = 0;
                 m_hasDeadline = false;
                 if (chosen == 0) {
                     m_streamShift = 0.0;
@@ -7295,6 +8695,15 @@ public:
         }
         // Ship, light touch (2.2): small corrections only, on every stage.
         if (mode.ship && !mode.wave) maxDelay = std::min(maxDelay, scaleTicks(SHIP_MAX_DELAY_BASE, s));
+        // Robot release (2.2): letting go ends the jump's boost - a late
+        // release is a higher jump. Small corrections only, like the ship.
+        if (mode.robot && !push) maxDelay = std::min(maxDelay, scaleTicks(SHIP_MAX_DELAY_BASE, s));
+        // Mini wave (2.2): twice as steep, so a tick of delay moves you twice as
+        // far - half the hold for the same distance (never under 2 ticks).
+        if (mode.miniWave && !mode.ship) maxDelay = std::max(std::min(maxDelay, scaleTicks(2, s)), maxDelay / 2);
+        // Custom Min (2.2, Custom stage only): a click that has to move moves
+        // at least this far (never past the window / Custom Max).
+        int const minDelay = c.custom ? std::clamp(scaleTicks(c.minTicks, s), 1, std::max(1, maxDelay)) : 1;
 
         // CPU budget: the manual cap, further capped to a share of the frame time
         // when Auto is on (extreme gets a bigger share since it searches more).
@@ -7306,7 +8715,11 @@ public:
         if (m_hasDeadline) m_deadline = t0 + std::chrono::microseconds(std::max(budgetUs, R0_BUDGET_MIN_US));
 
         bool const holdBased = mode.holdBased();
-        m_recordPath = c.accuracy || c.overlay;
+        m_recordPath = c.accuracy;
+        // Show Rays (2.2): keep every test's path for "what the buffer thought"
+        m_thinkTests.clear();
+        m_thinkRec = c.rayView;
+        if (m_thinkRec) m_recordPath = true;
 
         Ctx x;
         if (!makeCtx(pl, push, c, x)) return pass(Decision::PassNoWindow);
@@ -7359,6 +8772,7 @@ public:
         // How good is the click if delayed by d ticks? (shared by the search and the probe)
         auto eval = [&](int d) -> ibcore::Verdict {
             SimResult rd = sim(d);
+            if (m_thinkRec && m_thinkTests.size() < 24) m_thinkTests.emplace_back(d, m_path);
             if (rd.end == SimEnd::OutOfBudget && !cheap) {
                 enterCheap();
                 rd = sim(d);
@@ -7376,9 +8790,40 @@ public:
         // 6. Frame 0 is doomed: find the delay to use.
         int earliest = 0;
         int planTick = 0; // > 0: follow the plan (see below)
-        if (r0.end == SimEnd::Died && !escape0 && !discard) {
+        // 6a. Wave rays (2.2): cast the two straight lines your wave can take
+        //     and let them pick the delay; one real prediction confirms it
+        //     (then up to 3 more find the earliest that still holds). Instead
+        //     of the full search's dozen-plus predictions per deadly click -
+        //     the cost that made spam hit the CPU limit. If the real
+        //     prediction disagrees, the normal search runs as before.
+        bool rayDone = false;
+        if (r0.end == SimEnd::Died && !escape0 && !discard && waveOnly(mode) && maxDelay > 0) {
+            int const pick = wavePick(pl, x, minDelay, maxDelay);
+            if (pick > 0) {
+                m_rayPicks++;
+                if (eval(pick) == ibcore::Verdict::Good) {
+                    int d = pick;
+                    evals++;
+                    for (int k = 0; k < 3 && d - 1 >= minDelay; k++) {
+                        evals++;
+                        if (eval(d - 1) != ibcore::Verdict::Good) break;
+                        d--;
+                    }
+                    bestDelay = d;
+                    earliest = d;
+                    planTick = d; // wave: fire on the first safe tick (same as the search's plan)
+                    rayDone = true;
+                    m_rayConfirmed++;
+                } else {
+                    evals++;
+                    m_rayRejected++;
+                }
+            }
+        }
+        if (r0.end == SimEnd::Died && !escape0 && !discard && !rayDone) {
             ibcore::SearchParams sp;
             sp.maxDelay = maxDelay;
+            sp.minDelay = minDelay;
             // Every tick near the click (narrow safe gaps live there), then a
             // stride over the rest of the window.
             sp.dense    = scaleTicks(DENSE_SCAN_BASE, s);
@@ -7514,17 +8959,6 @@ public:
             rescue = true;
         }
 
-        // Path of the chosen delay (orb note, accuracy check, overlay). One more
-        // test, after the budget window: only when something will use it.
-        std::vector<ibcore::Point2> pathB;
-        bool viaOrb = false;
-        // (Only for the path overlay now: the live check supplies the accuracy
-        // path when the click fires, so this was one wasted full test per click.)
-        if (dec == Decision::Buffered && c.overlay) {
-            sim(bestDelay);
-            viaOrb = c.orbPredict && m_simOrbUsed;
-            if (m_recordPath) pathB = m_path;
-        }
 
         ClickNote n = base;
         n.d = dec;
@@ -7532,10 +8966,10 @@ public:
         n.r0 = r0;
         n.delay = bestDelay;
         n.evals = evals;
-        n.orb = viaOrb;
         n.needed = needed;
         n.rescue = rescue;
         note(c, mode, dt, n);
+        if (m_thinkRec) thinkCapture(push, dec, r0, path0, bestDelay, windowTicks, mode.name());
         m_last.needed = needed;
         m_last.probe = probeMax;
         m_last.window = windowTicks;
@@ -7550,17 +8984,9 @@ public:
 
         // Accuracy: compare this prediction with reality 100 ms after the click lands.
         int const checkSteps = scaleTicks(ACCURACY_CHECK_BASE, s);
-        m_trackPending = false;
         if (c.accuracy && dec == Decision::PassSafe && r0.end == SimEnd::Survived && !path0.empty()) {
             m_tracker.start(m_gameTime, dt, path0, checkSteps - 1, ACCURACY_TOL_PX);
             m_trackMode = mode.name();
-        } else if (c.accuracy && dec == Decision::Buffered && bestDelay > 0 && !pathB.empty()) {
-            // Starts when the held click actually fires (aligned to the real step).
-            m_trackPending = true;
-            m_pendingPath = pathB;
-            m_pendingDelay = bestDelay;
-            m_pendingCheck = bestDelay + checkSteps - 1;
-            m_pendingMode = mode.name();
         }
 
 
@@ -7598,7 +9024,9 @@ public:
             // tick later runs you into the obstacle.
             // No plan to fall back on (out of CPU / memory hold): give up after a
             // few ticks instead of holding it for the whole window.
-            double latest = at(std::max(1, scaleTicks(LIVE_GIVEUP_BASE, s))) + TIME_EPS;
+            // Custom Max (2.2): never past it, whatever holds the click.
+            auto capD = [&](int t) { return std::min(t, maxCap); };
+            double latest = at(capD(std::max(1, scaleTicks(LIVE_GIVEUP_BASE, s)))) + TIME_EPS;
             if (!liveFallback && spotNote != 1 && bestDelay > 0) {
                 latest = at(bestDelay) + TIME_EPS; // exactly on the plan
             }
@@ -7607,7 +9035,7 @@ public:
             m_liveSpotHold = (spotNote == 2);
             m_orbHelpHold = false;
             m_routeHold = false;
-            if (spotNote == 2) latest = at(bestDelay + scaleTicks(2, s)) + TIME_EPS;
+            if (spotNote == 2) latest = at(capD(bestDelay + scaleTicks(2, s))) + TIME_EPS;
             if (rescue) {
                 // No plan to fall back on: the whole window is checked tick by
                 // tick. But if doing nothing kills you inside the window, fire
@@ -7628,7 +9056,7 @@ public:
             }
             m_liveRescue = rescue; // first safe tick, no margin
 
-            m_liveState.startClick(m_gameTime, dt, at(bestDelay), at(maxDelay + 1) + TIME_EPS, latest);
+            m_liveState.startClick(m_gameTime, dt, at(bestDelay), at(std::min(maxDelay + 1, maxCap)) + TIME_EPS, latest);
             m_liveArrive = m_gameTime;
             m_livePlanTicks = bestDelay;
             m_liveWaited = false;
@@ -7637,12 +9065,14 @@ public:
             m_refuseHave = false;
             m_last.liveTicks = -1;
             m_last.liveReason = ibcore::FireReason::None;
-            m_trackPending = false; // the live check supplies the exact path when it fires
-            if (mode.wave) m_streamShift = static_cast<double>(bestDelay) * dt; // updated when it really fires
+            if (mode.holdBased()) {
+                m_streamShift = static_cast<double>(bestDelay) * dt; // updated when it really fires
+                m_streamStartPush = push; // (2.2) this input starts the shift
+            }
             return false;
         }
 
-        if (mode.wave) m_streamShift = 0.0; // went in raw: the stream has no shift now
+        if (mode.holdBased()) m_streamShift = 0.0; // went in raw: the stream has no shift now
         m_gameHolding = push;
         return true;
     }
@@ -7660,7 +9090,6 @@ public:
         std::string modeName;
         float simScale = 1.f;
         bool waveMode = false;
-        SimEnd testedEnd = SimEnd::Survived;
 
         // "Is firing it now safe?" - one test from the real current state.
         //  * The click you made (head = first) gets everything: learned spots,
@@ -7768,10 +9197,9 @@ public:
             int const budget = liveBudgetUs(c);
             m_hasDeadline = budget > 0;
             if (m_hasDeadline) m_deadline = Clock::now() + std::chrono::microseconds(budget);
-            m_recordPath = c.accuracy || c.overlay;
+            m_recordPath = c.accuracy;
             SimResult r = simAt(0);
             if (m_recordPath) path = m_path;
-            testedEnd = r.end;
             bool budgetHit = false;
             ibcore::Verdict const v = verdictFor(x, 0, r, -1000000, budgetHit);
             auto probe = [&](int d) {
@@ -7847,17 +9275,43 @@ public:
         // fires exactly on its scheduled time: same spacing from the held
         // input as you made it, no re-check. Re-checking held wave releases up
         // to the whole window and made them late.
-        auto windowTime = [&](bool) { return 0.0; };
+        // (2.2) Releases (and presses) queued behind a held input get the same
+        // treatment as a click: from their own time, the first safe tick
+        // inside their window. They used to fire on schedule unchecked, so a
+        // release made a little early while your press was held just died.
+        auto windowTime = [&](bool push) -> double {
+            PlayerObject* p1 = pl->m_player1;
+            if (!p1) return 0.0;
+            ModeInfo mi;
+            mi.add(p1);
+            if (!push && !mi.releaseMatters()) return 0.0; // a cube release does nothing
+            // Ship (2.2): your tap stays exactly as long as you made it. In a
+            // straight fly (quick taps to stay level) a release that waited for
+            // a "safe" tick made that tap a longer hold, and the ship rose by
+            // itself. A queued ship input fires on its schedule: the held
+            // input's shift, your hold / gap unchanged.
+            if (mi.ship && !mi.wave) return 0.0;
+            // Robot (2.2): the same - its release sets the jump's height, so a
+            // queued one keeps exactly the hold you made.
+            if (mi.robot && !push) return 0.0;
+            int wt = mi.windowTicks(effectiveCfg(c), push, dt);
+            if (c.custom) wt = std::min(wt, std::max(1, scaleTicks(c.maxTicks, BASE_DT / dt)));
+            return static_cast<double>(std::max(0, wt)) * dt;
+        };
 
         auto fired = ibcore::liveStep(m_queue, m_liveState, now, TIME_EPS, check, need, windowTime);
-        if (c.overlay && !path.empty()) drawPreview(pl, path, previewColor(testedEnd));
         if (fired) {
             fireButton(pl, *fired);
+            // (2.2) which hold it was, for the log: a scan snap / orb wait used to
+            // say "spot that worked before" (the learned-spot text)
+            char const* holdWhy = !wasFirst ? nullptr : m_routeHold ? "reached the scanned input"
+                                : m_orbHelpHold ? "touched the orb" : nullptr;
             if (wasFirst) { m_orbHelpHold = false; m_orbHelpRing = nullptr; m_routeHold = false; }
             if (wasFirst) {
                 int const firedTicks = static_cast<int>(std::lround((now - m_liveArrive) / dt));
                 m_last.liveTicks = firedTicks;
-                if (m_streamShift > TIME_EPS || modeName.find("wave") != std::string::npos) {
+                if (m_streamShift > TIME_EPS || modeName.find("wave") != std::string::npos ||
+                    modeName.find("ship") != std::string::npos) {
                     m_streamShift = std::max(0.0, now - m_liveArrive); // the shift it really got
                 }
                 m_last.liveReason = m_liveState.reason;
@@ -7869,7 +9323,8 @@ public:
                 // Always shown: when the held click really went in, and why.
                 bool const onPlan = !followed && m_liveState.reason == ibcore::FireReason::Plan;
                 pushLog(fmt::format("{} fired +{}t ({}){}{}", *fired ? "PRESS" : "REL", firedTicks,
-                                    fireReasonText(m_liveState.reason),
+                                    (holdWhy && m_liveState.reason == ibcore::FireReason::Proven) ? holdWhy
+                                                                                                  : fireReasonText(m_liveState.reason),
                                     m_liveWaited ? ", waited for a cleaner path" : "",
                                     ((late || onPlan) && c.hudVerbose) ? " | live: " + refuseSummary() : std::string()),
                         (late || onPlan) ? COL_ORANGE : COL_GREEN, false);
@@ -7930,7 +9385,51 @@ public:
         // scan's portal handling against the real game.
         {
             int const mc = modeCode(player);
+            // (2.2) band check: how far down / up you really went in this
+            // gamemode, against the band the scan uses (for the report)
+            {
+                CCRect const& r = player->getObjectRect();
+                m_realBandMin = std::min(m_realBandMin, r.getMinY());
+                m_realBandMax = std::max(m_realBandMax, r.getMaxY());
+            }
+            // (2.2) ground check: what you really stand on, and whether the
+            // hidden player could see it (for the report) - a few lines a level
+            if (player->m_isOnGround && m_groundTraces < 60) {
+                GameObject* g = player->m_lastGroundObject;
+                if (g != m_groundSeen) {
+                    m_groundSeen = g;
+                    m_groundTraces++;
+                    CCRect const& pr = player->getObjectRect();
+                    if (!g) {
+                        float lo = 0.f, hi = 0.f;
+                        bool const band = bandOf(player, lo, hi, pl->m_gameState.m_portalY);
+                        groundLog(fmt::format("ground check: standing at y {:.1f} (feet {:.1f}) on no object - GD ground / portal floor{}",
+                                          player->getPositionY(), pr.getMinY(),
+                                          band ? fmt::format(" (scan band {:.0f} .. {:.0f})", lo, hi) : std::string(" (no band)")));
+                    } else {
+                        bool inIndex = false;
+                        for (auto const& ro : m_rayObjs) if (ro.obj == g) { inIndex = true; break; }
+                        CCRect const& r = g->getObjectRect();
+                        groundLog(fmt::format("ground check: standing on {} id {} at ({:.0f},{:.0f}) {:.0f}x{:.0f} type {} "
+                                          "noTouch {} passable {} groupOff {} off {} visible {} - in the mod's list: {}",
+                                          objectName(g->m_objectType), g->m_objectID, r.getMidX(), r.getMidY(), r.size.width,
+                                          r.size.height, static_cast<int>(g->m_objectType), g->m_isNoTouch, g->m_isPassable,
+                                          g->m_isGroupDisabled, g->m_isDisabled, g->isVisible(), inIndex ? "yes" : "NO"));
+                    }
+                }
+            }
             if (mc != m_lastRealMode) {
+                if (m_lastRealMode >= 0 && bandHeight(m_lastRealMode) > 0.f) {
+                    float const h = bandHeight(m_lastRealMode);
+                    float const lo = std::max(GROUND_Y, m_realBandY - h * 0.5f);
+                    groundLog(fmt::format("band check: mode {} you went {:.1f} .. {:.1f}, scan band {:.1f} .. {:.1f} "
+                                      "(portal y {:.1f}, portalY {:.1f}, mode height {:.1f})",
+                                      m_lastRealMode, m_realBandMin, m_realBandMax, lo, lo + h, m_realBandY,
+                                      pl->m_gameState.m_portalY, pl->m_gameState.m_lastModeHeight));
+                }
+                m_realBandMin = 1e9f;
+                m_realBandMax = -1e9f;
+                m_realBandY = player->m_lastPortalPos.y;
                 if (m_lastRealMode >= 0) {
                     trace(fmt::format("real mode {} -> {} at ({:.1f},{:.1f}) lastPortalPos=({:.1f},{:.1f}) portalY={:.1f}",
                                       m_lastRealMode, mc, player->getPositionX(), player->getPositionY(),
@@ -7946,6 +9445,9 @@ public:
             m_lvlStats.attempts++;
             m_lifeStats.attempts++;
             trace(fmt::format("attempt start at x={:.1f}{}", player->getPositionX(), pl->m_isPracticeMode ? " (practice)" : ""));
+            // Wave rays (2.2): index the level's hitboxes now (once per level),
+            // not on your first wave click - a big level takes a moment.
+            if (m_rayLayer != pl) buildRayIndex(pl);
         }
         m_lastStepWall = Clock::now();
 
@@ -7964,7 +9466,17 @@ public:
             refreshFlags();
             refreshHud(pl, false);
         }
-        if ((m_tick & 3) == 0) updatePreview(pl);
+        if (cfg().rayView) {
+            // Show Rays (2.2): the pathfinder gets ~1 ms every 4 steps, the
+            // drawing is redone every 8 (~30x a second)
+            // (paused while one of your inputs is waiting to go in: nothing may
+            // touch the game between your click and its tick)
+            if ((m_tick & 3) == 0 && !m_queue.pending() && !m_live) planSlice(pl, 1000);
+            if ((m_tick & 7) == 0) updateRays(pl);
+        } else if ((m_tick & 15) == 0) {
+            clearRays();
+            if (m_planActive) { m_planActive = false; m_planA = AStarRun{}; }
+        }
 
         if (!m_enabled) {
             clearBuffer();
@@ -8011,14 +9523,6 @@ public:
             // At most one queued input per physics step, right before the step runs.
             if (auto due = m_queue.poll(m_gameTime, TIME_EPS)) {
                 fireButton(pl, *due);
-                if (m_trackPending) {
-                    // Align the prediction to the step the held click really landed on.
-                    m_tracker.start(m_gameTime - static_cast<double>(m_pendingDelay) * getValidDt(), getValidDt(),
-                                    std::move(m_pendingPath), m_pendingCheck, ACCURACY_TOL_PX);
-                    m_pendingPath.clear();
-                    m_trackPending = false;
-                    m_trackMode = m_pendingMode;
-                }
             }
         } else {
             reconcile(pl);
@@ -8053,7 +9557,7 @@ std::string toggleHint() {
 // "how to bring the window back", for the hide notification and the empty Log.
 std::string showHowTo() {
 #ifdef GEODE_IS_MOBILE
-    return "the Input Buffer button in the pause menu";
+    return "the Nova button in the pause menu";
 #else
     return windowKeyName();
 #endif
@@ -8074,12 +9578,20 @@ std::string keyNameFor(Keybind const& b, char const* fallback);
     if (binds.empty()) return "";
     return keyNameFor(binds.front(), "");
 }
+// (2.3) Geode's names can have symbols the window's font can't draw (Mac's
+// key symbols came out as nothing: "  to toggle"). Plain text only, else the fallback.
+static std::string plainKeyName(std::string const& t, char const* fallback) {
+    std::string out;
+    for (unsigned char ch : t) if (ch >= 32 && ch < 127) out += static_cast<char>(ch);
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    bool any = false;
+    for (char ch : out) any = any || std::isalnum(static_cast<unsigned char>(ch));
+    return any ? out : std::string(fallback);
+}
 std::string keyNameFor(Keybind const& b, char const* fallback) {
     // with modifiers, Geode's own name says it all ("Ctrl+Shift+X")
-    if (b.modifiers != KeyboardModifier::None) {
-        std::string const t = b.toString();
-        return t.empty() ? std::string(fallback) : t;
-    }
+    if (b.modifiers != KeyboardModifier::None) return plainKeyName(b.toString(), fallback);
     int const vk = static_cast<int>(b.key);
     switch (vk) {
         case 0xA4: return "Left Alt";
@@ -8104,8 +9616,7 @@ std::string keyNameFor(Keybind const& b, char const* fallback) {
     if (vk >= 0x70 && vk <= 0x87) return fmt::format("F{}", vk - 0x70 + 1);
     if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A)) return std::string(1, static_cast<char>(vk));
     // anything else: Geode's name for it
-    std::string const t = b.toString();
-    return t.empty() ? std::string(fallback) : t;
+    return plainKeyName(b.toString(), fallback);
 }
 
 constexpr char const* AUTHOR_NAME    = "AlQuerez23";
@@ -8114,7 +9625,7 @@ constexpr float PLATFORM_WINDOW_SCALE = 1.5f; // window size on iOS / Android (2
 #else
 constexpr float PLATFORM_WINDOW_SCALE = 1.0f;
 #endif
-constexpr char const* TITLE_BADGE = "V2.2"; // the badge next to the title
+constexpr char const* TITLE_BADGE = "V2.3"; // the badge next to the title
 constexpr char const* AUTHOR_DISCORD = "alquerez23";
 
 // ----------------------------------------------------------------------------
@@ -8125,6 +9636,209 @@ constexpr char const* AUTHOR_DISCORD = "alquerez23";
 //  would have been (measured once). If the bundled font isn't there, it falls
 //  back to GD's own font.
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+//  Online users (2.2): how many people have Input Buffer and how many are
+//  playing right now, shown in the window header (green dot = online, grey =
+//  offline). Each game sends the Input Buffer server an anonymous random ID
+//  (made on first start, nothing else about you) every 2 minutes; the server
+//  answers with the totals. Off with the "Show Online Users" setting.
+//  ONLINE_URL (src/OnlineURL.hpp) is your Cloudflare Worker (see server/README.md); empty = off.
+// ----------------------------------------------------------------------------
+// The URL lives in its own file (src/OnlineURL.hpp) so a new main.cpp never wipes it.
+#include "OnlineURL.hpp"
+constexpr float ONLINE_PING_SECS = 90.f;  // (2.3) "I'm here", every 1.5 minutes (was 2; the server's "online" is 3)
+constexpr float ONLINE_STATS_SECS = 30.f; // (2.3) the totals, every 30 s - only while you're looking at the window
+// (Cloudflare's free plan: 100 000 requests a day. A game left open pings
+// ~960 times a day; the extra totals only while the window is up and you're
+// not playing.)
+struct OnlineStats { long long total = -1, online = -1; };
+OnlineStats s_online;
+
+std::string onlineId() {
+    auto* mod = Mod::get();
+    std::string id = mod->getSavedValue<std::string>("anon-id", "");
+    bool ok = id.size() == 32;
+    for (char ch : id) ok = ok && std::isxdigit(static_cast<unsigned char>(ch));
+    if (!ok) {
+        std::random_device rd;
+        std::mt19937_64 rng((static_cast<uint64_t>(rd()) << 32) ^ rd());
+        id.clear();
+        for (int i = 0; i < 32; i++) id += "0123456789abcdef"[rng() & 15];
+        mod->setSavedValue<std::string>("anon-id", id);
+    }
+    return id;
+}
+
+bool onlineEnabled() {
+    return ONLINE_URL[0] != '\0' && Mod::get()->getSettingValue<bool>("online-count");
+}
+
+void sendOnlinePing() {
+    if (!onlineEnabled()) { s_online = OnlineStats{}; return; }
+    web::WebRequest req;
+    req.bodyJSON(matjson::makeObject({{"id", onlineId()},
+                                      {"version", Mod::get()->getVersion().toVString()},
+                                      {"platform", std::string(GEODE_PLATFORM_SHORT_IDENTIFIER)}}));
+    req.timeout(std::chrono::seconds(10));
+    async::spawn(req.post(std::string(ONLINE_URL) + "/ping"), [](web::WebResponse res) {
+        if (!res.ok()) return;
+        auto j = res.json();
+        if (!j) return;
+        auto const total = (*j)["total"].asInt();
+        auto const online = (*j)["online"].asInt();
+        if (total && online) {
+            s_online.total = static_cast<long long>(*total);
+            s_online.online = static_cast<long long>(*online);
+        }
+    });
+}
+
+// (2.3) Just the totals (no "I'm here"): cheap, so the numbers follow other
+// players coming and going between your own pings. Every version of the mod
+// (Input Buffer 2.2, Nova) talks to the same server, so they all count.
+void fetchOnlineStats() {
+    if (!onlineEnabled()) { s_online = OnlineStats{}; return; }
+    web::WebRequest req;
+    req.timeout(std::chrono::seconds(10));
+    async::spawn(req.get(std::string(ONLINE_URL) + "/stats"), [](web::WebResponse res) {
+        if (!res.ok()) return;
+        auto j = res.json();
+        if (!j) return;
+        auto const total = (*j)["total"].asInt();
+        auto const online = (*j)["online"].asInt();
+        if (total && online) {
+            s_online.total = static_cast<long long>(*total);
+            s_online.online = static_cast<long long>(*online);
+        }
+    });
+}
+bool s_onlineNow = false;    // set: fetch the totals right away (the window just opened)
+bool s_onlineWanted = false; // the window is up (and you're not playing): keep the totals fresh
+
+// Sends the ping on start and every ONLINE_PING_SECS, and fetches the totals
+// every ONLINE_STATS_SECS (lives on Geode's overlay).
+class OnlineCounter : public CCNode {
+    float m_wait = 3.f; // first ping a few seconds after start
+    float m_statsWait = ONLINE_STATS_SECS;
+public:
+    static OnlineCounter* create() {
+        auto* p = new OnlineCounter();
+        if (p->init()) { p->autorelease(); return p; }
+        delete p;
+        return nullptr;
+    }
+    bool init() override {
+        if (!CCNode::init()) return false;
+        scheduleUpdate();
+        return true;
+    }
+    void update(float dt) override {
+        m_wait -= dt;
+        m_statsWait -= dt;
+        if (m_wait <= 0.f) {
+            m_wait = ONLINE_PING_SECS;
+            m_statsWait = ONLINE_STATS_SECS; // (the ping answers with the totals too)
+            s_onlineNow = false;
+            sendOnlinePing();
+            return;
+        }
+        if ((m_statsWait <= 0.f && s_onlineWanted) || s_onlineNow) {
+            m_statsWait = ONLINE_STATS_SECS;
+            s_onlineNow = false;
+            fetchOnlineStats();
+        }
+    }
+};
+
+// ----------------------------------------------------------------------------
+//  Smooth shapes (2.2): GD draws shapes without anti-aliasing, so circles and
+//  round corners came out jagged. These small textures are made once by the
+//  mod with soft 1-px edges (white, tinted when used): a circle, a rounded
+//  box, and a rounded box with a gentle top-to-bottom shade and a thin light
+//  top edge (buttons). Remade after a graphics reload.
+// ----------------------------------------------------------------------------
+namespace aa {
+constexpr int TEX = 64;          // texture size, px
+constexpr float CORNER = 16.f;   // corner radius in the rounded textures, px
+inline CCTexture2D* s_circle = nullptr;
+inline CCTexture2D* s_round = nullptr;
+inline CCTexture2D* s_button = nullptr;
+
+inline CCTexture2D* make(bool circle, bool shaded) {
+    std::vector<uint8_t> px(static_cast<size_t>(TEX * TEX * 4));
+    float const half = TEX * 0.5f;
+    for (int y = 0; y < TEX; y++) {
+        for (int x = 0; x < TEX; x++) {
+            float const fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
+            float sd; // signed distance to the edge, px (negative inside)
+            if (circle) {
+                sd = std::hypot(fx - half, fy - half) - (half - 1.f);
+            } else {
+                float const r = CORNER;
+                float const qx = std::fabs(fx - half) - (half - 1.f - r), qy = std::fabs(fy - half) - (half - 1.f - r);
+                sd = std::hypot(std::max(qx, 0.f), std::max(qy, 0.f)) + std::min(std::max(qx, qy), 0.f) - r;
+            }
+            float const a = std::clamp(0.5f - sd, 0.f, 1.f);
+            float shade = 1.f;
+            if (shaded) {
+                float const t = fy / static_cast<float>(TEX);         // 0 top .. 1 bottom (image rows run top-down)
+                shade = 0.97f - 0.17f * t;                           // lighter at the top
+                if (fy < 3.5f + 0.f && sd < -0.5f) shade = 1.f;      // thin light top edge
+            }
+            uint8_t const v = static_cast<uint8_t>(std::lround(255.f * shade));
+            size_t const i = static_cast<size_t>((y * TEX + x) * 4);
+            px[i] = v; px[i + 1] = v; px[i + 2] = v;
+            px[i + 3] = static_cast<uint8_t>(std::lround(255.f * a));
+        }
+    }
+    auto* t = new CCTexture2D();
+    if (!t->initWithData(px.data(), kCCTexture2DPixelFormat_RGBA8888, TEX, TEX, CCSize(TEX, TEX))) {
+        t->release();
+        return nullptr;
+    }
+    t->setAntiAliasTexParameters();
+    return t; // kept (one reference) until reset()
+}
+inline CCTexture2D* circle() { if (!s_circle) s_circle = make(true, false); return s_circle; }
+inline CCTexture2D* round() { if (!s_round) s_round = make(false, false); return s_round; }
+inline CCTexture2D* button() { if (!s_button) s_button = make(false, true); return s_button; }
+inline void reset() {
+    for (CCTexture2D** t : {&s_circle, &s_round, &s_button}) {
+        if (*t) (*t)->release();
+        *t = nullptr;
+    }
+}
+// The textures' size in points (cocos counts textures in pixels / content scale).
+inline float pts(float px) { return px / std::max(0.01f, CC_CONTENT_SCALE_FACTOR()); }
+// A smooth filled circle, `d` across, centred on its position.
+inline CCSprite* circleSprite(float d, ccColor3B col, GLubyte op = 255) {
+    CCTexture2D* t = circle();
+    if (!t) return nullptr;
+    auto* s = CCSprite::createWithTexture(t);
+    s->setScale(d / pts(static_cast<float>(TEX)));
+    s->setColor(col);
+    s->setOpacity(op);
+    return s;
+}
+// A smooth rounded box `w` x `h` with corner radius `r`, anchored bottom-left.
+inline CCNode* roundBox(float w, float h, float r, ccColor3B col, GLubyte op = 255, bool shaded = false) {
+    CCTexture2D* t = shaded ? button() : round();
+    if (!t) return nullptr;
+    r = std::clamp(r, 0.5f, std::min(w, h) * 0.5f);
+    float const tp = pts(static_cast<float>(TEX)), cp = pts(CORNER);
+    float const k = r / cp; // the texture's corners are cp points: scale them to r
+    auto* frame = CCSpriteFrame::createWithTexture(t, CCRect(0.f, 0.f, tp, tp));
+    auto* s = extension::CCScale9Sprite::createWithSpriteFrame(frame, CCRect(cp, cp, tp - 2.f * cp, tp - 2.f * cp));
+    if (!s) return nullptr;
+    s->setContentSize({w / k, h / k});
+    s->setScale(k);
+    s->setAnchorPoint({0.f, 0.f});
+    s->setColor(col);
+    s->setOpacity(op);
+    return s;
+}
+} // namespace aa
+
 class IBLabel : public CCLabelBMFont {
 public:
     float m_k = 1.f; // drawn scale = asked scale * m_k
@@ -8171,6 +9885,8 @@ public:
     void setScale(float s) override { CCLabelBMFont::setScale(s * m_k); }
 };
 
+#include "NovaUI.hpp"
+
 class BufferWindow : public CCLayer {
 public:
     enum Tab { TAB_LOG, TAB_STATS, TAB_SETTINGS, TAB_MODES, TAB_TOOLS, TAB_DEV, TAB_COUNT };
@@ -8204,6 +9920,8 @@ public:
             bool const stale = std::fabs(Config::load().hudScale - s_builtScale) > 1e-3f ||
                                std::fabs(windowOpacity() - s_builtAlpha) > 1e-3f;
             if (!stale) {
+                // (2.3) hidden for the mod's settings: it comes back when they close
+                if (s_instance->m_settingsPopup && s_instance->m_settingsPopup->getParent()) return;
                 if (!s_instance->isVisible()) {
                     s_instance->setVisible(true);
                     s_instance->popIn();
@@ -8211,10 +9929,18 @@ public:
                 return;
             }
         }
+        // (2.3) settings still open (Window Size / Opacity changed in them): the
+        // new window waits hidden for them to close, like the old one did
+        Ref<CCNode> popup = s_instance && s_instance->m_settingsPopup && s_instance->m_settingsPopup->getParent()
+                                ? s_instance->m_settingsPopup : Ref<CCNode>(nullptr);
         if (s_instance) s_instance->removeFromParent(); // from an older version / scene
         auto* w = new BufferWindow();
         if (w->init()) {
             w->autorelease();
+            if (popup) {
+                w->m_settingsPopup = popup;
+                w->setVisible(false);
+            }
             host->addChild(w, 100);
         } else {
             delete w;
@@ -8241,6 +9967,8 @@ public:
     // was made for the old graphics and comes out as big coloured blocks.
     // Throw the window away now; it's built again fresh right after (2.2).
     static void dropForReload() {
+        aa::reset(); // (2.2) the smooth-shape textures belong to the old graphics
+        nv::reset();
         if (!s_instance) return;
         s_instance->removeFromParent(); // (its destructor clears s_instance)
         s_instance = nullptr;
@@ -8255,6 +9983,11 @@ public:
     // Window key: flip "window shown".
     static void toggle() {
         auto* mod = Mod::get();
+        // (2.3) The mod's settings are open (from the cog): the window waits
+        // for them to close and comes back where it was. The key used to pull
+        // it up over the settings, and the next press hid it / brought it back
+        // somewhere else.
+        if (s_instance && s_instance->m_settingsPopup && s_instance->m_settingsPopup->getParent()) return;
         // Shown in settings but hidden on screen (e.g. after "All settings"): just bring it back.
         if (mod->getSavedValue<bool>("window-shown", true) && s_instance && !s_instance->isVisible()) {
             ensure();
@@ -8273,10 +10006,10 @@ protected:
     // Layout (window-local units; the whole window is scaled by "Window Size").
     // 2.2: a sidebar on the left (title + the tabs), the page on the right.
     // W is the PAGE width - every page is laid out in page coordinates.
-    static constexpr float SIDE_W  = 88.f;
+    static constexpr float SIDE_W  = 104.f; // (2.2 Nova: room for Nova Run and a big NOVA)
     static constexpr float W       = 320.f;
     static constexpr float FULL_W  = SIDE_W + W;
-    static constexpr float H       = 198.f;
+    static constexpr float H       = 214.f; // (2.2 Nova: taller, roomier pages)
     static constexpr float TITLE_H = 18.f;
     static constexpr float TABS_H  = 0.f;   // (the tabs are in the sidebar)
     static constexpr float FOOT_H  = 14.f;
@@ -8290,20 +10023,30 @@ protected:
 
     // Palette (2.2): dark glass with a purple hue - near-black panels, soft
     // violet edges, one bright violet accent.
-    static inline const ccColor3B C_FRAME   = {13, 10, 24};
-    static inline const ccColor3B C_EDGE    = {64, 50, 108};        // outline around the window / cards
-    static inline const ccColor4B C_GRAD_TOP = {34, 24, 60, 240};   // page: dusk purple at the top...
-    static inline const ccColor4B C_GRAD_BOT = {16, 12, 30, 240};   // ...near black at the bottom
-    static inline const ccColor3B C_SIDE    = {20, 15, 36};         // sidebar
-    static inline const ccColor3B C_SIDE_SEL = {66, 48, 118};       // selected tab in the sidebar
-    static inline const ccColor3B C_CARD    = {29, 22, 50};
-    static inline const ccColor3B C_CARD_EDGE = {56, 44, 94};
-    static inline const ccColor3B C_BTN     = {46, 37, 78};         // button box
-    static inline const ccColor3B C_BTN_SEL = {136, 88, 246};       // selected stage / main buttons
+    // (2.2 overhaul: flat charcoal panels with a purple tint, one muted violet accent)
+    static inline const ccColor3B C_FRAME   = {17, 15, 23};
+    static inline const ccColor3B C_EDGE    = {52, 46, 70};         // outline around the window / cards
+    static inline const ccColor4B C_GRAD_TOP = {27, 24, 36, 240};   // page: charcoal at the top...
+    static inline const ccColor4B C_GRAD_BOT = {18, 16, 24, 240};   // ...a little darker at the bottom
+    static inline const ccColor3B C_SIDE    = {21, 19, 29};         // sidebar
+    static inline const ccColor3B C_SIDE_SEL = {46, 40, 64};        // selected tab in the sidebar
+    static inline const ccColor3B C_CARD    = {27, 25, 36};
+    // (2.2 Nova) card outlines: a violet glow at rest, brighter under the mouse,
+    // flaring when a tab opens; grey for a mode that's off
+    static inline const ccColor3B C_CARD_REST = {74, 60, 118};
+    static inline const ccColor3B C_CARD_HOV  = {140, 114, 232};
+    static inline const ccColor3B C_CARD_LIT  = {190, 160, 255};
+    static inline const ccColor3B C_CARD_OFF  = {48, 44, 62};
+    static inline const ccColor3B C_GLOW      = {150, 110, 255};
+    static inline const ccColor3B C_EXTREME      = {184, 46, 136};  // the Extreme button: hot pink
+    static inline const ccColor3B C_EXTREME_TEXT = {255, 150, 206};
+    static inline const ccColor3B C_ROW_LINE = {40, 37, 53};        // thin line between rows
+    static inline const ccColor3B C_BTN     = {41, 38, 55};         // button box
+    static inline const ccColor3B C_BTN_SEL = {110, 76, 196};       // selected stage / main buttons (2.2: muted)
     static inline const ccColor3B C_BTN_HOT = {196, 72, 168};       // unsaved Apply
-    static inline const ccColor3B C_SW_OFF  = {62, 54, 92};         // switch track, off
-    static inline const ccColor3B C_PILL    = {34, 26, 60};
-    static inline const ccColor3B C_LAV     = {200, 172, 255};      // card titles
+    static inline const ccColor3B C_SW_OFF  = {60, 57, 76};         // switch track, off
+    static inline const ccColor3B C_PILL    = {31, 28, 42};
+    static inline const ccColor3B C_LAV     = {214, 206, 236};      // card titles (2.2: near white, like the reference)
     static inline const ccColor3B C_MUTED   = {192, 183, 228};  // secondary text (brighter in 2.2)
     static inline const ccColor3B C_DIM     = {146, 136, 186};
 
@@ -8311,18 +10054,8 @@ protected:
     bool  m_shownOnce = false;
     int   m_offset = 0;            // first visible row
     CCNode*        m_body = nullptr;     // the full window (everything below is in here)
-    CCNode*        m_pill = nullptr;     // small pill shown instead while a level runs
-    CCDrawNode*    m_pillBg = nullptr;
-    CCLabelBMFont* m_pillStage = nullptr;
-    CCLabelBMFont* m_pillTag = nullptr;
-    CCLabelBMFont* m_pillText = nullptr;
-    unsigned long long m_pillVersion = ~0ull;
-    std::string    m_pillStageText;
-    bool           m_compactNow = false; // currently showing the pill
-    bool           m_compactOn = true;   // "Small while playing" (cached)
-    float          m_compactCheck = 0.f;
     CCNode*        m_tabSlots = nullptr; // the four tab boxes (static)
-    CCDrawNode*    m_tabHi = nullptr;    // the selected tab's highlight (slides)
+    CCNode*        m_tabHi = nullptr;    // the selected tab's highlight (slides)
     bool           m_tabHiPlaced = false;
     float          m_alpha = 1.f;        // Window Opacity setting (panels only, text stays solid)
     static inline float s_builtScale = -1.f, s_builtAlpha = -1.f;
@@ -8336,18 +10069,25 @@ protected:
     CCLabelBMFont* m_header = nullptr;
     CCLayerGradient* m_accent = nullptr;   // line under the title
     CCDrawNode*    m_headerPill = nullptr;
+    CCNode*        m_headerFx = nullptr;   // (2.2 Nova) Extreme's glow on the stage pill
     CCNode*        m_stripes = nullptr;
     CCLayerColor*  m_scrollTrack = nullptr;
     CCLayerColor*  m_scrollThumb = nullptr;
     CCLabelBMFont* m_footer = nullptr;
     CCLabelBMFont* m_platform = nullptr; // footer, right: "Windows 11" etc. (2.1)
     CCNode* m_page = nullptr;      // the page (right of the sidebar); pages use its coordinates
-    CCNode* m_stars = nullptr;     // background shooting stars
+    nv::Starfield* m_pageSky = nullptr; // (2.2 Nova) stars + nebulae behind the page
+    nv::Starfield* m_sideSky = nullptr; // and a few in the sidebar
+    CCSprite* m_accentSweep = nullptr;  // the light that runs along the header line
+    CCNode*   m_runBox = nullptr;       // Nova Run: its card
+    nv::CourseView* m_run = nullptr;    // Nova Run itself
+    CCRect    m_runRect;
+    bool      m_tapLogo = false;        // a click on NOVA calls the robot
+    Clock::time_point m_lastHeaderTap{}; // (2.3) double-click the header: back to the top right
+    float     m_tapMoved = 0.f;
     float   m_badgeW = 20.f;
     int     m_badgeTaps = 0;
     float   m_badgeTapAge = 0.f;
-    float   m_starIn = 0.f;        // seconds until the next one
-    unsigned m_starSeed = 12345u;
     CCLabelBMFont* m_pageTitle = nullptr;
     CCMenu* m_titleMenu = nullptr; // close button
     CCMenu* m_tabMenu = nullptr;
@@ -8402,10 +10142,15 @@ protected:
         frame->setPosition({1.f, 1.f});
         m_body->addChild(frame, 0);
 
-        // Sidebar panel.
+        // Sidebar panel, with a few slow stars of its own.
         auto* side = panel(SIDE_W - 4.f, H - 8.f, C_SIDE, op(235.f), 7.f);
         side->setPosition({4.f, 4.f});
         m_body->addChild(side, 0);
+        m_sideSky = nv::Starfield::create(SIDE_W - 10.f, H - 14.f, 16, 9001u, m_alpha, 0.9f, false);
+        if (m_sideSky) {
+            m_sideSky->setPosition({7.f, 7.f});
+            m_body->addChild(m_sideSky, 0);
+        }
 
         // The page (right of the sidebar): its own node, so every page keeps
         // its own coordinates (0..W).
@@ -8424,51 +10169,82 @@ protected:
         body->setPosition({3.f, FOOT_H + 1.f});
         m_page->addChild(body, 0);
 
-        // Shooting stars behind the page (2.2). (The galaxy is only in the
-        // sidebar - behind the page it made the text hard to read.)
-        m_stars = CCNode::create();
-        m_page->addChild(m_stars, 0);
+        // (2.2 Nova) deep space behind the page: slow parallax stars that
+        // twinkle, and soft nebulae that breathe. Kept faint - text first.
+        {
+            float const bw = W - 8.f, bh = H - TITLE_H - FOOT_H - 3.f;
+            CCNode* clip = nv::clipped(bw, bh, 7.f);
+            clip->setPosition({3.f, FOOT_H + 1.f});
+            m_page->addChild(clip, 0);
+            m_pageSky = nv::Starfield::create(bw, bh, 46, 12345u, m_alpha, 3.f, true);
+            if (m_pageSky) clip->addChild(m_pageSky);
+        }
 
-        // Accent line under the page header: violet into pink.
+        // Accent line under the page header: violet into pink. A light runs
+        // along it when you open a tab.
         m_accent = CCLayerGradient::create(ccColor4B{150, 90, 255, 200}, ccColor4B{235, 90, 200, 120}, CCPoint{1.f, 0.f});
         m_accent->setContentSize({W - 14.f, 1.f});
         m_accent->setPosition({6.f, H - TITLE_H});
         m_page->addChild(m_accent, 1);
+        m_accentSweep = nv::sprite(nv::soft(), 30.f, {222, 196, 255}, 0);
+        if (m_accentSweep) {
+            nv::additive(m_accentSweep);
+            m_accentSweep->setScaleY(m_accentSweep->getScaleX() * 0.18f);
+            m_accentSweep->setPosition({6.f, H - TITLE_H + 0.5f});
+            m_page->addChild(m_accentSweep, 2);
+        }
 
-        // ---- sidebar: title, version + author, the tabs, the system ----
-        auto* title = IBLabel::make("Input Buffer", "bigFont.fnt");
-        title->setScale(0.44f);
-        limitNodeWidth(title, SIDE_W - 16.f, 0.44f, 0.15f);
-        title->setColor({255, 255, 255});
-        title->setAnchorPoint({0.f, 0.5f});
-        title->setPosition({10.f, H - 16.f});
-        m_body->addChild(title, 2);
-        // Version badge ("V2.2"): violet pill, white text, sized to the text.
-        // version badge (a violet pill; a button - see buildTabs)
+        // ---- sidebar header (2.2 Nova), centred: NOVA in neon (each letter
+        // lights up under the mouse; the O is a ring galaxy), "INPUT BUFFER"
+        // under it, then the version - glowing too (5 quick clicks: Dev tab) -
+        // and the author on one line.
+        float const sideMid = (SIDE_W + 4.f) / 2.f; // the sidebar panel's middle
+        // NOVA and V2.2 side by side, the author under them, all centred
         auto* v2 = IBLabel::make(TITLE_BADGE, "bigFont.fnt");
-        v2->setScale(0.31f);
-        float const badgeW = std::max(24.f, v2->getContentSize().width * v2->getScale() + 11.f);
-        float const badgeY = H - 31.f;
-        m_badgeW = badgeW;
-        auto* by = IBLabel::make(fmt::format("by {}", AUTHOR_NAME).c_str(), "chatFont.fnt");
-        by->setScale(0.5f);
-        limitNodeWidth(by, SIDE_W - 20.f - badgeW, 0.5f, 0.25f);
-        by->setColor({255, 255, 255}); // white: readable over the galaxy
-        by->setAnchorPoint({0.f, 0.5f});
-        by->setPosition({10.f + badgeW + 4.f, badgeY - 0.3f});
-        m_body->addChild(by, 2);
-        auto* sideLine = CCLayerColor::create(ccColor4B{150, 110, 255, 50}, SIDE_W - 20.f, 1.f);
-        sideLine->setPosition({10.f, H - 41.f});
+        v2->setScale(0.28f);
+        m_badgeW = v2->getContentSize().width * v2->getScale();
+        constexpr float VER_GAP = 4.f;
+        float const novaY = H - 20.f; // (the author's line moved to the Log)
+        buildNova(sideMid, novaY, m_badgeW + VER_GAP);
+        m_verX = m_novaRight + VER_GAP;
+        m_verY = novaY - 3.5f; // sits low beside NOVA, like a superscript's opposite
+        buildVersionGlow(m_verX + m_badgeW / 2.f, m_verY);
+        // (2.2) NOVA sits in the middle between the panel's top and the line:
+        // measured from the letters as drawn (glyphs, the galaxy O), the line
+        // goes as far under them as the panel's top is above them; the tabs
+        // follow the line.
+        float const lineY = std::clamp(novaLineY(), H - 46.f, H - 30.f);
+        s_tabTop = lineY - 10.f;
+        auto* sideLine = CCLayerColor::create(ccColor4B{150, 120, 230, 40}, SIDE_W - 20.f, 1.f);
+        sideLine->setPosition({10.f, lineY});
         m_body->addChild(sideLine, 2);
 
-        // the sidebar gets its own bit of sky
-        m_body->addChild(buildSideSky(), 1);
-        buildRunners();
+        // ---- Nova Run (2.2): your icons, one gamemode at a time, through GD
+        // obstacles; a portal at the end of each section changes the mode.
+        // Click the icon and it explodes (and tries again).
+        {
+            float const cx = 8.f, cy = 27.f, cw = SIDE_W - 16.f;
+            float const ch = std::min(62.f, sideItemY(3) - SIDE_ITEM_H / 2.f - 6.f - cy); // under the four tabs
+            m_runRect = CCRect(cx, cy, cw, ch);
+            m_runBox = CCNode::create();
+            m_body->addChild(m_runBox, 1);
+            if (CCNode* g = nv::glowBox(cx, cy, cw, ch, 5.5f, C_GLOW, op(60.f))) m_runBox->addChild(g);
+            CCNode* e = aa::roundBox(cw, ch, 5.5f, C_CARD_REST, op(220.f));
+            if (!e) e = panel(cw, ch, C_CARD_REST, op(220.f), 5.5f);
+            e->setPosition({cx, cy});
+            m_runBox->addChild(e);
+            m_run = nv::CourseView::create(cw - 2.f, ch - 2.f, m_alpha);
+            if (m_run) {
+                m_run->setPosition({cx + 1.f, cy + 1.f});
+                m_runBox->addChild(m_run);
+            }
+        }
 
         // Tabs: a highlight that slides to the selected one, items over it.
         m_tabSlots = CCNode::create();
         m_body->addChild(m_tabSlots, 1);
-        m_tabHi = panel(SIDE_W - 16.f, SIDE_ITEM_H, C_SIDE_SEL, 255, 5.f);
+        m_tabHi = aa::roundBox(SIDE_W - 16.f, SIDE_ITEM_H, 5.f, C_SIDE_SEL, 255, true);
+        if (!m_tabHi) m_tabHi = panel(SIDE_W - 16.f, SIDE_ITEM_H, C_SIDE_SEL, 255, 5.f);
         m_body->addChild(m_tabHi, 2);
 
         // System, bottom of the sidebar ("Windows 11" etc.).
@@ -8496,6 +10272,15 @@ protected:
         m_headerPill->setAnchorPoint({1.f, 0.5f});
         m_headerPill->setPosition({W - 21.f, H - TITLE_H / 2.f});
         m_page->addChild(m_headerPill, 1);
+        // Online users (2.2): "(green) 12 online  (grey) 328 offline", left of the stage pill
+        m_onlineDots = CCNode::create();
+        m_page->addChild(m_onlineDots, 2);
+        m_onlineOn = bodyLabel("", 0.26f);
+        m_onlineOn->setAnchorPoint({0.f, 0.5f});
+        m_page->addChild(m_onlineOn, 2);
+        m_onlineOff = bodyLabel("", 0.26f, C_MUTED);
+        m_onlineOff->setAnchorPoint({0.f, 0.5f});
+        m_page->addChild(m_onlineOff, 2);
         m_header = bodyLabel("", 0.28f);
         m_header->setAnchorPoint({1.f, 0.5f});
         m_header->setPosition({W - 26.f, H - TITLE_H / 2.f});
@@ -8532,10 +10317,35 @@ protected:
         m_page->addChild(m_footer, 2);
 
         m_titleMenu = makeMenu(m_page);
+        // (2.2 Nova) settings: a round button with a cog, bottom right (right
+        // of the online count). Opens the mod's settings; the cog turns while
+        // the mouse is on it.
+        {
+            float const d = 11.5f;
+            auto* node = CCNode::create();
+            node->setContentSize({d, d});
+            if (auto* ring = aa::circleSprite(d, ccColor3B{96, 78, 156})) { ring->setPosition({d / 2.f, d / 2.f}); node->addChild(ring); }
+            if (auto* fill = aa::circleSprite(d - 1.3f, C_BTN)) { fill->setPosition({d / 2.f, d / 2.f}); node->addChild(fill); }
+            if (auto* hov = aa::circleSprite(d, C_HOVER, 0)) {
+                hov->setTag(HOVER_TAG);
+                hov->setPosition({d / 2.f, d / 2.f});
+                node->addChild(hov);
+                m_gearHover = hov;
+            }
+            m_gear = nv::sprite(nv::gear(), 7.6f, ccColor3B{220, 212, 242});
+            if (m_gear) {
+                m_gear->setPosition({d / 2.f, d / 2.f});
+                node->addChild(m_gear);
+            }
+            auto* item = CCMenuItemExt::createSpriteExtra(node, [this](CCMenuItemSpriteExtra*) { openSettings(); });
+            item->setSizeMult(1.1f);
+            item->setPosition({W - PAD - d / 2.f + 1.f, FOOT_H / 2.f + 0.5f});
+            m_titleMenu->addChild(item);
+        }
         // Close: a white X in a small box.
         boxButton(m_titleMenu, "X", {W - 11.f, H - TITLE_H / 2.f}, 12.f, 12.f, C_BTN, ccColor3B{255, 255, 255}, 0.3f, [] {
             BufferWindow::toggle();
-            Notification::create(fmt::format("Input Buffer hidden - {} shows it again", showHowTo()),
+            Notification::create(fmt::format("Nova hidden - {} shows it again", showHowTo()),
                                  NotificationIcon::None, 2.0f)->show();
         });
 
@@ -8575,7 +10385,6 @@ protected:
             m_rowsT.push_back(tl);
         }
 
-        buildPill();
         restorePosition();
         setTouchEnabled(true);
         // (mouse wheel: BufMouse hook -> takeScroll, so it's handled before anything behind the window)
@@ -8594,7 +10403,16 @@ protected:
 
     // Open (2.2): grows in from 86% with a small overshoot while rising 8
     // units into place. Close: shrinks away, then hides.
+    // (2.3) The mod's settings: the window steps aside while they're open and
+    // comes back by itself when they close (on phones there was no key to
+    // bring it back - only the pause menu button).
+    Ref<CCNode> m_settingsPopup;
+    void openSettings() {
+        setVisible(false);
+        m_settingsPopup = openSettingsPopup(Mod::get(), false);
+    }
     void popIn() {
+        s_onlineNow = true; // fresh online numbers when the window opens
         if (!m_body) return;
         m_body->stopAllActions();
         CCPoint const home{FULL_W / 2.f, H / 2.f};
@@ -8602,10 +10420,10 @@ protected:
         m_body->setPosition({home.x, home.y - 8.f});
         m_body->runAction(CCEaseBackOut::create(CCScaleTo::create(0.24f, 1.f)));
         m_body->runAction(CCEaseOut::create(CCMoveTo::create(0.2f, home), 2.5f));
+        neonOn();
     }
     void popOut() {
         if (!m_body || !isVisible()) return;
-        if (m_compactNow) { setVisible(false); return; }
         m_body->stopAllActions();
         m_body->runAction(CCSequence::create(CCEaseIn::create(CCScaleTo::create(0.13f, 0.84f), 2.f),
                                              CCCallFunc::create(this, callfunc_selector(BufferWindow::finishClose)), nullptr));
@@ -8616,59 +10434,6 @@ protected:
         if (!m_body) return;
         m_body->setScale(1.f);
         m_body->setPosition({FULL_W / 2.f, H / 2.f});
-    }
-
-    // ---- in-game pill: "EXTREME  BUFFER press +6t" while a level runs -------------
-    static constexpr float PILL_H = 15.f;
-    void buildPill() {
-        m_pill = CCNode::create();
-        m_pill->setVisible(false);
-        this->addChild(m_pill, 5);
-        m_pillBg = panel(80.f, PILL_H, C_PILL, static_cast<GLubyte>(std::clamp(235.f * m_alpha, 0.f, 255.f)));
-        m_pill->addChild(m_pillBg, 0);
-        m_pillStage = IBLabel::make("", "bigFont.fnt");
-        m_pillStage->setAnchorPoint({0.f, 0.5f});
-        m_pillStage->setColor({255, 255, 255});
-        m_pill->addChild(m_pillStage, 1);
-        m_pillTag = IBLabel::make("", "bigFont.fnt");
-        m_pillTag->setAnchorPoint({0.f, 0.5f});
-        m_pill->addChild(m_pillTag, 1);
-        m_pillText = IBLabel::make("", "chatFont.fnt");
-        m_pillText->setAnchorPoint({0.f, 0.5f});
-        m_pillText->setColor(C_MUTED);
-        m_pill->addChild(m_pillText, 1);
-    }
-
-    // Only rebuilt when the stage or the latest log line changed.
-    void refreshPill() {
-        std::string stage = s_sim.headerLine();
-        if (stage.rfind("INPUT BUFFER  ", 0) == 0) stage = stage.substr(14);
-        unsigned long long const v = s_sim.logVersion();
-        if (stage == m_pillStageText && v == m_pillVersion) return;
-        m_pillStageText = stage;
-        m_pillVersion = v;
-        std::string tag, text;
-        ccColor3B col = COL_WHITE;
-        bool const have = !LogConsole::on() && s_sim.lastLog(tag, text, col); // console on: the Log is there
-        if (text.size() > 26) text = text.substr(0, 25) + "..";
-        float const y = PILL_H / 2.f;
-        float x = 6.f;
-        m_pillStage->setString(stage.c_str());
-        m_pillStage->setScale(0.24f);
-        m_pillStage->setPosition({x, y});
-        x += m_pillStage->getContentSize().width * m_pillStage->getScale() + 7.f;
-        m_pillTag->setString(have ? tag.c_str() : "");
-        m_pillTag->setScale(0.19f);
-        m_pillTag->setColor(logTagColor(tag));
-        m_pillTag->setPosition({x, y});
-        if (have) x += m_pillTag->getContentSize().width * m_pillTag->getScale() + 4.f;
-        m_pillText->setString(have ? text.c_str() : "");
-        m_pillText->setScale(0.42f);
-        m_pillText->setPosition({x, y - 0.5f});
-        if (have) x += m_pillText->getContentSize().width * m_pillText->getScale();
-        float const w = std::max(40.f, x + 6.f);
-        drawRound(m_pillBg, w, PILL_H, C_PILL, static_cast<GLubyte>(std::clamp(235.f * m_alpha, 0.f, 255.f)));
-        m_pill->setPosition({0.f, H - PILL_H}); // the window's top-left corner
     }
 
     // Rounded box, drawn as an exact polygon (1.25.8). The 9-slice texture
@@ -8709,12 +10474,49 @@ protected:
     }
 
     // A card on a page: rounded panel + small caps title, optional hint on the right.
-    void card(float x, float y, float w, float h, char const* titleText, std::string const& hint = {}) {
-        // soft violet edge, then the card itself
-        auto* e = panel(w, h, C_CARD_EDGE, static_cast<GLubyte>(std::clamp(150.f * m_alpha, 0.f, 255.f)), 6.f);
+    // (2.2 Nova) Its outline glows: a violet light runs in when the tab opens,
+    // settles to a soft glow, and brightens while the mouse is over the card.
+    struct CardFx {
+        CCNode* edge = nullptr;
+        CCNode* glow = nullptr;
+        CCRect  rect;
+        bool    lit = false;
+        ccColor3B rest = C_CARD_REST;      // its outline's colour at rest
+    };
+    std::vector<CardFx> m_cardFx;
+    int m_cardHover = -1;
+    static constexpr GLubyte GLOW_REST = 70, GLOW_HOVER = 150, GLOW_PEAK = 215;
+    GLubyte glowOp(GLubyte v) const { return static_cast<GLubyte>(std::clamp(static_cast<float>(v) * m_alpha, 0.f, 255.f)); }
+    static void tint(CCNode* n, ccColor3B c, float t) {
+        if (!n) return;
+        n->stopActionByTag(77);
+        auto* a = CCTintTo::create(t, c.r, c.g, c.b);
+        a->setTag(77);
+        n->runAction(a);
+    }
+    static void fadeNode(CCNode* n, GLubyte to, float t, float delay = 0.f) {
+        if (!n) return;
+        n->stopActionByTag(78);
+        CCAction* a = delay > 0.f ? static_cast<CCAction*>(CCSequence::create(CCDelayTime::create(delay), CCFadeTo::create(t, to), nullptr))
+                                  : static_cast<CCAction*>(CCFadeTo::create(t, to));
+        a->setTag(78);
+        n->runAction(a);
+    }
+    int card(float x, float y, float w, float h, char const* titleText, std::string const& hint = {}) {
+        // (2.2) smooth corners (textures - GD's drawn shapes are jagged)
+        GLubyte const eo = static_cast<GLubyte>(std::clamp(200.f * m_alpha, 0.f, 255.f));
+        GLubyte const po = static_cast<GLubyte>(std::clamp(235.f * m_alpha, 0.f, 255.f));
+        CardFx fx;
+        fx.rect = CCRect(x, y, w, h);
+        fx.glow = nv::glowBox(x, y, w, h, 6.f, C_GLOW, glowOp(GLOW_REST));
+        if (fx.glow) m_cards->addChild(fx.glow);
+        CCNode* e = aa::roundBox(w, h, 6.f, C_CARD_REST, eo);
+        if (!e) e = panel(w, h, C_CARD_REST, eo, 6.f);
         e->setPosition({x, y});
         m_cards->addChild(e);
-        auto* p = panel(w - 1.2f, h - 1.2f, C_CARD, static_cast<GLubyte>(std::clamp(215.f * m_alpha, 0.f, 255.f)), 5.4f);
+        fx.edge = e;
+        CCNode* p = aa::roundBox(w - 1.2f, h - 1.2f, 5.4f, C_CARD, po);
+        if (!p) p = panel(w - 1.2f, h - 1.2f, C_CARD, po, 5.4f);
         p->setPosition({x + 0.6f, y + 0.6f});
         m_cards->addChild(p);
         if (titleText && *titleText) {
@@ -8732,6 +10534,55 @@ protected:
             hl->setAnchorPoint({1.f, 0.5f});
             hl->setPosition({x + w - 6.f, y + h - 7.f});
             m_settingsLabels->addChild(hl);
+        }
+        m_cardFx.push_back(fx);
+        return static_cast<int>(m_cardFx.size()) - 1;
+    }
+    // The tab just opened: the outlines light up one after another, then settle.
+    void cardIntro() {
+        float delay = 0.f;
+        for (auto& fx : m_cardFx) {
+            if (fx.edge) {
+                if (auto* r = typeinfo_cast<CCRGBAProtocol*>(fx.edge)) r->setColor(fx.rest);
+                fx.edge->stopActionByTag(77);
+                auto* a = CCSequence::create(CCDelayTime::create(delay), CCTintTo::create(0.12f, C_CARD_LIT.r, C_CARD_LIT.g, C_CARD_LIT.b),
+                                             CCTintTo::create(0.65f, fx.rest.r, fx.rest.g, fx.rest.b), nullptr);
+                a->setTag(77);
+                fx.edge->runAction(a);
+            }
+            if (fx.glow) {
+                if (auto* r = typeinfo_cast<CCRGBAProtocol*>(fx.glow)) r->setOpacity(0);
+                fx.glow->stopActionByTag(78);
+                auto* a = CCSequence::create(CCDelayTime::create(delay), CCFadeTo::create(0.14f, glowOp(GLOW_PEAK)),
+                                             CCFadeTo::create(0.7f, glowOp(GLOW_REST)), nullptr);
+                a->setTag(78);
+                fx.glow->runAction(a);
+            }
+            fx.lit = false;
+            delay += 0.05f;
+        }
+        m_cardHover = -1;
+    }
+    // the card under the mouse brightens
+    void hoverCards(CCPoint mouseWorld, bool allowed) {
+        int hit = -1;
+        if (allowed && m_cards && m_cards->isVisible()) {
+            CCPoint const p = m_cards->convertToNodeSpace(mouseWorld);
+            for (size_t i = 0; i < m_cardFx.size(); i++) {
+                if (m_cardFx[i].rect.containsPoint(p)) { hit = static_cast<int>(i); break; }
+            }
+        }
+        if (hit == m_cardHover) return;
+        if (m_cardHover >= 0 && m_cardHover < static_cast<int>(m_cardFx.size())) {
+            auto& o = m_cardFx[static_cast<size_t>(m_cardHover)];
+            tint(o.edge, o.rest, 0.3f);
+            fadeNode(o.glow, glowOp(GLOW_REST), 0.3f);
+        }
+        m_cardHover = hit;
+        if (hit >= 0) {
+            auto& n = m_cardFx[static_cast<size_t>(hit)];
+            tint(n.edge, C_CARD_HOV, 0.14f);
+            fadeNode(n.glow, glowOp(GLOW_HOVER), 0.14f);
         }
     }
 
@@ -8803,7 +10654,15 @@ protected:
                                      GLubyte opacity = 235) {
         auto* node = CCNode::create();
         node->setContentSize({w, h});
-        node->addChild(panel(w, h, fill, opacity));
+        // (2.2) smooth rounded box with a gentle shade (lighter top edge)
+        float const br = std::min(4.5f, h * 0.38f);
+        CCNode* bg = aa::roundBox(w, h, br, fill, opacity, true);
+        node->addChild(bg ? bg : panel(w, h, fill, opacity));
+        // a soft violet glow that fades in while the mouse is over it (see updateHover)
+        if (CCNode* hov = aa::roundBox(w, h, br, C_HOVER, 0)) {
+            hov->setTag(HOVER_TAG);
+            node->addChild(hov);
+        }
         float const ts = textScale * 1.12f;
         auto* l = bodyLabel(text.c_str(), ts, textCol);
         limitNodeWidth(l, w - 8.f, ts, ts * 0.5f);
@@ -8814,6 +10673,15 @@ protected:
         item->setPosition(center);
         menu->addChild(item);
         return item;
+    }
+
+    // (2.3) Extreme's look on another button: a glowing edge in `glow` and a light
+    // sweeping across it (no embers).
+    void shine(CCMenuItemSpriteExtra* item, float w, float h, ccColor3B glow, bool on = true) {
+        if (!item) return;
+        if (CCNode* img = item->getNormalImage()) {
+            if (auto* fx = nv::ExtremeFx::create(w, h, std::min(4.5f, h * 0.38f), on, glow, false)) img->addChild(fx, 1);
+        }
     }
 
     // A box sized to its text.
@@ -8827,7 +10695,8 @@ protected:
     // ---- tabs (2.2): a list in the sidebar, the highlight slides to the selected one ----
     static constexpr float SIDE_ITEM_H = 16.f;
     static constexpr float SIDE_ITEM_GAP = 3.f;
-    static float sideItemY(int i) { return H - 55.f - static_cast<float>(i) * (SIDE_ITEM_H + SIDE_ITEM_GAP); }
+    static inline float s_tabTop = H - 49.f; // (2.2) the first tab's middle: set from where the line under NOVA is
+    static float sideItemY(int i) { return s_tabTop - static_cast<float>(i) * (SIDE_ITEM_H + SIDE_ITEM_GAP); }
     static char const* tabName(int i) {
         static char const* names[TAB_COUNT] = {"Log", "Stats", "Stage", "Modes", "Tools", "Dev"};
         return names[std::clamp(i, 0, TAB_COUNT - 1)];
@@ -8837,14 +10706,15 @@ protected:
         m_tabMenu->removeAllChildren();
         // the version badge: 5 quick clicks turn the Dev tab on / off
         {
-            float const bh = 12.5f, by = H - 31.f;
+            // (2.2 Nova) the version as plain violet text, a soft glow under the mouse
+            float const bh = 10.f, by = m_verY, bw = m_badgeW + 6.f;
             auto* node = CCNode::create();
-            node->setContentSize({m_badgeW, bh});
-            node->addChild(panel(m_badgeW, bh, C_BTN_SEL, 255, bh / 2.f));
+            node->setContentSize({bw, bh});
+            if (CCNode* hov = aa::roundBox(bw, bh, 4.f, C_HOVER, 0)) { hov->setTag(HOVER_TAG); node->addChild(hov); }
             auto* v2 = IBLabel::make(TITLE_BADGE, "bigFont.fnt");
-            v2->setScale(0.31f);
-            v2->setColor({255, 255, 255});
-            v2->setPosition({m_badgeW / 2.f, bh / 2.f - 0.3f});
+            v2->setScale(0.28f);
+            v2->setColor({190, 160, 255});
+            v2->setPosition({bw / 2.f, bh / 2.f - 0.3f});
             node->addChild(v2);
             auto* item = CCMenuItemExt::createSpriteExtra(node, [this](CCMenuItemSpriteExtra*) {
                 if (m_badgeTapAge > 2.5f) m_badgeTaps = 0;
@@ -8858,7 +10728,7 @@ protected:
                 showTab(on ? TAB_DEV : TAB_LOG);
             });
             item->setSizeMult(1.05f);
-            item->setPosition({10.f + m_badgeW / 2.f, by});
+            item->setPosition({m_verX + m_badgeW / 2.f, by});
             m_tabMenu->addChild(item);
         }
         float const iw = SIDE_W - 16.f;
@@ -8868,15 +10738,13 @@ protected:
             // the whole row clicks: a dot, then the name, left-aligned
             auto* node = CCNode::create();
             node->setContentSize({iw, SIDE_ITEM_H});
-            CCPoint dotPts[10];
-            for (int k = 0; k < 10; k++) {
-                float const a = 6.2831853f * static_cast<float>(k) / 10.f;
-                dotPts[k] = CCPoint{8.f + 1.9f * std::cos(a), SIDE_ITEM_H / 2.f - 0.5f + 1.9f * std::sin(a)};
+            // (2.2) a soft glow under the mouse, and a smooth dot
+            if (CCNode* hov = aa::roundBox(iw, SIDE_ITEM_H, 5.f, C_HOVER, 0)) { hov->setTag(HOVER_TAG); node->addChild(hov); }
+            ccColor3B const dc = sel ? ccColor3B{206, 182, 255} : C_DIM;
+            if (auto* dot = aa::circleSprite(4.f, dc)) {
+                dot->setPosition({8.f, SIDE_ITEM_H / 2.f - 0.3f});
+                node->addChild(dot);
             }
-            auto* dot = CCDrawNode::create();
-            ccColor3B const dc = sel ? ccColor3B{214, 180, 255} : C_DIM;
-            dot->drawPolygon(dotPts, 10, ccColor4F{dc.r / 255.f, dc.g / 255.f, dc.b / 255.f, 1.f}, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
-            node->addChild(dot);
             auto* l = bodyLabel(tabName(i), 0.34f, sel ? ccColor3B{255, 255, 255} : C_MUTED);
             l->setAnchorPoint({0.f, 0.5f});
             l->setPosition({15.f, SIDE_ITEM_H / 2.f});
@@ -8921,9 +10789,14 @@ protected:
         m_cards->setVisible(!list);
         m_scanLabel = nullptr; // its label goes with m_settingsLabels
         m_listMenu->removeAllChildren();
+        m_footBtns.clear();
         m_settingsMenu->removeAllChildren();
         m_settingsLabels->removeAllChildren();
         m_cards->removeAllChildren();
+        m_cardFx.clear();
+        m_cardHover = -1;
+        m_modeTiles.clear();
+        m_modesSummary = nullptr;
         if (list) buildListButtons();
         else if (t == TAB_MODES) buildModes();
         else if (t == TAB_TOOLS) buildTools();
@@ -8936,9 +10809,23 @@ protected:
             n->setPosition({changed ? 7.f : 0.f, 0.f});
             if (changed) n->runAction(CCEaseOut::create(CCMoveTo::create(0.16f, CCPoint{0.f, 0.f}), 2.5f));
         }
+        if (changed) {
+            cardIntro(); // (2.2 Nova) the outlines light up
+            if (m_accentSweep) {
+                m_accentSweep->stopAllActions();
+                m_accentSweep->setPosition({6.f, H - TITLE_H + 0.5f});
+                m_accentSweep->setOpacity(0);
+                m_accentSweep->runAction(CCEaseInOut::create(CCMoveTo::create(0.6f, CCPoint{W - 8.f, H - TITLE_H + 0.5f}), 2.f));
+                m_accentSweep->runAction(CCSequence::create(CCFadeTo::create(0.12f, 255), CCDelayTime::create(0.3f),
+                                                            CCFadeTo::create(0.18f, 0), nullptr));
+            }
+        }
         refresh();
     }
 
+    void footBtn(CCMenuItemSpriteExtra* item) {
+        if (item) m_footBtns.push_back({item, item->getContentSize().width});
+    }
     void buildListButtons() {
         float const x = W - PAD - SCROLL_W / 2.f;
         boxButton(m_listMenu, "^", {x, contentTop() - 5.f}, 10.f, 10.f, C_BTN, C_MUTED, 0.26f,
@@ -8946,21 +10833,16 @@ protected:
         boxButton(m_listMenu, "v", {x, contentBottom() + 5.f}, 10.f, 10.f, C_BTN, C_MUTED, 0.26f,
                   [this] { scrollBy(visibleRows() - 1); });
         if (m_tab == TAB_DEV) {
-            boxButtonFit(m_listMenu, "Copy All", {W - PAD - 24.f, FOOT_H / 2.f}, ccColor3B{255, 255, 255}, [] {
+            footBtn(boxButtonFit(m_listMenu, "Copy All", {W - PAD - 24.f, FOOT_H / 2.f}, ccColor3B{255, 255, 255}, [] {
                 bool const ok = geode::utils::clipboard::write(s_sim.devCopyText());
                 Notification::create(ok ? "Dev info copied - paste it to Claude" : "Couldn't copy", NotificationIcon::None, 1.5f)->show();
-            }, 0.22f, 10.f, C_BTN_SEL);
+            }, 0.22f, 10.f, C_BTN_SEL));
         }
         if (m_tab == TAB_LOG) {
-            // In the footer.
-            boxButtonFit(m_listMenu, "Clear", {W - PAD - 15.f, FOOT_H / 2.f}, COL_ORANGE, [this] {
-                s_sim.clearHistory();
-                m_forceRefresh = true;
-                refresh();
-            }, 0.22f, 10.f);
+            // In the footer (laid out by layoutFooter: Console, then Clear).
             // The Log in a command-prompt window instead (2.2, Windows).
             if (LogConsole::available()) {
-                boxButtonFit(m_listMenu, LogConsole::on() ? "Console: On" : "Console", {W - PAD - 62.f, FOOT_H / 2.f},
+                footBtn(boxButtonFit(m_listMenu, LogConsole::on() ? "Console: On" : "Console", {W - PAD - 62.f, FOOT_H / 2.f},
                              ccColor3B{255, 255, 255}, [this] {
                     bool const on = !LogConsole::on();
                     if (on) {
@@ -8974,8 +10856,13 @@ protected:
                     }
                     Mod::get()->setSavedValue<bool>("log-console", on);
                     showTab(TAB_LOG);
-                }, 0.22f, 10.f, LogConsole::on() ? C_BTN_SEL : C_BTN);
+                }, 0.22f, 10.f, LogConsole::on() ? C_BTN_SEL : C_BTN));
             }
+            footBtn(boxButtonFit(m_listMenu, "Clear", {W - PAD - 15.f, FOOT_H / 2.f}, COL_ORANGE, [this] {
+                s_sim.clearHistory();
+                m_forceRefresh = true;
+                refresh();
+            }, 0.22f, 10.f));
         }
     }
 
@@ -8997,19 +10884,31 @@ protected:
     void refresh() {
         bool const force = m_forceRefresh;
         m_forceRefresh = false;
+        refreshOnline(force);
         std::string head = s_sim.headerLine();
         if (head.rfind("INPUT BUFFER  ", 0) == 0) head = head.substr(14); // the title already says it
         if (force || head != m_shownHeader) {
             m_shownHeader = head;
             m_header->setString(head.c_str());
-            m_header->setColor({255, 255, 255});
+            m_header->setColor(s_sim.currentStage() == STAGE_EXTREME ? C_EXTREME_TEXT : ccColor3B{255, 255, 255});
             m_header->setScale(0.28f);
             limitNodeWidth(m_header, W - 120.f, 0.28f, 0.15f);
             if (m_headerPill) {
+                bool const extreme = s_sim.currentStage() == STAGE_EXTREME;
                 float const hw = m_header->getContentSize().width * m_header->getScale() + 12.f;
-                drawRound(m_headerPill, hw, 13.f, C_PILL, 240);
+                drawRound(m_headerPill, hw, 13.f, extreme ? C_EXTREME : C_PILL, 240);
                 m_header->setAnchorPoint({0.5f, 0.5f});
                 m_header->setPosition({W - 21.f - hw / 2.f, H - TITLE_H / 2.f - 0.4f});
+                if (extreme) m_header->setColor({255, 255, 255});
+                // (2.2 Nova) Extreme: the same glow, sweep and embers as its button
+                if (m_headerFx) { m_headerFx->removeFromParent(); m_headerFx = nullptr; }
+                if (extreme) {
+                    m_headerFx = nv::ExtremeFx::create(hw, 13.f, 6.5f, true);
+                    if (m_headerFx) {
+                        m_headerFx->setPosition({W - 21.f - hw, H - TITLE_H / 2.f - 6.5f});
+                        m_page->addChild(m_headerFx, 2);
+                    }
+                }
             }
         }
         std::string const foot = toggleHint(); // was the status line ("INPUT BUFFER  EXTREME" ...) before 2.1
@@ -9021,8 +10920,8 @@ protected:
             m_footer->setString(up.c_str());
             m_footer->setScale(0.23f);
             // room for "clear" / "console" on the Log tab
-            float const right = W - PAD - (m_tab == TAB_LOG ? (LogConsole::available() ? 92.f : 34.f) : m_tab == TAB_DEV ? 52.f : 2.f);
-            limitNodeWidth(m_footer, std::max(40.f, right - (PAD + 2.f)), 0.23f, 0.12f);
+            // (2.2 Nova) up to the footer's buttons / the online pill
+            limitNodeWidth(m_footer, std::max(30.f, m_footTextRight - 6.f - (PAD + 2.f)), 0.23f, 0.12f);
         }
         if (m_tab == TAB_TOOLS && m_scanLabel) {
             std::string const st = s_sim.scanStatus();
@@ -9055,6 +10954,8 @@ protected:
             m_data.emplace_back("Nothing logged yet.", COL_WHITE);
             m_data.emplace_back("Buffered clicks, when they fired, and deaths show up here while you play.", COL_WHITE);
             m_data.emplace_back(fmt::format("Show / hide this window: {}. Drag it by the title bar.", showHowTo()), COL_WHITE);
+            m_data.emplace_back("", COL_WHITE);
+            m_data.emplace_back(fmt::format("Questions? Ask {} on Discord ({}).", AUTHOR_NAME, AUTHOR_DISCORD), C_MUTED);
         }
         m_rowCount = static_cast<int>(m_data.size());
         scrollBy(0);
@@ -9163,85 +11064,130 @@ protected:
             case 5:  return "20 frames early (12 for wave, 2 for ship).";
             case 6: {
                 CustomFrames const f = CustomFrames::load();
-                return fmt::format("Your frames: cube {:g}, ship {:g}, wave {:g} (Extreme engine).", f.cube, f.ship, f.wave);
+                return fmt::format("Your frames: cube {:g}, ship {:g}, wave {:g}.", f.cube, f.ship, f.wave);
             }
             default: return "";
         }
     }
 
-    // Custom frames being edited (applied with the Apply button).
+    // Custom frames (saved on every +/- since 2.2).
     CustomFrames m_customEdit = CustomFrames::load();
 
-    // A switch (2.2): a pill track (violet when on) with a white knob that
-    // slides across. `flip` changes the setting and returns the new state.
+    // the switch's size (the rows draw one at their right end)
     static constexpr float SW_W = 21.f, SW_H = 11.f;
-    void addSwitch(CCPoint center, bool on, std::function<bool()> flip) {
+
+    // (2.2 Nova) A settings row like the reference: a rounded pill with the
+    // name (and a short grey description under it), the switch at its right
+    // end. The WHOLE row is the button: click anywhere to switch it, it glows
+    // violet under the mouse, and an "on" row has a faint violet tint.
+    static inline const ccColor3B C_ROW    = {32, 29, 43};
+    static inline const ccColor3B C_ROW_ON = {44, 36, 72};
+    void rowToggle(float x, float y, float w, char const* title, char const* desc, char const* key, bool def) {
+        float const h = desc ? 17.f : 13.f;
+        bool const on = Mod::get()->getSavedValue<bool>(key, def);
+        std::string const k = key;
         auto* node = CCNode::create();
-        node->setContentSize({SW_W, SW_H});
-        auto* track = panel(SW_W, SW_H, on ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+        node->setContentSize({w, h});
+        CCNode* bg = aa::roundBox(w, h, 4.f, on ? C_ROW_ON : C_ROW, 255);
+        bool const smoothBg = bg != nullptr; // a CCScale9Sprite, or the old drawn box
+        if (!bg) bg = panel(w, h, on ? C_ROW_ON : C_ROW, 255, 4.f);
+        node->addChild(bg);
+        if (CCNode* hov = aa::roundBox(w, h, 4.f, C_HOVER, 0)) {
+            hov->setTag(HOVER_TAG);
+            node->addChild(hov);
+        }
+        float const textW = w - SW_W - 12.f;
+        auto* l = bodyLabel(title, 0.3f);
+        l->setAnchorPoint({0.f, 0.5f});
+        l->setPosition({5.f, desc ? h / 2.f + 3.2f : h / 2.f});
+        limitNodeWidth(l, textW, 0.3f, 0.17f);
+        node->addChild(l);
+        if (desc) {
+            auto* d = bodyLabel(desc, 0.19f, C_DIM);
+            d->setAnchorPoint({0.f, 0.5f});
+            d->setPosition({5.f, h / 2.f - 3.6f});
+            limitNodeWidth(d, textW, 0.19f, 0.11f);
+            node->addChild(d);
+        }
+        // the switch (drawn, not its own button: the row is the button)
+        CCNode* track = aa::roundBox(SW_W, SW_H, SW_H / 2.f, on ? C_BTN_SEL : C_SW_OFF, 255, true);
+        bool const smooth = track != nullptr;
+        if (!track) track = panel(SW_W, SW_H, on ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+        track->setPosition({w - SW_W - 4.f, (h - SW_H) / 2.f});
         node->addChild(track);
-        auto* knob = CCDrawNode::create();
-        auto circle = [&](float cx, float cy, float r, ccColor4F col) {
-            CCPoint pts[20];
-            for (int k = 0; k < 20; k++) {
-                float const a = 6.2831853f * static_cast<float>(k) / 20.f;
-                pts[k] = CCPoint{cx + r * std::cos(a), cy + r * std::sin(a)};
-            }
-            knob->drawPolygon(pts, 20, col, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
-        };
         float const r = SW_H / 2.f - 1.5f;
-        circle(0.f, -0.5f, r + 0.4f, ccColor4F{0.f, 0.f, 0.f, 0.22f}); // soft shadow under the knob
-        circle(0.f, 0.f, r, ccColor4F{1.f, 1.f, 1.f, 1.f});
-        float const offX = SW_H / 2.f, onX = SW_W - SW_H / 2.f;
-        knob->setPosition({on ? onX : offX, SW_H / 2.f});
+        auto* knob = CCNode::create();
+        if (auto* sh = aa::circleSprite(2.f * r + 1.2f, ccColor3B{0, 0, 0}, 70)) { sh->setPosition({0.f, -0.6f}); knob->addChild(sh); }
+        if (auto* kk = aa::circleSprite(2.f * r, ccColor3B{246, 244, 252})) knob->addChild(kk);
+        float const offX = w - SW_W - 4.f + SW_H / 2.f, onX = w - 4.f - SW_H / 2.f;
+        knob->setPosition({on ? onX : offX, h / 2.f});
         node->addChild(knob);
-        auto* item = CCMenuItemExt::createSpriteExtra(node, [track, knob, offX, onX, flip = std::move(flip)](CCMenuItemSpriteExtra*) {
-            bool const now = flip();
-            drawRound(track, SW_W, SW_H, now ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+        auto* item = CCMenuItemExt::createSpriteExtra(node, [k, def, w, h, bg, smoothBg, track, smooth, knob, offX, onX](CCMenuItemSpriteExtra*) {
+            auto* mod = Mod::get();
+            bool const now = !mod->getSavedValue<bool>(k, def);
+            mod->setSavedValue<bool>(k, now);
+            s_sim.settingsChanged();
+            if (smooth) static_cast<CCNodeRGBA*>(track)->setColor(now ? C_BTN_SEL : C_SW_OFF);
+            else drawRound(static_cast<CCDrawNode*>(track), SW_W, SW_H, now ? C_BTN_SEL : C_SW_OFF, 255, SW_H / 2.f);
+            if (smoothBg) static_cast<CCNodeRGBA*>(bg)->setColor(now ? C_ROW_ON : C_ROW);
+            else drawRound(static_cast<CCDrawNode*>(bg), w, h, now ? C_ROW_ON : C_ROW, 255, 4.f);
             knob->stopAllActions();
-            knob->runAction(CCEaseOut::create(CCMoveTo::create(0.12f, CCPoint{now ? onX : offX, SW_H / 2.f}), 2.5f));
+            knob->runAction(CCEaseOut::create(CCMoveTo::create(0.12f, CCPoint{now ? onX : offX, h / 2.f}), 2.5f));
         });
-        item->setSizeMult(1.08f);
-        item->setPosition(center);
+        item->setSizeMult(1.015f);
+        item->setPosition({x + w / 2.f, y});
         m_settingsMenu->addChild(item);
     }
 
-    // A switch + label pair on a card.
-    void addToggle(float x, float y, char const* label, char const* key, bool def) {
-        bool const on = Mod::get()->getSavedValue<bool>(key, def);
-        std::string const k = key;
-        addSwitch({x + SW_W / 2.f + 1.f, y}, on, [k, def] {
-            auto* mod = Mod::get();
-            bool const v = !mod->getSavedValue<bool>(k, def);
-            mod->setSavedValue<bool>(k, v);
-            s_sim.settingsChanged();
-            return v;
-        });
-        auto* l = bodyLabel(label, 0.29f);
+    // A value row: a pill with the name on the left and [-] value [+] on the right.
+    void stepperRow(float x, float y, float w, char const* label, std::string const& value, std::function<void()> minus,
+                    std::function<void()> plus) {
+        float const h = 13.f;
+        if (CCNode* bg = aa::roundBox(w, h, 4.f, C_ROW, 255)) {
+            bg->setPosition({x, y - h / 2.f});
+            m_cards->addChild(bg);
+        }
+        auto* l = bodyLabel(label, 0.28f);
         l->setAnchorPoint({0.f, 0.5f});
-        l->setPosition({x + SW_W + 6.f, y});
+        l->setPosition({x + 5.f, y});
+        limitNodeWidth(l, w - 56.f, 0.28f, 0.16f);
         m_settingsLabels->addChild(l);
+        boxButton(m_settingsMenu, "-", {x + w - 44.f, y}, 11.f, 10.f, C_BTN, C_LAV, 0.28f, std::move(minus));
+        auto* num = bodyLabel(value.c_str(), 0.29f);
+        num->setPosition({x + w - 27.5f, y});
+        limitNodeWidth(num, 20.f, 0.29f, 0.18f);
+        m_settingsLabels->addChild(num);
+        boxButton(m_settingsMenu, "+", {x + w - 11.f, y}, 11.f, 10.f, C_BTN, C_LAV, 0.28f, std::move(plus));
     }
 
-    //  Stage tab, three cards:
-    //    STAGE    [Off][1][2][3][4][Extreme][Custom]   name + what it does
-    //    CUSTOM FRAMES   Cube [-] 6 [+]  Ship ...  [Apply]
-    //    OPTIONS  toggles, forget level, all settings
-    //  and the credit line under them.
+    // A small grey caption inside a card.
+    void caption(float x, float y, char const* text, float maxW) {
+        auto* c = bodyLabel(text, 0.21f, C_DIM);
+        c->setAnchorPoint({0.f, 0.5f});
+        c->setPosition({x, y});
+        limitNodeWidth(c, maxW, 0.21f, 0.12f);
+        m_settingsLabels->addChild(c);
+    }
+
+
+
+    //  Stage tab (2.2 Nova), like the reference:
+    //    Stage (top, full width): the stage buttons, its name and what it does
+    //    Options (left): rows       |  Custom (right): frames + Custom Min / Max
+    //    Quick (left): tiles        |
     void buildSettings() {
         int const cur = s_sim.currentStage();
-        float const cx = PAD, cw = W - 2.f * PAD;
+        ccColor3B const white{255, 255, 255};
+        float const lx = PAD, lw = 154.f, rx = PAD + lw + 6.f, rw = W - PAD - rx;
 
-        // -- STAGE card (117..176)
-        // the Stage Cycle Key you set (phones: no keyboard, no hint)
+        // -- Stage (146..192)
         std::string cycleHint;
 #ifndef GEODE_IS_MOBILE
         if (std::string const k = cycleKeyName(); !k.empty()) cycleHint = k + " cycles stages";
 #endif
-        card(cx, 117.f, cw, 59.f, "STAGE", cycleHint);
+        card(lx, 146.f, W - 2.f * PAD, 46.f, "Stage", cycleHint);
         char const* labels[] = {"Off", "1", "2", "3", "4", "Extreme", "Custom"};
-        float const by = 152.f;
-        constexpr float BTN_H = 15.f, BTN_GAP = 4.f, BTN_TEXT = 0.28f;
+        constexpr float BTN_H = 13.f, BTN_GAP = 4.f, BTN_TEXT = 0.27f;
         std::vector<float> widths;
         float total = 0.f;
         for (int i = 0; i < STAGE_COUNT; i++) {
@@ -9249,117 +11195,310 @@ protected:
             total += widths.back();
         }
         total += BTN_GAP * static_cast<float>(STAGE_COUNT - 1);
-        float x = std::max(cx + 4.f, (W - total) / 2.f);
+        float x = std::max(lx + 4.f, (W - total) / 2.f);
         for (int i = 0; i < STAGE_COUNT; i++) {
             bool const sel = (i == cur);
-            boxButton(m_settingsMenu, labels[i], {x + widths[i] / 2.f, by}, widths[i], BTN_H, sel ? C_BTN_SEL : C_BTN,
-                      sel ? ccColor3B{255, 255, 255} : C_MUTED, BTN_TEXT, [this, i] {
-                          s_sim.setStage(i);
-                          showTab(TAB_SETTINGS);
-                      }, sel ? 255 : 220);
+            bool const extreme = i == STAGE_EXTREME;
+            // (2.2 Nova) Extreme, the top stage, looks it: hot pink, a glowing
+            // edge, a light sweeping across, embers rising while it's on
+            ccColor3B const fill = sel ? (extreme ? C_EXTREME : C_BTN_SEL) : C_BTN;
+            ccColor3B const text = sel ? white : (extreme ? C_EXTREME_TEXT : C_MUTED);
+            auto* item = boxButton(m_settingsMenu, labels[i], {x + widths[i] / 2.f, 171.f}, widths[i], BTN_H, fill, text, BTN_TEXT,
+                                   [this, i] {
+                                       s_sim.setStage(i);
+                                       showTab(TAB_SETTINGS);
+                                   }, sel ? 255 : 230);
+            if (extreme && item) {
+                if (CCNode* img = item->getNormalImage()) {
+                    if (auto* fx = nv::ExtremeFx::create(widths[i], BTN_H, std::min(4.5f, BTN_H * 0.38f), sel)) img->addChild(fx, 1);
+                }
+            }
+            if (i == STAGE_CUSTOM) shine(item, widths[i], BTN_H, C_GLOW, sel); // (2.3)
             x += widths[i] + BTN_GAP;
         }
-        auto* name = IBLabel::make(STAGES[cur].name, "bigFont.fnt");
-        name->setScale(0.3f);
-        name->setColor({255, 255, 255});
-        limitNodeWidth(name, cw - 12.f, 0.3f, 0.18f);
-        name->setPosition({W / 2.f, 137.f});
+        auto* name = bodyLabel(STAGES[cur].name, 0.3f, cur == STAGE_EXTREME ? C_EXTREME_TEXT : white);
+        limitNodeWidth(name, W - 2.f * PAD - 12.f, 0.3f, 0.18f);
+        name->setPosition({W / 2.f, 159.5f});
         m_settingsLabels->addChild(name);
-        auto* blurb = IBLabel::make(stageBlurb(cur).c_str(), "chatFont.fnt");
-        blurb->setScale(0.48f);
-        blurb->setColor(C_MUTED);
-        limitNodeWidth(blurb, cw - 12.f, 0.48f, 0.28f);
-        blurb->setPosition({W / 2.f, 125.5f});
+        auto* blurb = bodyLabel(stageBlurb(cur).c_str(), 0.2f, C_DIM);
+        limitNodeWidth(blurb, W - 2.f * PAD - 12.f, 0.2f, 0.12f);
+        blurb->setPosition({W / 2.f, 152.5f});
         m_settingsLabels->addChild(blurb);
 
-        // -- CUSTOM FRAMES card (80..114)
-        card(cx, 80.f, cw, 34.f, "CUSTOM FRAMES", "Frames @60fps, 0.5 steps");
-        buildCustomRow(92.f);
+        // -- Options (left, 84..142)
+        card(lx, 84.f, lw, 58.f, "Options");
+        rowToggle(lx + 4.f, 119.f, lw - 8.f, "Learn From Attempts", "Remembers the spots that killed you or worked",
+                  "learn-spots", true);
+        rowToggle(lx + 4.f, 99.f, lw - 8.f, "Log: More Detail", "Every click's decision in the Log", "log-safe-clicks", false);
 
-        // -- OPTIONS card (30..77): title row has the two buttons, then 2x2 toggles
-        card(cx, 30.f, cw, 47.f, "OPTIONS");
-        float const colL = cx + 4.f, colR = W / 2.f + 2.f;
-        float const wAll = textWidth("All Settings", 0.26f * 1.12f) + 16.f;
-        float const wForget = textWidth("Forget Level", 0.26f * 1.12f) + 16.f;
-        float const allX = W - PAD - 6.f - wAll / 2.f, forgetX = allX - wAll / 2.f - 5.f - wForget / 2.f;
-        boxButtonFit(m_settingsMenu, "Forget Level", {forgetX, 69.f}, ccColor3B{255, 255, 255}, [] {
+        // -- Quick (left, 18..80): tiles
+        card(lx, 18.f, lw, 62.f, "Quick");
+        float const tw = (lw - 12.f) / 2.f, ty = 43.f;
+        auto tile = [&](int i, char const* text, ccColor3B fill, ccColor3B col, std::function<void()> fn) {
+            return boxButton(m_settingsMenu, text, {lx + 4.f + tw / 2.f + static_cast<float>(i) * (tw + 4.f), ty}, tw, 34.f, fill, col,
+                      0.24f, std::move(fn));
+        };
+        tile(0, "Forget Level", C_BTN, white, [] {
             if (s_sim.inLevelWithSpots()) s_sim.forgetSpots();
-            else Notification::create("Open the level first (pause it), then press forget level", NotificationIcon::None, 1.8f)->show();
-        }, 0.26f, 13.f, C_BTN_SEL);
-        boxButtonFit(m_settingsMenu, "All Settings", {allX, 69.f}, C_LAV, [this] {
-            setVisible(false); // out of the way of the settings popup; comes back with the window key
-            openSettingsPopup(Mod::get());
-        }, 0.26f, 13.f, C_BTN);
-        addToggle(colL, 55.f, "Show Paths", "show-paths", false);
-        addToggle(colR, 55.f, "Learn From Attempts", "learn-spots", true);
-        addToggle(colL, 39.f, "Log: More Detail", "log-safe-clicks", false);
-        addToggle(colR, 39.f, "Small While Playing", "compact-play", true);
-
-        // -- Discord (2.1): a violet pill like the version badge, white bold text,
-        // centred under the cards. Clicking it copies the name. (The "Left Alt:
-        // show / hide" hint moved to the footer: "Left Alt to toggle".)
-        static std::string const discordText = fmt::format("Discord: {}", AUTHOR_DISCORD);
-        boxButtonFit(m_settingsMenu, discordText.c_str(), {W / 2.f, 22.f}, ccColor3B{255, 255, 255}, [] {
+            else Notification::create("Open the level first (pause it), then press Forget Level", NotificationIcon::None, 1.8f)->show();
+        });
+        auto* discord = tile(1, "Discord", C_BTN_SEL, white, [] {
             bool const ok = geode::utils::clipboard::write(AUTHOR_DISCORD);
             Notification::create(ok ? fmt::format("Copied {}", AUTHOR_DISCORD) : fmt::format("Discord: {}", AUTHOR_DISCORD),
                                  NotificationIcon::None, 1.5f)->show();
-        }, 0.22f, 14.f, C_BTN_SEL);
+        });
+        shine(discord, tw, 34.f, ccColor3B{110, 124, 255}); // (2.3) Extreme's glow + shine, in Discord's blurple
+
+        // -- Custom (right, 18..142): frames, then Custom Min / Max (ticks)
+        card(rx, 18.f, rw, 124.f, "Custom", "frames @60fps");
+        auto frames = [&](char const* label, float& value, float y) {
+            float* v = &value;
+            auto apply = [this]() {
+                m_customEdit.save();
+                s_sim.setStage(STAGE_CUSTOM); // reloads the config with the new frames
+                showTab(TAB_SETTINGS);
+            };
+            stepperRow(rx + 4.f, y, rw - 8.f, label, fmt::format("{:g}", value),
+                       [v, apply] { *v = std::max(CUSTOM_MIN_FRAMES, *v - 0.5f); apply(); },
+                       [v, apply] { *v = std::min(CUSTOM_MAX_FRAMES, *v + 0.5f); apply(); });
+        };
+        frames("Cube", m_customEdit.cube, 118.f);
+        frames("Ship", m_customEdit.ship, 102.f);
+        frames("Wave", m_customEdit.wave, 86.f);
+        caption(rx + 6.f, 72.f, "TICKS (4 = 1 frame) - changing one switches to Custom", rw - 12.f);
+        auto* mod = Mod::get();
+        int const maxV = std::clamp(static_cast<int>(std::lround(mod->getSavedValue<double>("max-ticks", 1.0))), 1, MAX_TICKS_LIMIT);
+        int const minV = std::clamp(static_cast<int>(std::lround(mod->getSavedValue<double>("min-ticks", 1.0))), 1, maxV);
+        auto setTicks = [this](bool isMax, int delta) {
+            auto* m = Mod::get();
+            int mx = std::clamp(static_cast<int>(std::lround(m->getSavedValue<double>("max-ticks", 1.0))), 1, MAX_TICKS_LIMIT);
+            int mn = std::clamp(static_cast<int>(std::lround(m->getSavedValue<double>("min-ticks", 1.0))), 1, mx);
+            if (isMax) mx = std::clamp(mx + delta, 1, MAX_TICKS_LIMIT);
+            else mn = std::clamp(mn + delta, 1, MAX_TICKS_LIMIT);
+            if (mn > mx) { if (isMax) mn = mx; else mx = mn; } // Min never above Max
+            m->setSavedValue<double>("max-ticks", mx);
+            m->setSavedValue<double>("min-ticks", mn);
+            s_sim.setStage(STAGE_CUSTOM); // (2.2) they only apply to Custom: switch to it
+            showTab(TAB_SETTINGS);
+        };
+        stepperRow(rx + 4.f, 57.f, rw - 8.f, "Custom Min", fmt::format("{}t", minV),
+                   [setTicks] { setTicks(false, -1); }, [setTicks] { setTicks(false, +1); });
+        stepperRow(rx + 4.f, 41.f, rw - 8.f, "Custom Max", maxV >= MAX_TICKS_LIMIT ? std::string("Off") : fmt::format("{}t", maxV),
+                   [setTicks] { setTicks(true, -1); }, [setTicks] { setTicks(true, +1); });
+        caption(rx + 6.f, 27.f, "Max all the way up = Off (no cap)", rw - 12.f);
     }
 
-    // ---- modes page ------------------------------------------------------------------
-    //  Which gamemodes the buffer works in. Two cards; each mode has a normal
-    //  and a mini toggle. Off = clicks in that mode go through raw.
+    // ---- Modes tab (2.2 Nova) ------------------------------------------------------
+    //  A tile per gamemode with YOUR icon for it. Normal / Mini under it, each
+    //  on its own; click the icon to switch both. A mode that's off: its
+    //  clicks go through raw (no buffering). Changes show in place.
+    struct ModeTile {
+        std::string id;
+        SimplePlayer* icon = nullptr;
+        float iconScale = 0.f;
+        CCSprite* halo = nullptr;
+        CCSprite* dot = nullptr;
+        CCLabelBMFont* name = nullptr;
+        CCNode* seg[2] = {nullptr, nullptr};
+        CCLabelBMFont* segLabel[2] = {nullptr, nullptr};
+        int fx = -1;
+        bool lit = false;
+    };
+    std::vector<ModeTile> m_modeTiles;
+    CCLabelBMFont* m_modesSummary = nullptr;
+    static IconType modeIcon(int i) {
+        static IconType const t[] = {IconType::Cube, IconType::Ship, IconType::Ball, IconType::Ufo,
+                                     IconType::Wave, IconType::Robot, IconType::Spider, IconType::Swing};
+        return t[std::clamp(i, 0, 7)];
+    }
+    static float modeIconScale(int i) {
+        static float const s[] = {0.6f, 0.52f, 0.58f, 0.52f, 0.58f, 0.46f, 0.44f, 0.56f};
+        return s[std::clamp(i, 0, 7)];
+    }
     void buildModes() {
-        float const top = contentTop() - 10.f;
-        float const colW = (W - 2.f * PAD - 6.f) / 2.f;
-        float const colX[2] = {PAD, PAD + colW + 6.f};
-        int const perCol = (MODE_TOGGLE_COUNT + 1) / 2;
-        float const cardBottom = top - 18.f - static_cast<float>(perCol - 1) * 24.f - 12.f;
-        for (int c = 0; c < 2; c++) card(colX[c], cardBottom, colW, top + 7.f - cardBottom, nullptr);
-        auto caption = [&](char const* text, float x, float y, ccColor3B col, float scale, bool left = false) {
-            auto* l = bodyLabel(text, scale, col);
-            if (left) l->setAnchorPoint({0.f, 0.5f});
-            l->setPosition({x, y});
-            m_settingsLabels->addChild(l);
-        };
-        for (int c = 0; c < 2; c++) {
-            caption("NORMAL", colX[c] + colW - 52.f, top, C_LAV, 0.3f);
-            caption("MINI", colX[c] + colW - 20.f, top, C_LAV, 0.3f);
-        }
+        m_modeTiles.clear();
+        m_modeTiles.resize(MODE_TOGGLE_COUNT);
+        constexpr int COLS = 4;
+        constexpr float GAP = 6.f, TH = 72.f;
+        float const tw = (W - 2.f * PAD - GAP * (COLS - 1)) / COLS;
+        float const top = 192.f;
         for (int i = 0; i < MODE_TOGGLE_COUNT; i++) {
-            int const col = i / perCol, row = i % perCol;
-            float const x = colX[col];
-            float const y = top - 18.f - static_cast<float>(row) * 24.f;
-            caption(MODE_TOGGLES[i].label, x + 10.f, y, COL_WHITE, 0.37f, true);
-            for (int mini = 0; mini < 2; mini++) {
-                std::string const id = mini ? fmt::format("mini-{}", MODE_TOGGLES[i].id) : std::string(MODE_TOGGLES[i].id);
-                addSwitch({x + colW - (mini ? 20.f : 52.f), y}, modeOn(id), [id] {
-                    auto* mod = Mod::get();
-                    bool const v = !mod->getSavedValue<bool>("mode-on-" + id, true);
-                    mod->setSavedValue<bool>("mode-on-" + id, v);
-                    s_sim.settingsChanged();
-                    return v;
+            int const col = i % COLS, row = i / COLS;
+            float const x = PAD + static_cast<float>(col) * (tw + GAP);
+            float const y = top - TH - static_cast<float>(row) * (TH + GAP);
+            ModeTile& t = m_modeTiles[static_cast<size_t>(i)];
+            t.id = MODE_TOGGLES[i].id;
+            t.fx = card(x, y, tw, TH, nullptr);
+            // your icon, with a soft violet light behind it when the mode is on;
+            // the icon area is a button: both on / both off
+            CCPoint const ic{x + tw / 2.f, y + TH - 26.f};
+            {
+                float const bw = tw - 10.f, bh = 30.f;
+                CCPoint const c{bw / 2.f, bh / 2.f};
+                auto* node = CCNode::create();
+                node->setContentSize({bw, bh});
+                // under the mouse: a round violet light behind the icon (no box)
+                if (CCSprite* hov = nv::sprite(nv::soft(), 46.f, ccColor3B{176, 136, 255}, 0)) {
+                    nv::additive(hov);
+                    hov->setPosition(c);
+                    hov->setTag(HOVER_TAG);
+                    node->addChild(hov, 0);
+                }
+                t.halo = nv::sprite(nv::soft(), 40.f, ccColor3B{136, 96, 246}, 0);
+                if (t.halo) {
+                    nv::additive(t.halo);
+                    t.halo->setPosition(c);
+                    node->addChild(t.halo, 1);
+                }
+                if (auto* shadow = nv::sprite(nv::soft(), 22.f, ccColor3B{0, 0, 0}, 110)) {
+                    shadow->setScaleY(shadow->getScaleX() * 0.22f);
+                    shadow->setPosition({c.x, c.y - 11.5f});
+                    node->addChild(shadow, 1);
+                }
+                t.iconScale = modeIconScale(i);
+                t.icon = nv::playerIcon(modeIcon(i), t.iconScale);
+                if (t.icon) {
+                    t.icon->setPosition(c);
+                    node->addChild(t.icon, 2);
+                }
+                auto* item = CCMenuItemExt::createSpriteExtra(node, [this, i](CCMenuItemSpriteExtra*) {
+                    auto& tile = m_modeTiles[static_cast<size_t>(i)];
+                    bool const any = modeOn(tile.id) || modeOn("mini-" + tile.id);
+                    setMode(i, 0, !any);
+                    setMode(i, 1, !any);
+                    applyTile(i, true);
                 });
+                item->setSizeMult(1.04f);
+                item->setPosition(ic);
+                m_settingsMenu->addChild(item);
+            }
+            // status dot, top right
+            t.dot = aa::circleSprite(4.f, ccColor3B{96, 240, 136});
+            if (t.dot) {
+                t.dot->setPosition({x + tw - 7.5f, y + TH - 7.5f});
+                m_settingsLabels->addChild(t.dot, 1);
+            }
+            t.name = bodyLabel(MODE_TOGGLES[i].label, 0.31f);
+            t.name->setPosition({x + tw / 2.f, y + 28.f});
+            m_settingsLabels->addChild(t.name, 1);
+            // Normal | Mini: a dark pill, each half its own switch
+            float const sw = tw - 12.f, sh = 12.f, sy = y + 11.f;
+            if (CCNode* bg = aa::roundBox(sw, sh, sh / 2.f, C_ROW, 255)) {
+                bg->setPosition({x + 6.f, sy - sh / 2.f});
+                m_settingsLabels->addChild(bg, 0);
+            }
+            for (int half = 0; half < 2; half++) {
+                float const hw = sw / 2.f - 1.4f, hh = sh - 2.4f;
+                auto* node = CCNode::create();
+                node->setContentSize({hw, hh});
+                CCNode* fill = aa::roundBox(hw, hh, hh / 2.f, C_BTN_SEL, 255, true);
+                if (fill) node->addChild(fill);
+                t.seg[half] = fill;
+                if (CCNode* hov = aa::roundBox(hw, hh, hh / 2.f, C_HOVER, 0)) { hov->setTag(HOVER_TAG); node->addChild(hov); }
+                auto* l = bodyLabel(half ? "Mini" : "Normal", 0.21f);
+                l->setPosition({hw / 2.f, hh / 2.f - 0.2f});
+                node->addChild(l);
+                t.segLabel[half] = l;
+                auto* item = CCMenuItemExt::createSpriteExtra(node, [this, i, half](CCMenuItemSpriteExtra*) {
+                    auto& tile = m_modeTiles[static_cast<size_t>(i)];
+                    setMode(i, half, !modeOn(half ? "mini-" + tile.id : tile.id));
+                    applyTile(i, true);
+                });
+                item->setSizeMult(1.04f);
+                item->setPosition({x + 6.f + 1.2f + hw / 2.f + static_cast<float>(half) * (sw / 2.f + 0.2f), sy});
+                m_settingsMenu->addChild(item);
             }
         }
+        for (int i = 0; i < MODE_TOGGLE_COUNT; i++) applyTile(i, false);
+
+        // bottom bar: all on / all off, and how many are on
         auto setAll = [this](bool on) {
-            auto* mod = Mod::get();
-            for (auto const& m : MODE_TOGGLES) {
-                mod->setSavedValue<bool>(fmt::format("mode-on-{}", m.id), on);
-                mod->setSavedValue<bool>(fmt::format("mode-on-mini-{}", m.id), on);
+            for (int i = 0; i < MODE_TOGGLE_COUNT; i++) {
+                setMode(i, 0, on);
+                setMode(i, 1, on);
+                applyTile(i, true);
             }
-            s_sim.settingsChanged();
-            showTab(TAB_MODES);
         };
-        float const by = std::min(cardBottom - 12.f, contentBottom() + 12.f);
+        float const by = 28.f;
         boxButton(m_settingsMenu, "All On", {PAD + 24.f, by}, 44.f, 13.f, C_BTN, COL_GREEN, 0.24f, [setAll] { setAll(true); });
         boxButton(m_settingsMenu, "All Off", {PAD + 74.f, by}, 44.f, 13.f, C_BTN, COL_ORANGE, 0.24f, [setAll] { setAll(false); });
-        auto* hint = IBLabel::make("Off = clicks in that mode go through raw", "chatFont.fnt");
-        hint->setScale(0.5f);
-        hint->setColor({255, 255, 255});
-        hint->setAnchorPoint({1.f, 0.5f});
-        hint->setPosition({W - PAD - 4.f, by});
-        m_settingsLabels->addChild(hint);
+        m_modesSummary = bodyLabel("", 0.24f, C_MUTED);
+        m_modesSummary->setAnchorPoint({1.f, 0.5f});
+        m_modesSummary->setPosition({W - PAD - 4.f, by});
+        m_settingsLabels->addChild(m_modesSummary);
+        updateModesSummary();
+    }
+    void setMode(int i, int mini, bool on) {
+        std::string const id = mini ? fmt::format("mini-{}", MODE_TOGGLES[i].id) : std::string(MODE_TOGGLES[i].id);
+        Mod::get()->setSavedValue<bool>("mode-on-" + id, on);
+        s_sim.settingsChanged();
+    }
+    void updateModesSummary() {
+        if (!m_modesSummary) return;
+        int on = 0;
+        for (auto const& m : MODE_TOGGLES) on += (modeOn(m.id) ? 1 : 0) + (modeOn(fmt::format("mini-{}", m.id)) ? 1 : 0);
+        m_modesSummary->setString(fmt::format("{} / {} buffered  -  off = clicks go through raw", on, 2 * MODE_TOGGLE_COUNT).c_str());
+        m_modesSummary->setScale(0.24f);
+        limitNodeWidth(m_modesSummary, W - 2.f * PAD - 110.f, 0.24f, 0.14f);
+    }
+    // Show a tile's state: lit icon + violet halo when on, grey when off.
+    void applyTile(int i, bool animate) {
+        if (i < 0 || i >= static_cast<int>(m_modeTiles.size())) return;
+        ModeTile& t = m_modeTiles[static_cast<size_t>(i)];
+        bool const n = modeOn(t.id), m = modeOn("mini-" + t.id);
+        int const count = (n ? 1 : 0) + (m ? 1 : 0);
+        for (int half = 0; half < 2; half++) {
+            bool const on = half ? m : n;
+            if (auto* r = typeinfo_cast<CCRGBAProtocol*>(t.seg[half])) {
+                r->setColor(C_BTN_SEL);
+                if (!animate) r->setOpacity(on ? 255 : 0);
+            }
+            if (animate && t.seg[half]) fadeNode(t.seg[half], on ? 255 : 0, 0.14f);
+            if (t.segLabel[half]) t.segLabel[half]->setColor(on ? ccColor3B{255, 255, 255} : C_DIM);
+        }
+        if (t.name) t.name->setColor(count ? ccColor3B{255, 255, 255} : C_DIM);
+        if (t.dot) t.dot->setColor(count == 2 ? ccColor3B{96, 240, 136} : count == 1 ? ccColor3B{255, 196, 84} : ccColor3B{116, 112, 134});
+        GLubyte const haloOp = static_cast<GLubyte>(count == 2 ? 120 : count == 1 ? 70 : 0);
+        if (t.halo) {
+            if (animate) fadeNode(t.halo, haloOp, 0.25f);
+            else t.halo->setOpacity(haloOp);
+        }
+        if (t.icon) {
+            auto* gm = GameManager::sharedState();
+            bool const lit = count > 0;
+            bool const wasLit = t.lit;
+            t.lit = lit;
+            if (lit) {
+                t.icon->setColor(nv::playerColor());
+                t.icon->setSecondColor(nv::playerColor(true));
+                if (gm && gm->getPlayerGlow()) t.icon->setGlowOutline(gm->colorForIdx(gm->getPlayerGlowColor()));
+                t.icon->setOpacity(255);
+            } else {
+                t.icon->setColor({96, 92, 112});
+                t.icon->setSecondColor({70, 66, 86});
+                if (gm && gm->getPlayerGlow()) t.icon->disableGlowOutline();
+                t.icon->setOpacity(150);
+            }
+            if (animate && lit && !wasLit) {
+                t.icon->stopAllActions();
+                t.icon->setScale(t.iconScale);
+                t.icon->runAction(CCSequence::create(CCScaleTo::create(0.08f, t.iconScale * 1.18f),
+                                                     CCEaseBackOut::create(CCScaleTo::create(0.22f, t.iconScale)), nullptr));
+            }
+        }
+        // the tile's outline: violet when the mode is on
+        if (t.fx >= 0 && t.fx < static_cast<int>(m_cardFx.size())) {
+            CardFx& fx = m_cardFx[static_cast<size_t>(t.fx)];
+            fx.rest = count ? C_CARD_REST : C_CARD_OFF;
+            if (m_cardHover == t.fx) {
+                // (under the mouse: stays bright until it leaves)
+            } else if (animate) {
+                tint(fx.edge, fx.rest, 0.25f);
+            } else if (auto* r = typeinfo_cast<CCRGBAProtocol*>(fx.edge)) {
+                r->setColor(fx.rest);
+            }
+        }
+        updateModesSummary();
     }
 
     // ---- Tools tab (2.1) ----------------------------------------------------------------
@@ -9378,40 +11517,37 @@ protected:
     CCLabelBMFont* m_scanLabel = nullptr; // Tools tab: scan status (refreshed while shown)
     std::string    m_scanShown;
 
+    //  Tools tab (2.2 Nova): Assists rows + Your Stats on the left, Level Scan on the right.
     void buildTools() {
-        float const cx = PAD, cw = W - 2.f * PAD;
         ccColor3B const white{255, 255, 255};
-        float const bx = cx + 108.f, bw = W - PAD - 6.f - bx;
+        float const lx = PAD, lw = 154.f, rx = PAD + lw + 6.f, rw = W - PAD - rx;
 
-        // ASSISTS (132..176)
-        card(cx, 132.f, cw, 44.f, "ASSISTS");
-        addToggle(cx + 4.f, 156.f, "Orb Helper", "orb-helper", false);
-        toolsLine(bx, 156.f, "An early click waits for the next orb (up to 5 frames)", white, bw);
-        addToggle(cx + 4.f, 141.f, "Snap To Scan", "route-snap", false);
-        toolsLine(bx, 141.f, "Early clicks wait for the scanned input (within your stage)", white, bw);
+        // -- Assists (left, 94..192)
+        card(lx, 94.f, lw, 98.f, "Assists");
+        rowToggle(lx + 4.f, 168.f, lw - 8.f, "Orb Helper", "An early click waits for the orb, goes in on touch",
+                  "orb-helper", true);
+        rowToggle(lx + 4.f, 148.f, lw - 8.f, "Snap To Scan", "Early clicks wait for the scanned input (checked)",
+                  "route-snap", false);
+        rowToggle(lx + 4.f, 128.f, lw - 8.f, "Show Rays", "Your hitbox, press / release paths, the pathfinder",
+                  "show-rays", false);
+        rowToggle(lx + 4.f, 108.f, lw - 8.f, "Show Scan", "Watch the level scan work behind the pause menu",
+                  "scan-view", true);
 
-        // LEVEL SCAN (66..128)
-        card(cx, 66.f, cw, 62.f, "LEVEL SCAN");
-        addToggle(cx + 4.f, 78.f, "Show Scan", "scan-view", true);
-        addToggle(cx + cw * 0.36f, 78.f, "Real Game (Practice)", "real-scan", false);
-        boxButton(m_settingsMenu, "Scan Level", {cx + 44.f, 99.f}, 76.f, 15.f, C_BTN_SEL, white, 0.24f, [this] {
-            s_sim.startScan(PlayLayer::get());
-            m_scanShown.clear();
-            refresh();
-        });
-        m_scanLabel = IBLabel::make("", "chatFont.fnt");
-        m_scanLabel->setScale(0.42f);
-        m_scanLabel->setColor(white);
-        m_scanLabel->setAnchorPoint({0.f, 0.5f});
-        m_scanLabel->setPosition({cx + 88.f, 99.f});
-        m_settingsLabels->addChild(m_scanLabel);
-        m_scanShown.clear();
-        toolsLine(cx + 88.f, 112.f, "PLAY IT ONCE AS FAR AS YOU CAN, THEN PAUSE + SCAN (STAY PAUSED)", C_MUTED,
-                  W - PAD - 6.f - (cx + 88.f), 0.36f);
-
-        // YOUR STATS + report (18..60)
-        card(cx, 18.f, cw, 42.f, "YOUR STATS");
-        boxButtonFit(m_settingsMenu, "Export Report", {W - PAD - 40.f, 52.f}, white, [] {
+        // -- Your Stats (left, 18..88)
+        card(lx, 18.f, lw, 70.f, "Your Stats");
+        auto const lv = s_sim.levelStats();
+        auto const life = s_sim.lifeStats();
+        std::string const name = s_sim.levelName();
+        toolsLine(lx + 6.f, 66.f,
+                  name.empty() ? std::string("This level: play one to start counting")
+                               : fmt::format("{}: {} attempts, {} deaths, best {:.0f}%, {} buffered", name, lv.attempts,
+                                             lv.deaths, lv.best, lv.buffered),
+                  white, lw - 12.f, 0.36f);
+        toolsLine(lx + 6.f, 56.f,
+                  fmt::format("All levels: {} attempts, {} deaths, {} completions, {} buffered", life.attempts,
+                              life.deaths, life.completions, life.buffered),
+                  C_MUTED, lw - 12.f, 0.36f);
+        shine(boxButton(m_settingsMenu, "Export Report", {lx + lw / 2.f, 34.f}, lw - 12.f, 16.f, C_BTN_SEL, white, 0.27f, [] {
             std::string const text = s_sim.buildReport();
             auto const file = s_sim.saveReport(text);
             bool const copied = geode::utils::clipboard::write(text);
@@ -9420,66 +11556,395 @@ protected:
 #endif
             Notification::create(fmt::format("Report saved{} - {}", copied ? " and copied" : "", file.filename().string()),
                                  NotificationIcon::None, 2.5f)->show();
-        }, 0.27f, 13.f, C_BTN_SEL);
-        auto const lv = s_sim.levelStats();
-        auto const life = s_sim.lifeStats();
-        std::string const name = s_sim.levelName();
-        toolsLine(cx + 6.f, 43.f,
-                  name.empty() ? std::string("This level: play one to start counting")
-                               : fmt::format("{}:  {} attempts  -  {} deaths  -  best {:.0f}%  -  {} clicks buffered",
-                                             name, lv.attempts, lv.deaths, lv.best, lv.buffered),
-                  white, cw - 12.f);
-        toolsLine(cx + 6.f, 33.f,
-                  fmt::format("All levels:  {} attempts  -  {} deaths  -  {} completions  -  {} clicks buffered",
-                              life.attempts, life.deaths, life.completions, life.buffered),
-                  white, cw - 12.f);
-        toolsLine(cx + 6.f, 23.f, "Export Report: Log, Stats, settings and system in one file (also copied) - send it over",
-                  C_MUTED, cw - 12.f, 0.36f);
+        }), lw - 12.f, 16.f, C_GLOW);
+
+        // -- Level Scan (right, 18..192)
+        card(rx, 18.f, rw, 174.f, "Level Scan");
+        caption(rx + 6.f, 172.f, "Play it once as far as you can,", rw - 12.f);
+        caption(rx + 6.f, 165.f, "then pause and scan (stay paused).", rw - 12.f);
+        shine(boxButton(m_settingsMenu, "Scan Level", {rx + rw / 2.f, 148.f}, rw - 12.f, 18.f, C_BTN_SEL, white, 0.3f, [this] {
+            s_sim.startScan(PlayLayer::get());
+            m_scanShown.clear();
+            refresh();
+        }), rw - 12.f, 18.f, C_GLOW);
+        m_scanLabel = IBLabel::make("", "chatFont.fnt");
+        m_scanLabel->setScale(0.36f);
+        m_scanLabel->setColor(white);
+        m_scanLabel->setAnchorPoint({0.f, 0.5f});
+        m_scanLabel->setPosition({rx + 6.f, 129.f});
+        m_settingsLabels->addChild(m_scanLabel);
+        m_scanShown.clear();
+        boxButton(m_settingsMenu, "Export Scan", {rx + rw / 2.f, 109.f}, rw - 12.f, 16.f, C_BTN, white, 0.27f, [] {
+            if (!s_sim.hasLevel()) {
+                Notification::create("Open the level first (pause it), then press Export Scan", NotificationIcon::None, 1.8f)->show();
+                return;
+            }
+            std::string const text = s_sim.buildScanExport();
+            auto const file = s_sim.saveScanExport(text);
+            bool const copied = geode::utils::clipboard::write(text);
+#ifdef GEODE_IS_DESKTOP
+            (void)geode::utils::file::openFolder(file.parent_path());
+#endif
+            Notification::create(fmt::format("Scan saved{} - {}", copied ? " and copied" : "", file.filename().string()),
+                                 NotificationIcon::None, 2.5f)->show();
+        });
+        caption(rx + 6.f, 96.f, "Where to press, what it couldn't solve", rw - 12.f);
+        boxButton(m_settingsMenu, "Forget Scan", {rx + rw / 2.f, 77.f}, rw - 12.f, 16.f, C_BTN, white, 0.27f, [this] {
+            if (s_sim.forgetScan()) {
+                Notification::create("Nova - forgot the scan on this level", NotificationIcon::None, 1.5f)->show();
+            } else {
+                Notification::create("Open the level first (pause it), then press Forget Scan", NotificationIcon::None, 1.8f)->show();
+            }
+            m_scanShown.clear();
+            refresh();
+        });
+        caption(rx + 6.f, 64.f, "Deletes this level's scan and saved runs", rw - 12.f);
+        caption(rx + 6.f, 36.f, "Snap To Scan uses it while you play;", rw - 12.f);
+        caption(rx + 6.f, 29.f, "Show Scan draws it while it runs.", rw - 12.f);
     }
 
-    // ---- custom stage row ------------------------------------------------------------
-    //  "Cube [-] 6 [+]  Ship [-] 4 [+]  Wave [-] 4 [+]  [Apply]"
-    //  +/- change the numbers here; Apply saves them and switches to Custom.
-    void buildCustomRow(float y) {
-        CustomFrames const saved = CustomFrames::load();
-        bool const dirty = std::fabs(saved.cube - m_customEdit.cube) > 1e-3f ||
-                           std::fabs(saved.ship - m_customEdit.ship) > 1e-3f ||
-                           std::fabs(saved.wave - m_customEdit.wave) > 1e-3f;
-        bool const onCustom = s_sim.currentStage() == STAGE_CUSTOM;
 
-        // One "Name [-] value [+]" group, 0.5-frame steps.
-        auto group = [&](char const* label, float& value, float gx) {
-            auto* l = bodyLabel(label, 0.34f);
-            l->setAnchorPoint({0.f, 0.5f});
-            l->setPosition({gx, y});
-            m_settingsLabels->addChild(l);
-            float const bx = gx + 33.f;
-            float* v = &value;
-            boxButton(m_settingsMenu, "-", {bx, y}, 12.f, 12.f, C_BTN, C_LAV, 0.3f, [this, v] {
-                *v = std::max(CUSTOM_MIN_FRAMES, *v - 0.5f);
-                showTab(TAB_SETTINGS);
-            });
-            auto* num = bodyLabel(fmt::format("{:g}", value).c_str(), 0.36f);
-            num->setPosition({bx + 14.f, y});
-            m_settingsLabels->addChild(num);
-            boxButton(m_settingsMenu, "+", {bx + 28.f, y}, 12.f, 12.f, C_BTN, C_LAV, 0.3f, [this, v] {
-                *v = std::min(CUSTOM_MAX_FRAMES, *v + 0.5f);
-                showTab(TAB_SETTINGS);
-            });
+    // ---- NOVA title (2.2 Nova): a neon sign. Each letter is a bright tube
+    // with a tight glow and a wide bloom round it (the letter itself, blurred -
+    // real glow, not a bigger copy). Idle it hums softly; under the mouse a
+    // letter flickers on like a neon tube and burns bright. The O is a ring
+    // galaxy that slowly turns. When the window opens the sign flickers on.
+    struct NovaLetter {
+        Ref<CCLabelBMFont> letter;          // the tube (hidden for the O)
+        Ref<CCSprite> tight, wide;          // glow layers (additive)
+        Ref<CCSprite> ring;                 // the O: the galaxy
+        float scale = 0.f, lit = 0.f, flicker = 0.f, ringScale = 0.f;
+        bool  over = false;
+    };
+    std::vector<NovaLetter> m_nova;
+    float m_novaT = 0.f;
+    Ref<CCSprite> m_verTight, m_verWide; // the version's glow
+    float m_verLit = 0.f;
+    float m_novaLeft = 0.f, m_novaRight = 0.f; // where NOVA is (a click on it calls the robot)
+    float m_verX = 10.f, m_verY = 0.f;   // where the version is (left, middle)
+    // Where the line under NOVA goes so NOVA is centred between it and the
+    // sidebar panel's top (H - 4): the letters' drawn top / bottom.
+    float novaLineY() {
+        float top = -1e9f, bot = 1e9f;
+        for (auto const& n : m_nova) {
+            if (n.ring) {
+                CCRect const r = n.ring->boundingBox();
+                top = std::max(top, r.getMaxY());
+                bot = std::min(bot, r.getMinY());
+                continue;
+            }
+            CCLabelBMFont* l = n.letter.data();
+            if (!l || !l->getChildren()) continue;
+            for (auto* g : CCArrayExt<CCNode*>(l->getChildren())) {
+                CCRect const gb = g->boundingBox();
+                CCPoint const a = m_body->convertToNodeSpace(l->convertToWorldSpace(gb.origin));
+                CCPoint const b = m_body->convertToNodeSpace(l->convertToWorldSpace({gb.getMaxX(), gb.getMaxY()}));
+                top = std::max({top, a.y, b.y});
+                bot = std::min({bot, a.y, b.y});
+            }
+        }
+        if (top < bot) return H - 39.f;
+        float const gap = (H - 4.f) - top;
+        return bot - gap;
+    }
+    void buildVersionGlow(float cx, float cy) {
+        float const pad = 7.f;
+        auto* src = IBLabel::make(TITLE_BADGE, "bigFont.fnt");
+        src->setScale(0.28f);
+        float const w = src->getContentSize().width * src->getScaleX() + 2.f * pad;
+        float const h = src->getContentSize().height * src->getScaleY() + 2.f * pad;
+        src->setAnchorPoint({0.5f, 0.5f});
+        src->setPosition({w / 2.f, h / 2.f});
+        m_verTight = nv::bloom(src, w, h, 0.7f, 2.4f);
+        m_verWide = nv::bloom(src, w, h, 2.4f, 2.2f);
+        for (CCSprite* sp : {m_verTight.data(), m_verWide.data()}) {
+            if (!sp) continue;
+            sp->setColor({160, 110, 255});
+            nv::additive(sp);
+            sp->setAnchorPoint({0.5f, 0.5f});
+            sp->setPosition({cx, cy});
+            sp->setOpacity(0);
+            m_body->addChild(sp, 3);
+        }
+    }
+
+    // `x` is the middle of NOVA plus `extra` (the version beside it)
+    void buildNova(float x, float y, float extra = 0.f) {
+        m_nova.clear();
+        static char const* const word = "NOVA";
+        ccColor3B const glowCols[4] = {{130, 92, 255}, {150, 104, 255}, {190, 96, 252}, {228, 94, 220}};
+        float sc = 0.95f;
+        float const gap = 2.6f;
+        // fit the sidebar
+        auto widthAt = [&](float s) {
+            float tw = 0.f;
+            for (int i = 0; word[i]; i++) {
+                char const ch[2] = {word[i], 0};
+                tw += textWidth(ch, s) + (word[i + 1] ? gap : 0.f);
+            }
+            return tw;
         };
-        group("Cube", m_customEdit.cube, PAD + 8.f);
-        group("Ship", m_customEdit.ship, PAD + 80.f);
-        group("Wave", m_customEdit.wave, PAD + 152.f);
+        float const room = SIDE_W - 16.f - extra;
+        if (widthAt(sc) > room) sc *= room / widthAt(sc);
+        x -= (widthAt(sc) + extra) / 2.f; // (x is the middle of NOVA + the version)
+        m_novaLeft = x;
+        for (int i = 0; word[i]; i++) {
+            char const ch[2] = {word[i], 0};
+            auto* l = IBLabel::make(ch, "bigFont.fnt");
+            l->setScale(sc);
+            l->setColor({232, 224, 255});
+            l->setAnchorPoint({0.5f, 0.5f});
+            float const w = l->getContentSize().width * l->getScaleX();
+            float const h = l->getContentSize().height * l->getScaleY();
+            l->setPosition({x + w / 2.f, y});
+            m_body->addChild(l, 5);
+            NovaLetter n;
+            n.letter = l;
+            n.scale = sc;
+            if (word[i] == 'O') {
+                // the galaxy, sized to the O's glyph
+                float d = std::min(w, h) * 0.8f;
+                CCPoint c = l->getPosition();
+                if (l->getChildren() && l->getChildrenCount() > 0) {
+                    if (auto* g = typeinfo_cast<CCSprite*>(l->getChildren()->objectAtIndex(0))) {
+                        CCSize const gs = g->getContentSize();
+                        d = std::min(gs.width, gs.height) * l->getScaleX() * 1.02f;
+                        c = m_body->convertToNodeSpace(l->convertToWorldSpace(g->getPosition()));
+                    }
+                }
+                l->setVisible(false);
+                n.ring = nv::sprite(nv::galaxyRing(), d * 64.f / nv::RING_OUT);
+                if (n.ring) {
+                    n.ring->setPosition(c);
+                    n.ringScale = n.ring->getScale();
+                    m_body->addChild(n.ring, 5);
+                }
+                n.tight = nv::sprite(nv::ringGlow(), d * 80.f / nv::RING_OUT, glowCols[i]);
+                n.wide = nv::sprite(nv::soft(), d * 1.7f, glowCols[i]);
+                for (CCSprite* s : {n.tight.data(), n.wide.data()}) {
+                    if (!s) continue;
+                    nv::additive(s);
+                    s->setPosition(c);
+                    s->setOpacity(0);
+                    m_body->addChild(s, s == n.tight.data() ? 4 : 3);
+                }
+            } else {
+                // the glow: this letter drawn on its own and blurred, twice
+                float const pad = 9.f;
+                float const bw = w + 2.f * pad, bh = h + 2.f * pad;
+                auto* src = IBLabel::make(ch, "bigFont.fnt");
+                src->setScale(sc);
+                src->setAnchorPoint({0.5f, 0.5f});
+                src->setPosition({bw / 2.f, bh / 2.f});
+                n.tight = nv::bloom(src, bw, bh, 0.8f, 2.4f);
+                n.wide = nv::bloom(src, bw, bh, 3.f, 2.2f);
+                // (no render textures on this device: soft round glows instead)
+                if (!n.tight) n.tight = nv::sprite(nv::soft(), std::max(w, h) * 1.5f);
+                if (!n.wide) n.wide = nv::sprite(nv::soft(), std::max(w, h) * 2.6f);
+                for (CCSprite* s : {n.tight.data(), n.wide.data()}) {
+                    if (!s) continue;
+                    s->setColor(glowCols[i]);
+                    s->setBlendFunc(ccBlendFunc{GL_SRC_ALPHA, GL_ONE});
+                    s->setAnchorPoint({0.5f, 0.5f});
+                    s->setPosition(l->getPosition());
+                    s->setOpacity(0);
+                    m_body->addChild(s, s == n.tight.data() ? 4 : 3);
+                }
+            }
+            m_nova.push_back(n);
+            m_novaRight = x + w;
+            x += w + gap;
+        }
+        neonOn();
+    }
+    // the sign flickers on, letter by letter
+    void neonOn() {
+        for (size_t i = 0; i < m_nova.size(); i++) {
+            m_nova[i].flicker = 0.25f + 0.09f * static_cast<float>(i);
+            m_nova[i].lit = 0.f;
+        }
+    }
+    void stepNova(float dt) {
+        m_novaT += dt;
+        if (m_nova.empty() || !m_body) return;
+        bool live = isVisible() && !levelRunning();
+        CCPoint p{-9999.f, -9999.f};
+#ifdef GEODE_IS_DESKTOP
+        if (live) p = m_body->convertToNodeSpace(getMousePos());
+#else
+        live = false;
+#endif
+        for (size_t i = 0; i < m_nova.size(); i++) {
+            NovaLetter& n = m_nova[i];
+            CCNode* shape = n.ring ? static_cast<CCNode*>(n.ring.data()) : static_cast<CCNode*>(n.letter.data());
+            if (!shape) continue;
+            CCRect box = shape->boundingBox();
+            if (n.letter) {
+                CCRect const lb = n.letter->boundingBox(); // the letter's full cell (also for the O)
+                box.origin.y = std::min(box.origin.y, lb.origin.y);
+                box.size.height = std::max(box.size.height, lb.size.height);
+            }
+            box.origin.x -= 1.2f;
+            box.size.width += 2.4f;
+            bool const over = live && box.containsPoint(p);
+            if (over && !n.over && n.flicker <= 0.f) n.flicker = 0.2f; // a tube striking
+            n.over = over;
+            n.lit += ((over ? 1.f : 0.f) - n.lit) * std::min(1.f, dt * (over ? 16.f : 4.f));
+            float f = 1.f;
+            if (n.flicker > 0.f) {
+                n.flicker -= dt;
+                float const k = std::fmod(std::max(0.f, n.flicker), 0.1f);
+                f = k > 0.055f ? 0.2f : 1.f;
+            }
+            float const hum = 0.86f + 0.14f * std::sin(m_novaT * 2.2f + static_cast<float>(i) * 1.1f);
+            float const idle = 0.36f * hum;
+            float const e = (idle + (1.f - idle) * n.lit) * f;           // how bright, 0..1
+            float const a = std::clamp(m_alpha, 0.5f, 1.f);
+            if (n.tight) n.tight->setOpacity(static_cast<GLubyte>(std::clamp(255.f * (0.3f + 0.7f * e) * f * a, 0.f, 255.f)));
+            if (n.wide) n.wide->setOpacity(static_cast<GLubyte>(std::clamp(235.f * e * a, 0.f, 255.f)));
+            float const grow = 1.f + 0.07f * n.lit;
+            if (n.letter && n.letter->isVisible()) {
+                n.letter->setScale(n.scale * grow);
+                GLubyte const v = static_cast<GLubyte>(std::clamp(214.f + 41.f * e, 0.f, 255.f));
+                n.letter->setColor({v, static_cast<GLubyte>(v - 8), 255});
+                n.letter->setOpacity(static_cast<GLubyte>(f < 1.f ? 150 : 255));
+            }
+            if (n.ring) {
+                n.ring->setScale(n.ringScale * grow);
+                n.ring->setRotation(n.ring->getRotation() + dt * (8.f + 80.f * n.lit));
+                n.ring->setOpacity(static_cast<GLubyte>(f < 1.f ? 150 : 255));
+            }
+        }
+        // the version hums with the sign and burns brighter under the mouse
+        {
+            bool const overVer = live && p.x >= m_verX - 3.f && p.x <= m_verX + m_badgeW + 3.f && std::fabs(p.y - m_verY) <= 5.f;
+            m_verLit += ((overVer ? 1.f : 0.f) - m_verLit) * std::min(1.f, dt * (overVer ? 14.f : 4.f));
+            float const hum = 0.85f + 0.15f * std::sin(m_novaT * 2.2f + 4.f);
+            float const e = 0.4f * hum + 0.6f * m_verLit;
+            float const a = std::clamp(m_alpha, 0.5f, 1.f);
+            if (m_verTight) m_verTight->setOpacity(static_cast<GLubyte>(std::clamp(255.f * (0.35f + 0.65f * e) * a, 0.f, 255.f)));
+            if (m_verWide) m_verWide->setOpacity(static_cast<GLubyte>(std::clamp(220.f * e * a, 0.f, 255.f)));
+        }
+    }
 
-        // Apply: save and switch to Custom. Highlighted while there are unsaved changes.
-        char const* applyText = dirty ? "Apply*" : (onCustom ? "Applied" : "Apply");
-        float const aw = 52.f;
-        boxButton(m_settingsMenu, applyText, {W - PAD - 6.f - aw / 2.f, y}, aw, 14.f,
-                  dirty ? C_BTN_HOT : (onCustom ? C_BTN : C_BTN_SEL), ccColor3B{255, 255, 255}, 0.26f, [this] {
-                      m_customEdit.save();
-                      s_sim.setStage(STAGE_CUSTOM); // reloads the config with the new frames
-                      showTab(TAB_SETTINGS);
-                  });
+    // ---- hover (2.2): buttons light up purple under the mouse --------------------------
+    static constexpr int HOVER_TAG = 7301;
+    static inline const ccColor3B C_HOVER = {132, 98, 222}; // violet glow, faded to ~half on hover
+    Ref<CCNode> m_hovered; // kept alive: a page rebuild can remove the button under the mouse
+    void updateHover() {
+        CCNode* hit = nullptr;
+        bool const allowed = isVisible() && m_interactive && !m_dragging;
+        CCPoint const mouse = getMousePos();
+        if (allowed) {
+            for (CCMenu* m : {m_settingsMenu, m_listMenu, m_titleMenu, m_tabMenu}) {
+                if (!m || !m->isVisible() || !m->getChildren()) continue;
+                CCPoint const p = m->convertToNodeSpace(mouse);
+                // a button = menu item > its sprite node > the glow (by tag);
+                // found through the children, no casts (2.2: the cast never matched)
+                for (auto* item : CCArrayExt<CCNode*>(m->getChildren())) {
+                    if (!item || !item->isVisible() || !item->getChildren()) continue;
+                    CCNode* hov = nullptr;
+                    for (auto* img : CCArrayExt<CCNode*>(item->getChildren())) {
+                        if (img && (hov = img->getChildByTag(HOVER_TAG))) break;
+                    }
+                    if (!hov) continue;
+                    if (item->boundingBox().containsPoint(p)) { hit = hov; break; }
+                }
+                if (hit) break;
+            }
+        }
+        hoverCards(mouse, allowed);
+        if (hit == m_hovered.data()) return;
+        auto fade = [](CCNode* n, GLubyte to, float t) {
+            n->stopAllActions();
+            n->runAction(CCFadeTo::create(t, to));
+        };
+        if (m_hovered.data()) fade(m_hovered.data(), 0, 0.16f);
+        m_hovered = hit;
+        if (hit) fade(hit, 130, 0.1f);
+    }
+
+    // the settings cog turns while the mouse is on it, then settles on a tooth
+    CCSprite* m_gear = nullptr;
+    CCNode*   m_gearHover = nullptr;
+    void stepGear(float dt) {
+        if (!m_gear) return;
+        bool const over = m_gearHover && m_hovered.data() == m_gearHover;
+        float r = m_gear->getRotation();
+        if (over) {
+            r += 150.f * dt;
+        } else {
+            float const next = std::ceil(r / 45.f - 1e-3f) * 45.f;
+            r = std::min(next, r + 150.f * dt);
+        }
+        m_gear->setRotation(std::fmod(r, 360.f));
+    }
+
+    // ---- online users (2.2) ----------------------------------------------------------
+    CCNode*        m_onlineDots = nullptr; // (2.2) the pill + dots (smooth sprites)
+    CCLabelBMFont* m_onlineOn = nullptr;
+    CCLabelBMFont* m_onlineOff = nullptr;
+    long long      m_onlineShownTotal = -2, m_onlineShownOn = -2;
+    int            m_onlineTab = -1;
+    // the page's own footer buttons (Log: Console / Clear, Dev: Copy All), laid
+    // out right to left from the online pill; the footer text stops before them
+    struct FootBtn { CCMenuItemSpriteExtra* item; float w; };
+    std::vector<FootBtn> m_footBtns;
+    float m_footTextRight = W - PAD;
+
+    void refreshOnline(bool force) {
+        if (!m_onlineDots || !m_onlineOn || !m_onlineOff) return;
+        if (!force && s_online.total == m_onlineShownTotal && s_online.online == m_onlineShownOn && m_tab == m_onlineTab) return;
+        m_onlineTab = m_tab;
+        m_onlineShownTotal = s_online.total;
+        m_onlineShownOn = s_online.online;
+        m_onlineDots->removeAllChildren();
+        bool const have = s_online.total >= 0 && s_online.online >= 0;
+        m_onlineOn->setVisible(have);
+        m_onlineOff->setVisible(have);
+        float left = W - PAD - 15.f; // the settings button is at the far right
+        if (have) {
+            long long const off = std::max(0LL, s_online.total - s_online.online);
+            m_onlineOn->setString(fmt::format("{} online", s_online.online).c_str());
+            m_onlineOff->setString(fmt::format("{} offline", off).c_str());
+            // (2.2 Nova) bottom right, just left of the settings button
+            float const y = FOOT_H / 2.f + 0.5f;
+            float const wOn = m_onlineOn->getContentSize().width * m_onlineOn->getScale();
+            float const wOff = m_onlineOff->getContentSize().width * m_onlineOff->getScale();
+            float const right = W - PAD - 19.f;
+            float const xOff = right - wOff;
+            float const xOn = xOff - 16.f - wOn;
+            m_onlineOn->setPosition({xOn, y});
+            m_onlineOff->setPosition({xOff, y});
+            // a dark pill with a thin violet edge behind both, round dots with a soft glow
+            float const px0 = xOn - 11.f, px1 = right + 5.f, ph = 11.f;
+            if (auto* edge = aa::roundBox(px1 - px0, ph, ph / 2.f, ccColor3B{96, 74, 168}, 150)) {
+                edge->setPosition({px0, y - ph / 2.f});
+                m_onlineDots->addChild(edge);
+            }
+            if (auto* body = aa::roundBox(px1 - px0 - 1.2f, ph - 1.2f, ph / 2.f - 0.6f, ccColor3B{22, 20, 30}, 240)) {
+                body->setPosition({px0 + 0.6f, y - ph / 2.f + 0.6f});
+                m_onlineDots->addChild(body);
+            }
+            auto dot = [&](float x, float d, ccColor3B c, GLubyte op) {
+                if (auto* sp = aa::circleSprite(d, c, op)) { sp->setPosition({x, y}); m_onlineDots->addChild(sp); }
+            };
+            dot(xOn - 5.f, 7.f, ccColor3B{80, 230, 120}, 60);   // glow
+            dot(xOn - 5.f, 4.2f, ccColor3B{96, 240, 136}, 255); // online
+            dot(xOff - 5.f, 4.2f, ccColor3B{140, 138, 156}, 255); // offline
+            left = px0;
+        }
+        layoutFooter(left);
+    }
+    void layoutFooter(float left) {
+        float x = left - 4.f;
+        for (auto it = m_footBtns.rbegin(); it != m_footBtns.rend(); ++it) {
+            if (!it->item) continue;
+            it->item->setPositionX(x - it->w / 2.f);
+            x -= it->w + 4.f;
+        }
+        m_footTextRight = x;
+        m_shownFooter.clear(); // the footer text refits next refresh
     }
 
     // ---- live update -------------------------------------------------------------
@@ -9511,509 +11976,79 @@ protected:
         }
     }
 
-    // ---- sidebar sky (2.2): a spiral galaxy behind the title and faint stars.
-    // (Your icons run across the bottom - see the runners.)
-    CCNode* buildSideSky() {
-        auto* root = CCNode::create();
-        root->setContentSize({SIDE_W, H});
-        unsigned seed = 9001u;
-        float const a = std::clamp(m_alpha, 0.3f, 1.f);
-        float const x0 = 7.f, x1 = SIDE_W - 3.f, y0 = 25.f;
-        auto* dn = CCDrawNode::create();
-        root->addChild(dn);
-        // the galaxy: a glowing core and two spiral arms, tilted - up behind
-        // the title, out of the way of the tabs
-        float const gx = SIDE_W * 0.56f, gy = H - 24.f;
-        float const R = 29.f;
-        float const gy0 = H - 46.f, gy1 = H - 5.f; // the arms stay inside this band
-        nebula(dn, gx, gy, R * 1.05f, R * 0.62f, ccColor3B{86, 52, 190}, 0.45f * a);  // halo
-        nebula(dn, gx, gy, R * 0.55f, R * 0.32f, ccColor3B{170, 110, 255}, 0.4f * a); // inner glow
-        nebula(dn, gx, gy, R * 0.2f, R * 0.13f, ccColor3B{255, 225, 255}, 0.55f * a); // core
-        float const tilt = 0.55f, rot = -0.35f;
-        for (int arm = 0; arm < 2; arm++) {
-            for (int i = 0; i < 120; i++) {
-                float const t = static_cast<float>(i) / 120.f;                   // 0 core .. 1 tip
-                float const th = t * 4.4f + static_cast<float>(arm) * 3.14159265f;
-                float const r = R * (0.12f + 0.9f * t);
-                float const jx = galRand(seed, -2.f, 2.f) * (0.4f + t), jy = galRand(seed, -2.f, 2.f) * (0.4f + t);
-                float const px = std::cos(th) * r + jx, py = std::sin(th) * r * tilt + jy;
-                float const qx = gx + px * std::cos(rot) - py * std::sin(rot), qy = gy + px * std::sin(rot) + py * std::cos(rot);
-                if (qx < x0 || qx > x1 || qy < gy0 || qy > gy1) continue;
-                float const b = (0.55f - 0.4f * t) * a;
-                ccColor3B const c = galRand(seed, 0.f, 1.f) < 0.3f ? ccColor3B{150, 170, 255} : ccColor3B{220, 180, 255};
-                float const rr = galRand(seed, 0.7f, 1.7f) * (1.f - 0.4f * t);
-                drawCircle(dn, qx, qy, rr, rr * 0.8f, ccColor4F{c.r / 255.f * b * 0.4f, c.g / 255.f * b * 0.4f, c.b / 255.f * b * 0.4f, b * 0.4f}, 10);
-                if (galRand(seed, 0.f, 1.f) < 0.25f) drawCircle(dn, qx, qy, 0.4f, 0.4f, ccColor4F{b, b, b, b}, 6); // a star in the arm
+    // ---- the robot (2.2 Nova easter egg) ----------------------------------------------
+    // Every 10 seconds there's a 1 in 5 chance your robot drops in at the left
+    // of the page and jumps across it from button to button (and along the
+    // cards' tops), then off the right edge. Click NOVA to call it; click the
+    // robot and it explodes.
+    Ref<nv::RobotHop> m_robot;
+    float m_robotClock = 0.f;
+    nv::Rand m_fxRand{static_cast<uint32_t>(std::random_device{}())};
+    void stepRobot(float dt) {
+        if (m_robot) {
+            if (m_robot->done() || !isVisible()) {
+                m_robot->removeFromParent();
+                m_robot = nullptr;
             }
+            return;
         }
-        // a light starfield
-        for (int i = 0; i < 26; i++) {
-            float const x = galRand(seed, x0, x1), y = galRand(seed, y0, H - 8.f);
-            float const b = galRand(seed, 0.25f, 0.7f) * a, r = galRand(seed, 0.25f, 0.55f);
-            drawCircle(dn, x, y, r, r, ccColor4F{b, b, b, b}, 8);
-        }
-        return root;
+        if (!isVisible() || levelRunning()) { m_robotClock = 0.f; return; }
+        m_robotClock += dt;
+        if (m_robotClock < 10.f) return;
+        m_robotClock = 0.f;
+        if (m_fxRand.f() < 0.2f) launchRobot();
     }
-
-    // ---- galaxy (2.2) -------------------------------------------------------------
-    static float galRand(unsigned& seed, float lo, float hi) {
-        seed = seed * 1664525u + 1013904223u;
-        return lo + (hi - lo) * static_cast<float>((seed >> 8) & 0xFFFF) / 65535.f;
-    }
-    static void drawCircle(CCDrawNode* dn, float cx, float cy, float rx, float ry, ccColor4F col, int n = 18) {
-        std::vector<CCPoint> pts(static_cast<size_t>(n));
-        for (int k = 0; k < n; k++) {
-            float const a = 6.2831853f * static_cast<float>(k) / static_cast<float>(n);
-            pts[static_cast<size_t>(k)] = CCPoint{cx + rx * std::cos(a), cy + ry * std::sin(a)};
-        }
-        dn->drawPolygon(pts.data(), static_cast<unsigned>(n), col, 0.f, ccColor4F{0.f, 0.f, 0.f, 0.f});
-    }
-    // A soft glow: stacked faint ellipses, brighter towards the middle.
-    static void nebula(CCDrawNode* dn, float cx, float cy, float rx, float ry, ccColor3B c, float strength) {
-        constexpr int RINGS = 12;
-        for (int i = 0; i < RINGS; i++) {
-            float const t = 1.f - static_cast<float>(i) / RINGS;          // 1 = outer
-            float const a = strength / RINGS;                              // each layer adds a little
-            ccColor4F const col{c.r / 255.f * a, c.g / 255.f * a, c.b / 255.f * a, a}; // premultiplied
-            drawCircle(dn, cx, cy, rx * t, ry * t, col, 28);
-        }
-    }
-    // The sky for a w x h area (stars only between y0..y1, x0..x1).
-    // `level`: 1 = full, lower = subtler (fewer, dimmer stars; softer clouds)
-    CCNode* buildGalaxy(float w, float h, float y0, float y1, float x0, float x1, int constellations, unsigned seed,
-                        float level = 1.f) {
-        auto* root = CCNode::create();
-        root->setContentSize({w, h});
-        auto* dn = CCDrawNode::create();
-        root->addChild(dn);
-        float const a = std::clamp(m_alpha, 0.3f, 1.f) * level;
-        // nebula: violet and deep blue clouds (kept inside the area - nothing spills out of the window)
-        auto cloud = [&](float fx0, float fx1, float fy0, float fy1, float frx, float fry, ccColor3B c, float k) {
-            float const cx = x0 + (x1 - x0) * galRand(seed, fx0, fx1), cy = y0 + (y1 - y0) * galRand(seed, fy0, fy1);
-            float const rx = std::min({(x1 - x0) * frx, cx - x0, x1 - cx}), ry = std::min({(y1 - y0) * fry, cy - y0, y1 - cy});
-            if (rx > 2.f && ry > 2.f) nebula(dn, cx, cy, rx, ry, c, k * a);
+    // what it can stand on: the page's buttons and the tops of its cards (window space)
+    std::vector<nv::Perch> perches() {
+        std::vector<nv::Perch> out;
+        auto add = [&](CCNode* space, CCRect r, CCNode* node) {
+            CCPoint const a = m_body->convertToNodeSpace(space->convertToWorldSpace(r.origin));
+            CCPoint const b = m_body->convertToNodeSpace(space->convertToWorldSpace({r.getMaxX(), r.getMaxY()}));
+            if (b.x - a.x < 8.f || b.y > H - TITLE_H - 2.f) return;   // (not the header)
+            out.push_back({a.x, b.x, b.y, node});
         };
-        cloud(0.3f, 0.42f, 0.55f, 0.65f, 0.42f, 0.38f, ccColor3B{124, 64, 220}, 0.38f);
-        cloud(0.6f, 0.72f, 0.3f, 0.42f, 0.38f, 0.34f, ccColor3B{48, 72, 200}, 0.34f);
-        cloud(0.45f, 0.6f, 0.4f, 0.6f, 0.22f, 0.2f, ccColor3B{214, 92, 196}, 0.2f);
-        // starfield
-        int const count = static_cast<int>((x1 - x0) * (y1 - y0) / 230.f * level);
-        for (int i = 0; i < count; i++) {
-            float const x = galRand(seed, x0, x1), y = galRand(seed, y0, y1);
-            float const r = galRand(seed, 0.25f, 0.75f);
-            float const b = galRand(seed, 0.35f, 1.f) * a;
-            float const tint = galRand(seed, 0.f, 1.f);
-            ccColor3B const c = tint < 0.2f ? ccColor3B{255, 226, 180} : tint < 0.45f ? ccColor3B{190, 205, 255} : ccColor3B{255, 255, 255};
-            drawCircle(dn, x, y, r, r, ccColor4F{c.r / 255.f * b, c.g / 255.f * b, c.b / 255.f * b, b}, 8);
-        }
-        // constellations: a few brighter stars joined by thin lines
-        for (int k = 0; k < constellations; k++) {
-            int const n = static_cast<int>(galRand(seed, 4.f, 7.f));
-            ccColor3B const lc = (k % 2 == 0) ? ccColor3B{235, 178, 196} : ccColor3B{96, 132, 255};
-            // low down, under the tabs
-            float px = galRand(seed, x0 + 12.f, x1 - 12.f), py = galRand(seed, y0 + 8.f, y0 + (y1 - y0) * 0.3f);
-            std::vector<CCPoint> pts{{px, py}};
-            for (int i = 1; i < n; i++) {
-                float const ang = galRand(seed, 0.f, 6.2831853f);
-                float const len = galRand(seed, 12.f, 30.f);
-                px = std::clamp(px + std::cos(ang) * len, x0 + 4.f, x1 - 4.f);
-                py = std::clamp(py + std::sin(ang) * len, y0 + 4.f, y1 - 4.f);
-                pts.push_back({px, py});
-            }
-            float const la = 0.32f * a;
-            for (size_t i = 1; i < pts.size(); i++) {
-                dn->drawSegment(pts[i - 1], pts[i], 0.28f, ccColor4F{lc.r / 255.f * la, lc.g / 255.f * la, lc.b / 255.f * la, la});
-            }
-            for (auto const& q : pts) {
-                drawCircle(dn, q.x, q.y, 1.6f, 1.6f, ccColor4F{0.25f * a, 0.22f * a, 0.35f * a, 0.25f * a}, 12); // halo
-                drawCircle(dn, q.x, q.y, 0.75f, 0.75f, ccColor4F{a, a, a, a}, 10);
+        for (CCMenu* m : {m_settingsMenu, m_listMenu, m_titleMenu}) {
+            if (!m || !m->isVisible() || !m->getChildren()) continue;
+            for (auto* item : CCArrayExt<CCNode*>(m->getChildren())) {
+                if (item && item->isVisible()) add(m, item->boundingBox(), item);
             }
         }
-        // twinkling stars (fade in and out on their own beat)
-        for (int i = 0; i < static_cast<int>(10.f * level); i++) {
-            auto* st = CCLayerColor::create(ccColor4B{255, 255, 255, 255}, 1.1f, 1.1f);
-            st->setPosition({galRand(seed, x0, x1), galRand(seed, y0, y1)});
-            GLubyte const lo = static_cast<GLubyte>(30.f * a), hi = static_cast<GLubyte>(galRand(seed, 170.f, 255.f) * a);
-            st->setOpacity(lo);
-            float const t = galRand(seed, 0.8f, 2.2f);
-            st->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(galRand(seed, 0.f, 2.f)),
-                                                                     CCFadeTo::create(t, hi), CCFadeTo::create(t, lo), nullptr)));
-            root->addChild(st);
+        if (m_cards && m_cards->isVisible()) {
+            for (auto const& fx : m_cardFx) add(m_cards, fx.rect, nullptr);
         }
-        return root;
+        // and the footer line, so there's always somewhere to land
+        out.push_back({SIDE_W + 6.f, FULL_W - 8.f, FOOT_H + 0.5f, nullptr});
+        return out;
     }
-
-    // ---- runners (2.2): your cube jumps, your ship flies, your UFO flaps and
-    // your wave zigzags across the sidebar - your icons, your colours, with
-    // GD-style particles and trails.
-    struct TrailPt { float x, y, age; };
-    struct Runner {
-        SimplePlayer* icon = nullptr;
-        float x = 0.f, y = 0.f, vy = 0.f, rot = 0.f, timer = 0.f, emit = 0.f;
-        int dir = 1;
-        bool ground = true, held = false;
-        float dead = 0.f;            // > 0: exploded, back in this many seconds
-        std::deque<TrailPt> oldTrail; // wave: the last run's trail, fading out
-        float oldFade = 0.f;
-        std::deque<TrailPt> trail;   // streak / wave trail points
-        CCDrawNode* trailNode = nullptr;
-    };
-    Runner m_cube, m_ship, m_ufo, m_wave;
-    CCNode* m_trails = nullptr;      // particles
-    ccColor3B m_col1{255, 255, 255}, m_col2{255, 255, 255};
-    static constexpr float RUN_SCALE = 0.25f;
-    static constexpr float RUN_WAVE_SCALE = 0.26f;
-    static constexpr float RUN_UFO_SCALE = 0.31f;
-    static constexpr float RUN_HALF = 3.7f;    // half the icon's size at that scale (about)
-    static constexpr float RUN_GROUND = 24.5f; // the line above the system name
-
-    SimplePlayer* makeIcon(int id, IconType type) {
-        auto* gm = GameManager::sharedState();
-        auto* p = SimplePlayer::create(1);
-        if (!p) return nullptr;
-        p->updatePlayerFrame(id, type);
-        p->setColor(m_col1);
-        p->setSecondColor(m_col2);
-        if (gm->getPlayerGlow()) p->setGlowOutline(gm->colorForIdx(gm->getPlayerGlowColor()));
-        p->setScale(RUN_SCALE);
-        m_body->addChild(p, 1);
-        return p;
-    }
-    // Your icons and colours, as a number: changes when you pick another icon.
-    static long long iconSig() {
-        auto* gm = GameManager::sharedState();
-        if (!gm) return 0;
-        long long h = 17;
-        for (int v : {gm->getPlayerFrame(), gm->getPlayerBird(), gm->getPlayerDart(), gm->getPlayerColor(),
-                      gm->getPlayerColor2(), gm->getPlayerGlow() ? 1 : 0, gm->getPlayerGlowColor()}) h = h * 1000003 + v;
-        return h;
-    }
-    long long m_iconSig = 0;
-    float     m_iconCheck = 0.f;
-    void makeIcons() {
-        auto* gm = GameManager::sharedState();
-        if (!gm) return;
-        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
-            if (r->icon) r->icon->removeFromParent();
-            r->icon = nullptr;
-        }
-        m_col1 = gm->colorForIdx(gm->getPlayerColor());
-        m_col2 = gm->colorForIdx(gm->getPlayerColor2());
-        m_cube.icon = makeIcon(gm->getPlayerFrame(), IconType::Cube);
-        m_ufo.icon = makeIcon(gm->getPlayerBird(), IconType::Ufo);
-        if (m_ufo.icon) m_ufo.icon->setScale(RUN_UFO_SCALE);
-        // your cube rides inside the UFO's dome, like in the game
-        if (m_ufo.icon) {
-            if (auto* rider = SimplePlayer::create(1)) {
-                rider->updatePlayerFrame(gm->getPlayerFrame(), IconType::Cube);
-                rider->setColor(m_col1);
-                rider->setSecondColor(m_col2);
-                rider->setScale(0.55f);
-                rider->setPosition({0.f, 5.f});
-                m_ufo.icon->addChild(rider, -1);
-            }
-        }
-        m_wave.icon = makeIcon(gm->getPlayerDart(), IconType::Wave);
-        if (m_wave.icon) m_wave.icon->setScale(RUN_WAVE_SCALE); // GD's wave is big next to its trail
-        m_iconSig = iconSig();
-        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) place(*r);
-    }
-
-    void buildRunners() {
-        auto* gm = GameManager::sharedState();
-        if (!gm) return;
-        m_col1 = gm->colorForIdx(gm->getPlayerColor());
-        m_col2 = gm->colorForIdx(gm->getPlayerColor2());
-        m_trails = CCNode::create();
-        m_body->addChild(m_trails, 1);
-        for (Runner* r : {&m_wave, &m_ufo}) {
-            r->trailNode = CCDrawNode::create();
-            m_body->addChild(r->trailNode, 1);
-        }
-        makeIcons();
-        m_cube.x = 12.f;  m_cube.y = RUN_GROUND + RUN_HALF; m_cube.timer = 0.6f;
-        m_ship.x = 30.f;  m_ship.y = RUN_GROUND + 34.f;
-        m_ufo.x = 45.f;   m_ufo.y = (RUN_GROUND + runTop()) / 2.f;
-        m_wave.x = 70.f;  m_wave.y = RUN_GROUND + 10.f; m_wave.timer = 0.3f;
-    }
-    // top of the runners' space under the tabs
-    float runTop() const {
-        return std::min(sideItemY(tabSlotsShown() - 1) - SIDE_ITEM_H / 2.f - 2.f, RUN_GROUND + 48.f);
-    }
-    static bool inSide(float x) { return x > 9.f && x < SIDE_W - 6.f; }
-    static void place(Runner& r) {
-        if (!r.icon) return;
-        r.icon->setVisible(inSide(r.x) && r.dead <= 0.f); // only inside the sidebar; across the edge it wraps round
-        r.icon->setPosition({r.x, r.y});
-        r.icon->setRotation(r.rot);
-    }
-    // A GD-style square particle: drifts, shrinks a little and fades out.
-    void particle(float x, float y, ccColor3B c, float size, CCPoint drift, float life, GLubyte alpha = 230) {
-        if (!m_trails || !inSide(x)) return;
-        auto* d = CCLayerColor::create(ccColor4B{c.r, c.g, c.b, alpha}, size, size);
-        d->setPosition({x - size / 2.f, y - size / 2.f});
-        d->runAction(CCMoveBy::create(life, drift));
-        d->runAction(CCSequence::create(CCFadeTo::create(life, 0), CCRemoveSelf::create(), nullptr));
-        m_trails->addChild(d);
-    }
-    // Trail: the last points of a runner's path, drawn as a line that fades
-    // towards its tail (the wave's solid trail, the UFO / ship streak).
-    void stepTrail(Runner& r, float dt, float life, float width, ccColor3B c, float alpha, float yOff = 0.f) {
-        if (!r.trailNode) return;
-        for (auto& p : r.trail) p.age += dt;
-        while (!r.trail.empty() && r.trail.front().age > life) r.trail.pop_front();
-        if (inSide(r.x)) r.trail.push_back({r.x, r.y + yOff, 0.f});
-        r.trailNode->clear();
-        for (size_t i = 1; i < r.trail.size(); i++) {
-            TrailPt const& p0 = r.trail[i - 1];
-            TrailPt const& p1 = r.trail[i];
-            if (std::fabs(p1.x - p0.x) > 20.f) continue; // wrapped round
-            float const a = alpha * std::max(0.f, 1.f - p1.age / life);
-            float const w = width * (0.8f + 0.2f * (1.f - p1.age / life));
-            r.trailNode->drawSegment(CCPoint{p0.x, p0.y}, CCPoint{p1.x, p1.y}, w,
-                                     ccColor4F{c.r / 255.f * a, c.g / 255.f * a, c.b / 255.f * a, a});
-        }
-    }
-    void stepRunners(float dt) {
-        dt = std::min(dt, 0.05f);
-        // picked another icon / colour in the garage: swap them in
-        m_iconCheck -= dt;
-        if (m_iconCheck <= 0.f) {
-            m_iconCheck = 0.5f;
-            if (iconSig() != m_iconSig) makeIcons();
-        }
-        // exploded ones come back from the left after a moment
-        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
-            if (r->dead <= 0.f) continue;
-            r->dead -= dt;
-            if (r->dead <= 0.f) {
-                r->x = 2.f;
-                r->vy = 0.f;
-                r->trail.clear();
-            }
-        }
-        float const top = std::max(RUN_GROUND + 14.f, runTop());
-        auto wrap = [](Runner& r) { if (r.x > SIDE_W + 6.f) r.x = 2.f; };
-        // cube: runs, jumps now and then (a half turn per jump, lands flat),
-        // kicking up little squares behind it while it's on the ground
-        if (m_cube.icon && m_cube.dead <= 0.f) {
-            Runner& c = m_cube;
-            c.x += 31.f * dt;
-            if (c.ground) {
-                c.timer -= dt;
-                if (c.timer <= 0.f) { c.vy = 66.f; c.ground = false; c.timer = starRand(0.35f, 1.2f); }
-                c.emit -= dt;
-                if (c.emit <= 0.f) {
-                    c.emit = 0.035f;
-                    particle(c.x - RUN_HALF, RUN_GROUND + 0.8f, m_col1, starRand(0.8f, 1.7f),
-                             CCPoint{-starRand(4.f, 10.f), starRand(1.f, 6.f)}, starRand(0.25f, 0.45f));
-                }
-            } else {
-                c.vy -= 300.f * dt;
-                c.rot += 420.f * dt;
-            }
-            c.y += c.vy * dt;
-            if (c.y <= RUN_GROUND + RUN_HALF) {
-                c.y = RUN_GROUND + RUN_HALF;
-                c.vy = 0.f;
-                if (!c.ground) c.rot = std::round(c.rot / 90.f) * 90.f;
-                c.ground = true;
-            }
-            wrap(c);
-            place(c);
-        }
-        // ship: hold to rise, let go to fall - gently, tilting with its speed,
-        // a streak and fire behind it (in your colours)
-        if (m_ship.icon) {
-            Runner& s = m_ship;
-            s.x += 17.f * dt;
-            float const lo = RUN_GROUND + RUN_HALF + 4.f, hi = std::max(lo + 10.f, H - 70.f);
-            s.timer -= dt;
-            if (s.timer <= 0.f) { s.held = !s.held; s.timer = starRand(0.25f, 0.7f); }
-            if (s.y > hi - 4.f) s.held = false;
-            if (s.y < lo + 4.f) s.held = true;
-            s.vy += (s.held ? 95.f : -95.f) * dt;
-            s.vy = std::clamp(s.vy, -38.f, 38.f);
-            s.y = std::clamp(s.y + s.vy * dt, lo, hi);
-            s.rot = std::clamp(-s.vy * 0.9f, -28.f, 28.f);
-            stepTrail(s, dt, 0.45f, 1.8f, ccColor3B{255, 255, 255}, 0.28f);
-            s.emit -= dt;
-            if (s.emit <= 0.f) {
-                s.emit = 0.03f;
-                ccColor3B const fc = starRand(0.f, 1.f) < 0.5f ? m_col1 : m_col2;
-                particle(s.x - RUN_HALF * 1.1f, s.y - 0.5f, fc, starRand(0.8f, 1.8f),
-                         CCPoint{-starRand(6.f, 14.f), starRand(-3.f, 3.f)}, starRand(0.25f, 0.5f));
-            }
-            wrap(s);
-            place(s);
-        }
-        // UFO: flaps up, falls back; a soft streak and a puff of squares per flap
-        if (m_ufo.icon && m_ufo.dead <= 0.f) {
-            Runner& u = m_ufo;
-            u.x += 27.f * dt;
-            u.vy -= 170.f * dt;
-            u.timer -= dt;
-            float const floorY = RUN_GROUND + RUN_HALF + 6.f;
-            float const mid = (floorY + top - RUN_HALF) / 2.f + u.dir * 3.f; // bobs a little above / below the middle
-            if ((u.timer <= 0.f && u.y < mid && u.vy < 0.f) || u.y < floorY + 2.f) {
-                u.vy = 42.f;
-                u.timer = starRand(0.18f, 0.4f);
-                if (starRand(0.f, 1.f) < 0.3f) u.dir = -u.dir;
-                for (int i = 0; i < 4; i++) {
-                    particle(u.x - starRand(0.f, RUN_HALF), u.y - RUN_HALF * 0.6f, i % 2 ? m_col1 : ccColor3B{255, 255, 255},
-                             starRand(0.8f, 1.6f), CCPoint{-starRand(3.f, 9.f), -starRand(3.f, 8.f)}, starRand(0.3f, 0.55f));
-                }
-            }
-            u.y += u.vy * dt;
-            if (u.y > top - RUN_HALF) { u.y = top - RUN_HALF; u.vy = std::min(u.vy, 0.f); }
-            if (u.y < floorY) { u.y = floorY; u.vy = std::max(u.vy, 0.f); }
-            u.rot = std::clamp(-u.vy * 0.25f, -12.f, 12.f);
-            stepTrail(u, dt, 0.4f, 1.6f, ccColor3B{255, 255, 255}, 0.3f, -RUN_HALF * 0.3f);
-            u.emit -= dt;
-            if (u.emit <= 0.f) {
-                u.emit = 0.07f;
-                particle(u.x - RUN_HALF, u.y - RUN_HALF * 0.4f, ccColor3B{255, 255, 255}, starRand(0.6f, 1.2f),
-                         CCPoint{-starRand(4.f, 8.f), starRand(-2.f, 2.f)}, starRand(0.25f, 0.45f), 200);
-            }
-            wrap(u);
-            place(u);
-        }
-        // wave: 45 degree zigzag with its solid trail, like in GD
-        if (m_wave.icon && m_wave.dead <= 0.f) {
-            Runner& w = m_wave;
-            float const sp = 25.f;
-            // waiting for the last line to wipe away: the next arrow starts after it
-            bool const waiting = w.oldFade > 0.f;
-            if (!waiting) w.x += sp * dt;
-            if (!waiting) w.y += static_cast<float>(w.dir) * sp * dt;
-            w.timer -= dt;
-            float const lo = RUN_GROUND + RUN_HALF + 1.f, hi = top - RUN_HALF;
-            if (w.timer <= 0.f || w.y > hi || w.y < lo) {
-                if (w.y > hi) w.dir = -1;
-                else if (w.y < lo) w.dir = 1;
-                else w.dir = -w.dir;
-                w.y = std::clamp(w.y, lo, hi);
-                w.timer = starRand(0.18f, 0.55f);
-            }
-            w.rot = w.dir > 0 ? -45.f : 45.f;
-            // trail as thick as about 40% of the arrow, like in GD
-            float tw = 1.8f;
-            // as thick as the back notch of the arrow (about a quarter of its height)
-            if (w.icon && w.icon->m_firstLayer) tw = std::clamp(w.icon->m_firstLayer->boundingBox().size.height * RUN_WAVE_SCALE * 0.24f, 1.f, 2.4f);
-            // the whole line stays until the wave leaves the side; then it fades
-            // out in one go while the next arrow starts from the left
-            if (w.x > SIDE_W + 6.f && !waiting) {
-                w.oldTrail = std::move(w.trail);
-                w.trail.clear();
-                w.oldFade = 0.5f; // the wipe takes half a second
-                w.x = SIDE_W + 7.f; // parked off the edge until it's done
-            }
-            if (w.oldFade > 0.f) {
-                w.oldFade = std::max(0.f, w.oldFade - dt);
-                if (w.oldFade <= 0.f) w.x = 2.f; // then the next arrow starts from the left
-            }
-            if (w.trailNode) {
-                if (inSide(w.x)) w.trail.push_back({w.x, w.y, 0.f});
-                w.trailNode->clear();
-                // `wipe` 0..1: how far along (from the start) the line has faded away
-                auto line = [&](std::deque<TrailPt> const& pts, float wipe) {
-                    size_t const n = pts.size();
-                    for (size_t i = 1; i < n; i++) {
-                        float const f = static_cast<float>(i) / static_cast<float>(n);
-                        float const a = std::clamp((f - wipe) * 5.f, 0.f, 1.f); // a soft edge sweeping forward
-                        if (a <= 0.f) continue;
-                        ccColor4F const c{m_col1.r / 255.f * a, m_col1.g / 255.f * a, m_col1.b / 255.f * a, a};
-                        w.trailNode->drawSegment(CCPoint{pts[i - 1].x, pts[i - 1].y}, CCPoint{pts[i].x, pts[i].y}, tw, c);
-                    }
-                };
-                if (w.oldFade > 0.f) line(w.oldTrail, 1.2f * (1.f - w.oldFade / 0.5f) - 0.2f);
-                else w.oldTrail.clear();
-                line(w.trail, -1.f);
-            }
-            if (w.oldFade <= 0.f) wrap(w); // (parked while the old line wipes away)
-            place(w);
-            // Line the arrow up with its trail like GD: the trail runs into the
-            // back of the arrow (measured from the wave sprite as drawn, so it's
-            // right for any wave icon), turned with the arrow.
-            if (w.icon && w.icon->m_firstLayer) {
-                CCRect const bb = w.icon->m_firstLayer->boundingBox(); // in the icon's own space, unscaled
-                // the trail ends in the arrow's back notch: just inside its back edge
-                float const lx = bb.origin.x + bb.size.width * 0.2f, ly = bb.getMidY();
-                float const r = w.rot * 3.14159265f / 180.f;          // cocos turns clockwise
-                float const ox = (lx * std::cos(r) + ly * std::sin(r)) * RUN_WAVE_SCALE;
-                float const oy = (-lx * std::sin(r) + ly * std::cos(r)) * RUN_WAVE_SCALE;
-                w.icon->setPosition({w.x - ox, w.y - oy});
-            }
-        }
-    }
-
-    // GD death: a burst ring, squares flying out in your colours, the sound.
-    void explode(Runner& r) {
-        CCPoint const at = r.icon ? r.icon->getPosition() : CCPoint{r.x, r.y};
-        r.dead = 1.1f;
-        if (r.icon) r.icon->setVisible(false);
-        r.trail.clear();
-        if (r.trailNode) r.trailNode->clear();
-        if (auto* wave = CCCircleWave::create(1.f, RUN_HALF * 4.5f, 0.35f, false, true)) {
-            wave->m_color = m_col1;
-            wave->setPosition(at);
-            m_body->addChild(wave, 3);
-        }
-        for (int i = 0; i < 18; i++) {
-            float const ang = starRand(0.f, 6.2831853f), dist = starRand(8.f, 20.f);
-            ccColor3B const c = i % 3 == 0 ? ccColor3B{255, 255, 255} : (i % 3 == 1 ? m_col1 : m_col2);
-            float const sz = starRand(1.f, 2.2f);
-            auto* d = CCLayerColor::create(ccColor4B{c.r, c.g, c.b, 255}, sz, sz);
-            d->setPosition({at.x - sz / 2.f, at.y - sz / 2.f});
-            float const life = starRand(0.35f, 0.6f);
-            d->runAction(CCEaseOut::create(CCMoveBy::create(life, CCPoint{std::cos(ang) * dist, std::sin(ang) * dist}), 2.f));
-            d->runAction(CCSequence::create(CCFadeTo::create(life, 0), CCRemoveSelf::create(), nullptr));
-            if (m_trails) m_trails->addChild(d);
-        }
-        if (auto* fm = FMODAudioEngine::sharedEngine()) fm->playEffect("explode_11.ogg");
-    }
-
-    float starRand(float lo, float hi) {
-        m_starSeed = m_starSeed * 1664525u + 1013904223u;
-        return lo + (hi - lo) * static_cast<float>((m_starSeed >> 8) & 0xFFFF) / 65535.f;
-    }
-    // One streak: a thin line, bright at its head and fading to nothing at its
-    // tail, sliding down-left across the page while it fades in and out.
-    void spawnStar() {
-        if (!m_stars) return;
-        float const len = starRand(22.f, 52.f);
-        GLubyte const peak = static_cast<GLubyte>(starRand(170.f, 255.f));
-        auto* s = CCLayerGradient::create(ccColor4B{215, 190, 255, 0}, ccColor4B{255, 255, 255, 255}, CCPoint{1.f, 0.f});
-        s->setContentSize({len, 1.0f});
-        s->ignoreAnchorPointForPosition(false);
-        s->setAnchorPoint({1.f, 0.5f}); // the head leads
-        float const angle = starRand(14.f, 22.f);
-        s->setRotation(-angle + 180.f); // pointing down-left
-        float const travel = starRand(70.f, 130.f);
-        float const rad = angle * 3.14159265f / 180.f;
-        CCPoint const dir{-std::cos(rad) * travel, -std::sin(rad) * travel};
-        // start inside the page so the whole streak stays inside the window
-        float const x0 = starRand(len + travel * 0.6f, W - 10.f);
-        float const y0 = starRand(FOOT_H + travel * 0.4f + 6.f, H - TITLE_H - 6.f);
-        s->setPosition({x0, y0});
-        s->setOpacity(0);
-        float const t = starRand(0.9f, 1.5f);
-        s->runAction(CCMoveBy::create(t, dir));
-        s->runAction(CCSequence::create(CCFadeTo::create(t * 0.25f, peak), CCDelayTime::create(t * 0.35f),
-                                        CCFadeTo::create(t * 0.4f, 0), CCRemoveSelf::create(), nullptr));
-        m_stars->addChild(s);
+    void launchRobot() {
+        if (!m_body || !getParent() || m_robot) return;
+        m_robot = nv::RobotHop::create(m_body, perches(), SIDE_W + 6.f, H, FULL_W + 24.f, 0.f);
+        if (m_robot) m_body->addChild(m_robot, 60);
     }
 
     void update(float dt) override {
-        // background stars and the runners, only while the full window shows
-        if (isVisible() && !m_compactNow) stepRunners(dt);
-        if (m_stars && isVisible() && !m_compactNow) {
-            m_starIn -= dt;
-            if (m_starIn <= 0.f) {
-                m_starIn = starRand(0.12f, 0.38f);
-                spawnStar();
+        s_onlineWanted = isVisible() && !levelRunning();
+        // (2.3) back after the settings popup closed
+        if (m_settingsPopup && !m_settingsPopup->getParent()) {
+            m_settingsPopup = nullptr;
+            if (!isVisible() && Mod::get()->getSavedValue<bool>("window-shown", true)) {
+                setVisible(true);
+                popIn();
             }
         }
+        // the sky, Nova Run, the sign - only while the window shows
+        if (isVisible()) {
+            if (m_run && m_runBox) {
+                bool const room = tabSlotsShown() <= 4; // (the Dev tabs take its place)
+                m_runBox->setVisible(room);
+                if (room) m_run->step(dt);
+            }
+            if (m_pageSky) m_pageSky->step(dt);
+            if (m_sideSky) m_sideSky->step(dt);
+            stepNova(dt);
+            stepGear(dt);
+        }
+        stepRobot(dt);
         // Display-only while the level runs: buttons off so clicks stay jumps.
         bool const interactive = !levelRunning();
         if (interactive != m_interactive) {
@@ -10021,35 +12056,12 @@ protected:
             for (CCMenu* m : {m_titleMenu, m_tabMenu, m_listMenu, m_settingsMenu}) m->setEnabled(interactive);
             m_dragging = m_scrollDrag = false;
         }
-        // Small pill while a level runs ("Small while playing"), the full window
-        // when paused / in menus. The hidden window costs nothing per frame.
-        m_compactCheck -= dt;
-        if (m_compactCheck <= 0.f) { // the setting, re-read twice a second (not every frame)
-            m_compactCheck = 0.5f;
-            m_compactOn = Mod::get()->getSavedValue<bool>("compact-play", true);
-        }
-        bool const compact = m_compactOn && levelRunning();
-        if (compact != m_compactNow) {
-            m_compactNow = compact;
-            m_body->setVisible(!compact);
-            m_pill->setVisible(compact);
-            if (compact) {
-                m_pillVersion = ~0ull; // redraw it now
-            } else {
-                m_forceRefresh = true;
-                popIn();
-            }
-        }
+#ifdef GEODE_IS_DESKTOP
+        updateHover();
+#endif
         m_refreshAt -= dt;
         m_statsAge += dt;
         m_badgeTapAge += dt;
-        if (m_compactNow) {
-            if (m_refreshAt <= 0.f && isVisible()) {
-                m_refreshAt = 0.25f;
-                refreshPill();
-            }
-            return;
-        }
         if (m_refreshAt <= 0.f && isVisible()) {
             m_refreshAt = 0.25f;
             refresh();
@@ -10065,16 +12077,33 @@ protected:
 
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
         if (!isVisible() || levelRunning()) return false;
+        CCPoint const bp = m_body ? m_body->convertToNodeSpace(touch->getLocation()) : CCPoint{-1.f, -1.f};
+        // the robot (it can be outside the window): it explodes
+        if (m_robot && m_robot->hit(bp)) {
+            m_robot->blowUp();
+            return true;
+        }
         CCPoint const p = convertToNodeSpace(touch->getLocation());
         if (!insideLocal(p)) return false;
-        // clicked one of the running icons: it dies like in GD
-        for (Runner* r : {&m_cube, &m_ufo, &m_wave}) {
-            if (!r->icon || !r->icon->isVisible() || r->dead > 0.f) continue;
-            CCPoint const c = r->icon->getPosition();
-            if (std::hypot(p.x - c.x, p.y - c.y) <= RUN_HALF * 1.8f) {
-                explode(*r);
+        // Nova Run: click the icon and it explodes like in GD
+        if (m_run && m_runBox && m_runBox->isVisible() && m_runRect.containsPoint(bp)) {
+            if (m_run->clickAt({bp.x - m_runRect.origin.x - 1.f, bp.y - m_runRect.origin.y - 1.f})) return true;
+        }
+        // NOVA: a click (not a drag) calls the robot
+        m_tapLogo = bp.x > m_novaLeft - 2.f && bp.x < m_novaRight + 2.f && bp.y > H - 33.f && bp.y < H - 10.f;
+        m_tapMoved = 0.f;
+        // (2.3) double-click the page header: the window goes back to its
+        // starting spot (top right) - for a window dragged somewhere awkward
+        if (p.y >= H - TITLE_H && p.x >= SIDE_W) {
+            auto const nowT = Clock::now();
+            if (nowT - m_lastHeaderTap < std::chrono::milliseconds(350)) {
+                auto const win = CCDirector::sharedDirector()->getWinSize();
+                setPosition(clampPos({win.width - FULL_W * getScale() - 6.f, win.height - H * getScale() - 6.f}));
+                savePosition();
+                m_lastHeaderTap = {};
                 return true;
             }
+            m_lastHeaderTap = nowT;
         }
         // drag: by the page header, or the sidebar's title block
         m_dragging = p.y >= H - TITLE_H || (p.x < SIDE_W && p.y >= H - 40.f);
@@ -10085,6 +12114,7 @@ protected:
 
     void ccTouchMoved(CCTouch* touch, CCEvent*) override {
         CCPoint const d = touch->getDelta();
+        m_tapMoved += std::fabs(d.x) + std::fabs(d.y);
         if (m_dragging) {
             setPosition(clampPos({getPositionX() + d.x, getPositionY() + d.y}));
         } else if (m_scrollDrag) {
@@ -10096,10 +12126,15 @@ protected:
 
     void ccTouchEnded(CCTouch*, CCEvent*) override {
         if (m_dragging) savePosition();
+        if (m_tapLogo && m_tapMoved < 3.f) launchRobot();
+        m_tapLogo = false;
         m_dragging = m_scrollDrag = false;
     }
 
-    void ccTouchCancelled(CCTouch* t, CCEvent* e) override { ccTouchEnded(t, e); }
+    void ccTouchCancelled(CCTouch* t, CCEvent* e) override {
+        m_tapLogo = false; // (a cancelled touch never calls the robot)
+        ccTouchEnded(t, e);
+    }
 
 public:
     // Mouse wheel over the window (1.25.9): the window gets it FIRST and it
@@ -10107,7 +12142,7 @@ public:
     // Called from the CCMouseDispatcher hook; true = handled, don't pass it on.
     static bool takeScroll(float y) {
         BufferWindow* w = s_instance;
-        if (!w || !w->isVisible() || !w->getParent() || w->m_compactNow) return false;
+        if (!w || !w->isVisible() || !w->getParent()) return false;
         CCPoint const p = w->convertToNodeSpace(getMousePos());
         if (!w->insideLocal(p)) return false;
         if (isList(w->m_tab) && y != 0.f) w->scrollBy(y > 0.f ? 3 : -3);
@@ -10260,7 +12295,59 @@ class $modify(BufPauseLayer, PauseLayer) {
 // ----------------------------------------------------------------------------
 //  8. Geode hooks
 // ----------------------------------------------------------------------------
+bool s_oldModRemoved = false; // (2.3) the old Input Buffer was removed this start: tell the player once
+
 $on_mod(Loaded) {
+    // (2.2) The mod's id is alquerez.nova now (was alquerez.inputbuffer). Geode
+    // keeps saved data per id, so the old install's comes over once: saved
+    // values (stats, your Custom frames, the online id ...), settings (not the
+    // keys - set those again), and the folders (scans, learned spots, reports).
+    {
+        namespace fs = std::filesystem;
+        auto* mod = Mod::get();
+        fs::path const now = mod->getSaveDir();
+        fs::path const old = now.parent_path() / "alquerez.inputbuffer";
+        std::error_code ec;
+        if (!mod->getSavedValue<bool>("migrated-from-inputbuffer", false) && fs::exists(old, ec)) {
+            if (auto r = geode::utils::file::readJson(old / "saved.json"); r.isOk() && r.unwrap().isObject()) {
+                auto& box = mod->getSaveContainer();
+                for (auto const& v : r.unwrap()) {
+                    auto const key = v.getKey();
+                    if (key && !box.contains(*key)) box[*key] = v;
+                }
+            }
+            if (auto r = geode::utils::file::readJson(old / "settings.json"); r.isOk() && r.unwrap().isObject()) {
+                for (auto const& v : r.unwrap()) {
+                    auto const key = v.getKey();
+                    if (!key || !mod->hasSetting(*key)) continue;
+                    if (v.isBool()) mod->setSettingValue<bool>(*key, v.asBool().unwrapOr(false));
+                    else if (v.isNumber()) mod->setSettingValue<double>(*key, v.asDouble().unwrapOr(0.0));
+                    else if (v.isString()) mod->setSettingValue<std::string>(*key, v.asString().unwrapOr(""));
+                }
+            }
+            for (auto const& e : fs::directory_iterator(old, ec)) {
+                auto const name = e.path().filename().string();
+                if (name == "saved.json" || name == "settings.json") continue;
+                fs::copy(e.path(), now / e.path().filename(), fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+            }
+            mod->setSavedValue<bool>("migrated-from-inputbuffer", true);
+            log::info("[Nova] brought over the saved data of Input Buffer (alquerez.inputbuffer)");
+        }
+        // (2.3) The old Input Buffer still installed next to Nova: two windows,
+        // and both would buffer your clicks. Its .geode is removed (its saved
+        // data stays, Nova has a copy); it's gone after a restart.
+        if (Mod* oldMod = Loader::get()->getInstalledMod("alquerez.inputbuffer")) {
+            if (!oldMod->isUninstalled()) {
+                auto const r = oldMod->uninstall(false);
+                if (r.isOk()) {
+                    s_oldModRemoved = true;
+                    log::info("[Nova] removed the old Input Buffer (alquerez.inputbuffer) - restart to finish");
+                } else {
+                    log::warn("[Nova] couldn't remove the old Input Buffer: {}", r.unwrapErr());
+                }
+            }
+        }
+    }
     // Stage cycle: 1 -> 2 -> 3 -> 4 -> Extreme -> Off
     listenForKeybindSettingPresses("cycle-key", [](Keybind const&, bool down, bool repeat, double) {
         if (down && !repeat) s_sim.cyclePreset();
@@ -10281,6 +12368,9 @@ $on_mod(Loaded) {
 #endif
     queueInMainThread([] {
         if (auto* p = ScanRunner::create()) OverlayManager::get()->addChild(p);
+    });
+    queueInMainThread([] {
+        if (auto* p = OnlineCounter::create()) OverlayManager::get()->addChild(p);
     });
     log::info("[InputBuffer] loaded");
 }
@@ -10311,6 +12401,17 @@ class $modify(BufAppDelegate, AppDelegate) {
 class $modify(BufMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
+        // (2.3) once: the old Input Buffer was removed - restart to be rid of its window
+        if (s_oldModRemoved) {
+            s_oldModRemoved = false;
+            Loader::get()->queueInMainThread([] {
+                FLAlertLayer::create("Nova",
+                                     "The old <cy>Input Buffer</c> was still installed next to Nova, so it's been removed "
+                                     "(your settings, scans and stats came over to Nova).\n<cg>Restart the game</c> to be rid of its window - "
+                                     "until then both buffer your clicks.",
+                                     "OK")->show();
+            });
+        }
         if (Mod::get()->getSavedValue<bool>("window-shown", true)) {
             Loader::get()->queueInMainThread([] { windowEnsure(); });
         }

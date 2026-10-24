@@ -10,7 +10,7 @@ else()
 endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(inputbuffer VERSION 2.1.0)
+project(nova VERSION 2.3.0)
 
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp

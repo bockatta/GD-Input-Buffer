@@ -1,4 +1,4 @@
-# Input Buffer V2.2
+# Nova V2.3 (Input Buffer)
 
 **An input buffer for Geometry Dash** (Geode mod) by **AlQuerez23**. Discord: **alquerez23**
 
@@ -34,17 +34,17 @@ One setting, **Stage**, picks how early a click can be and still get saved. Fram
 | Extreme | 20 frames early (12 for wave, 2 for ship) |
 | Custom | your own frames (0.5 to 30), set in the window |
 
-Extreme and Custom also re-plan held clicks live, every tick, so long holds stay safe. **F6** cycles through the stages (you can change the key in the mod settings).
+Extreme and Custom also re-plan held clicks live, every tick, so long holds stay safe. **Custom Min / Max** (Stage tab, Custom only): the smallest shift a click gets and the latest it can ever go in (240 ticks a second, 4 = 1 frame). **F6** cycles through the stages (you can change the key in the mod settings).
 
 ## The window
 
-**Left Alt** shows / hides it (change it in the settings: *Window Key*). You can also use the **Input Buffer button** in the pause menu (green circle with the target icon), which is the way on phones; the window is bigger there too. The tabs are in the sidebar on the left. While a level runs it shrinks to a small pill ("Small while playing").
+**Left Alt** shows / hides it (change it in the settings: *Window Key*). You can also use the **Nova button** in the pause menu (green circle with the target icon), which is the way on phones; the window is bigger there too. The tabs are in the sidebar on the left.
 
 - **Log**: what the buffer did with each click: buffered, fired, raw, deaths. On Windows, **console** opens it in its own command-prompt window instead.
 - **Stats** (hidden: click the version badge 5 times): prediction accuracy, your rhythm, windows, performance, and your system. The same 5 clicks show the **Dev** tab (live details to send when something's off).
-- **Stage**: pick the stage, set Custom frames, and the options (Show paths, Learn from attempts, Log: more detail, Small while playing).
+- **Stage**: pick the stage, set Custom frames, and the options (Learn from attempts, Log: more detail, Custom Min / Max).
 - **Modes**: switch the buffer on or off per gamemode.
-- **Tools**: Orb helper, Level scan (finds the inputs for the whole level while paused, never stops before the end), Show scan (watch it work), Real game (practice, experimental: the scan uses the real level where its own prediction can't get through), Snap to scan (your clicks use the scan, off by default), your saved stats, and Export report (one file with everything, to send when something's off).
+- **Tools**: Orb helper (on by default; any orb), Level scan (finds the inputs for the whole level while paused, never stops before the end), Show scan (watch it work), Show rays (your hitbox, the press / release paths, a live pathfinder and what the buffer thought, as lines in the level), Export scan (the scan as a text file: where to press, what it couldn't solve), Forget scan (delete this level's scan), Snap to scan (your clicks use the scan, off by default), your saved stats, and Export report (one file with everything, to send when something's off).
 
 ## Versions
 
@@ -52,6 +52,10 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 
 | Version | Platform | Works |
 |---------|----------|:-----:|
+| **v2.3.0** | Windows | ✅ |
+|  | macOS | ✅ |
+|  | iOS | ✅ |
+|  | Android | ✅ |
 | **v2.2.0** | Windows | ✅ |
 |  | macOS | ✅ |
 |  | iOS | ✅ |
@@ -73,12 +77,27 @@ Extreme and Custom also re-plan held clicks live, every tick, so long holds stay
 |  | iOS | ❌ |
 |  | Android | ❌ |
 
+## What's new in V2.3
+
+- **Nova:** the mod is called Nova now (id `alquerez.nova`); your Input Buffer data comes over on the first start.
+- **GD techniques in the scan:** straight fly (ship taps), buffer clicks (ball / spider holds into landings), dual parts, mini wave, slopes and speed portals.
+- **Nova look:** a neon NOVA sign with a galaxy O, a space background, glowing section outlines, a rebuilt Modes tab with your icons, a settings cog by the online count, and **Nova Run** - your icons through GD obstacles in all 8 gamemodes, with GD's real portals and trails. (And sometimes your robot jumps across the window.)
+- **New scan method (sprint):** much faster, and a scan always finishes now.
+- **Snap To Scan** finds the scanned line, in wave too.
+
 ## What's new in V2.2
 
 - **New window:** tabs in a sidebar, dark glass with a purple hue, switches instead of checkboxes.
 - **Animations:** the window grows in when it opens, shrinks away when it closes, and pages slide in.
 - **Console log (Windows):** the Log in its own command-prompt window (Log tab -> console).
 - **Ship, light touch:** ship clicks are held at most 2 frames and only for a crash right ahead, so a straight fly isn't pulled down.
+- **Wave rays:** wave inputs are judged by casting your two straight lines (press / release) against the level, like a wave bot's view - far less work per click, so spam keeps up.
+- **Spam fixed:** wave / ship spam no longer drifts you up.
+- **Orb Helper** on by default, now for dash / spider / teleport / custom orbs too.
+- **Show Rays:** press / release paths, a live pathfinder and what the buffer is thinking, drawn as lines.
+- **Online users** at the top of the window (needs the server in `server/`).
+- **Custom Min / Max:** the smallest and largest shift on the Custom stage; Custom saves the moment you press +/-.
+- **Scan Level** no longer crashes big levels, and **Forget Scan** deletes a level's scan.
 
 ## What's new in V2.1
 

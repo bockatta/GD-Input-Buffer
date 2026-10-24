@@ -1,4 +1,4 @@
-# Input Buffer V2.2
+# Nova V2.3 (Input Buffer)
 
 **By AlQuerez23.** Discord: **alquerez23**
 
@@ -26,20 +26,26 @@ How early a click can be and still get saved (60fps frames, 1 frame = 16.7 ms):
 - **Extreme:** 20 frames early (12 for wave, 2 for ship), with live re-planning
 - **Custom:** your own frames (0.5 to 30), set in the window
 
+**Custom Min / Max** (Stage tab) set the smallest and largest shift on the Custom stage (4 ticks = 1 frame).
+
 **F6** cycles the stages.
 
 ## The window
 
-**Left Alt** shows / hides it (or the key you set as Window Key). Or the **Input Buffer button** in the pause menu (green circle with the target icon), the way to open it on phones.
+**Left Alt** shows / hides it (or the key you set as Window Key). Or the **Nova button** in the pause menu (green circle with the target icon), the way to open it on phones.
 
 - **Log:** what happened to each click (Windows: or in a console window)
 - **Stats** (click the version badge 5 times): accuracy, your rhythm, windows, performance, your system
-- **Stage:** stage, Custom frames, options
+- **Stage:** stage, Custom frames, options, Custom Min / Max
 - **Modes:** buffer on / off per gamemode
-- **Tools:** Orb helper, Level scan, Show scan, Real game (practice), Snap to scan, your saved stats, Export report
+- **Tools:** Orb helper, Level scan, Show scan, Show rays, Export scan, Forget scan, Snap to scan, your saved stats, Export report
+
+## Online users
+
+The top of the window shows how many people are online and offline. Each game sends the Nova server an anonymous random ID every 90 seconds, nothing else. Turn it off with the **Show Online Users** setting.
 
 ## Platforms
 
-**V2.2 works on:** Windows, macOS (Apple Silicon and Intel), iOS and Android (32 and 64-bit).
+**V2.3 works on:** Windows, macOS (Apple Silicon and Intel), iOS and Android (32 and 64-bit).
 
 The full version list is in the Changelog tab.

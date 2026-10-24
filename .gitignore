@@ -2,3 +2,6 @@ build/
 *.geode
 .vs/
 .vscode/
+server/
+*.bat
+resources/

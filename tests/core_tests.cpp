@@ -973,6 +973,87 @@ static void testPushAt() {
     CHECK(g && !*g && !r.active(), "gesture not closed");
 }
 
+// ---------------------------------------------------------------------------
+//  Wave rays (2.2)
+// ---------------------------------------------------------------------------
+static void testWaveRays() {
+    std::printf("wave rays\n");
+    std::vector<RayBox> none;
+    // open space: clear all the way
+    {
+        WaveRayHit h = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, +1, 50, none);
+        CHECK(h.tick == -1 && std::fabs(h.x - 100.f) < 1e-3f && std::fabs(h.y - 100.f) < 1e-3f,
+              "tick=%d x=%.1f y=%.1f", h.tick, h.x, h.y);
+    }
+    // a spike up ahead: centre (2t, 2t), half size 5 -> touches the box at 20..30 on tick 8
+    {
+        std::vector<RayBox> b{RayBox{20.f, 20.f, 10.f, 10.f, 0.f, false}};
+        WaveRayHit h = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, +1, 50, b);
+        CHECK(h.tick == 8, "tick=%d", h.tick);
+        WaveRayHit d = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, -1, 50, b);
+        CHECK(d.tick == -1, "down ray should miss, tick=%d", d.tick);
+    }
+    // a floor: going down you land on its top and slide along it, alive
+    {
+        std::vector<RayBox> b{RayBox{-100.f, -100.f, 1000.f, 90.f, 0.f, true}}; // top at y = -10
+        WaveRayHit h = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, -1, 40, b);
+        CHECK(h.tick == -1 && std::fabs(h.y - (-5.f)) < 1e-3f, "tick=%d y=%.2f", h.tick, h.y);
+        // ... and a ceiling the same way going up
+        std::vector<RayBox> c{RayBox{-100.f, 10.f, 1000.f, 90.f, 0.f, true}}; // bottom at y = 10
+        WaveRayHit u = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, +1, 40, c);
+        CHECK(u.tick == -1 && std::fabs(u.y - 5.f) < 1e-3f, "tick=%d y=%.2f", u.tick, u.y);
+    }
+    // sliding along the floor into a wall: the wall's side kills
+    {
+        std::vector<RayBox> b{RayBox{-100.f, -100.f, 1000.f, 90.f, 0.f, true}, RayBox{40.f, -10.f, 20.f, 40.f, 0.f, true}};
+        WaveRayHit h = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, -1, 40, b);
+        CHECK(h.tick == 18, "tick=%d", h.tick); // right edge 2t+5 > 40 -> t = 18
+    }
+    // a saw (round hitbox): the box's corner region outside the circle is safe
+    {
+        std::vector<RayBox> b{RayBox{30.f, 50.f, 20.f, 20.f, 10.f, false}}; // centre (40, 60), r 10
+        WaveRayHit h = waveRay(0.f, 0.f, 5.f, 5.f, 2.f, 2.f, +1, 60, b);
+        // centre (2t,2t): the gap to (40,60) per axis minus 5, under 10 in length
+        int expect = -1;
+        for (int t = 1; t <= 60 && expect < 0; t++) {
+            float const dx = std::max(std::fabs(2.f * t - 40.f) - 5.f, 0.f), dy = std::max(std::fabs(2.f * t - 60.f) - 5.f, 0.f);
+            if (dx * dx + dy * dy < 100.f) expect = t;
+        }
+        CHECK(h.tick == expect && expect > 0, "tick=%d expect=%d", h.tick, expect);
+    }
+    // delay: going up, the press to go down hits a spike below; going up 6
+    // ticks first clears it (5 doesn't: y = 4d - 2t < -3 at t = 12)
+    {
+        std::vector<RayBox> b{RayBox{10.f, -20.f, 10.f, 12.f, 0.f, false}}; // x 10..20, top at -8
+        WaveRayIn in;
+        in.x = 0.f; in.y = 0.f; in.hw = 5.f; in.hh = 5.f; in.vx = 2.f; in.vy = 2.f;
+        in.dirNow = +1; in.dirNew = -1;
+        WaveRayHit now;
+        int d = waveRayDelay(in, 0, 10, 10, b, &now);
+        CHECK(d == 6, "d=%d", d);
+        CHECK(now.tick > 0, "on time should hit, tick=%d", now.tick);
+        CHECK(waveRayDelay(in, 0, 5, 10, b) == -1, "window 5 can't save it");
+        CHECK(waveRayDelay(in, 7, 10, 10, b) == 7, "min delay 7");
+        // safe as made -> 0
+        in.dirNew = +1;
+        CHECK(waveRayDelay(in, 0, 10, 10, b) == 0, "already safe");
+    }
+    // waiting runs you into something first: no delay can help past that
+    {
+        std::vector<RayBox> b{RayBox{8.f, 8.f, 10.f, 10.f, 0.f, false}}; // hit going up on tick 2
+        WaveRayIn in;
+        in.hw = 5.f; in.hh = 5.f; in.vx = 2.f; in.vy = 2.f; in.dirNow = +1; in.dirNew = +1;
+        CHECK(waveRayDelay(in, 0, 10, 10, b) == -1, "both directions blocked");
+        in.dirNew = -1;
+        CHECK(waveRayDelay(in, 0, 10, 10, b) == 0, "going down now is the way out");
+    }
+    // mini wave: twice as steep, and going left
+    {
+        WaveRayHit h = waveRay(0.f, 0.f, 3.f, 3.f, -2.f, 4.f, +1, 10, none);
+        CHECK(h.tick == -1 && std::fabs(h.x + 20.f) < 1e-3f && std::fabs(h.y - 40.f) < 1e-3f, "x=%.1f y=%.1f", h.x, h.y);
+    }
+}
+
 int main() {
     testPushAt();
     testSearch();
@@ -990,6 +1071,7 @@ int main() {
     testOrbAim();
     testSpotFilter();
     testGuarded();
+    testWaveRays();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
