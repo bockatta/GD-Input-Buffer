@@ -55,7 +55,7 @@
 - The Discord tile glows and shines like Extreme (a pulsing blurple edge and a light sweeping across it).
 - Custom, Export Report and Scan Level glow and shine like Extreme too, in Nova's violet (Custom's glow pulses brighter while it's your stage).
 - Online count: closing the game (or a phone putting it in the background) tells the server right away, so you show as offline at once instead of up to 3 minutes later (server: new POST /bye). The totals refresh every 15 seconds while the window is open (was 30).
-- Phones: the window is smaller - iOS and Android each have their own size (1.1x, was 1.5x), and on a phone it's never taller than half the screen, whatever Window Size says (PC: 90%).
+- Phones: the window is smaller - iOS and Android each have their own size (1.1x, was 1.5x), and on a phone it's never taller than half the screen, whatever Window Size says (PC: 90%). It's never wider than 70% of a phone's screen either - on iPad it was wider than the screen, so it could only be dragged up and down.
 - Custom's line under the stages just lists your frames ("(Extreme engine)" is gone).
 - Phone text says "the Nova button in the pause menu"; the report, dev info and log file say Nova.
 

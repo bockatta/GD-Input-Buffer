@@ -9620,10 +9620,25 @@ std::string keyNameFor(Keybind const& b, char const* fallback) {
 }
 
 constexpr char const* AUTHOR_NAME    = "AlQuerez23";
-#ifdef GEODE_IS_MOBILE
-constexpr float PLATFORM_WINDOW_SCALE = 1.5f; // window size on iOS / Android (2.1)
+// Window size per platform (Window Size 1.0). (2.3) Phones were 1.5x - too big
+// with the taller Nova window (half the screen); each has its own now.
+#if defined(GEODE_IS_IOS)
+constexpr float PLATFORM_WINDOW_SCALE = 1.1f;
+#elif defined(GEODE_IS_ANDROID)
+constexpr float PLATFORM_WINDOW_SCALE = 1.1f;
 #else
 constexpr float PLATFORM_WINDOW_SCALE = 1.0f;
+#endif
+// (2.3) Never taller than this share of the screen (any Window Size), so it
+// always fits on a small / wide phone.
+// Never wider than this share either: a window wider than the screen can only
+// be dragged up and down (iPad).
+#ifdef GEODE_IS_MOBILE
+constexpr float WINDOW_MAX_SCREEN_H = 0.5f;
+constexpr float WINDOW_MAX_SCREEN_W = 0.7f;
+#else
+constexpr float WINDOW_MAX_SCREEN_H = 0.9f;
+constexpr float WINDOW_MAX_SCREEN_W = 0.9f;
 #endif
 constexpr char const* TITLE_BADGE = "V2.3"; // the badge next to the title
 constexpr char const* AUTHOR_DISCORD = "alquerez23";
@@ -10137,9 +10152,13 @@ protected:
         setAnchorPoint({0.f, 0.f});
 
         Config const c = Config::load();
-        // Window Size 1.0 = half the original size. Phones get 1.5x on top (2.1):
-        // the same window is tiny on a phone screen.
-        setScale(0.5f * PLATFORM_WINDOW_SCALE * std::clamp(c.hudScale, 0.5f, 2.0f));
+        // Window Size 1.0 = half the original size. Phones get PLATFORM_WINDOW_SCALE
+        // on top (2.1; 2.3: 1.1 on iOS / Android, was 1.5), capped to the screen.
+        float scale = 0.5f * PLATFORM_WINDOW_SCALE * std::clamp(c.hudScale, 0.5f, 2.0f);
+        auto const screen = CCDirector::get()->getWinSize();
+        if (screen.height > 1.f) scale = std::min(scale, screen.height * WINDOW_MAX_SCREEN_H / H); // (2.3) fits the screen
+        if (screen.width > 1.f) scale = std::min(scale, screen.width * WINDOW_MAX_SCREEN_W / FULL_W);
+        setScale(scale);
         m_alpha = windowOpacity();
         s_builtScale = c.hudScale;
         s_builtAlpha = m_alpha;
