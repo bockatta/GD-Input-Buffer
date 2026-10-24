@@ -9647,7 +9647,7 @@ constexpr char const* AUTHOR_DISCORD = "alquerez23";
 // The URL lives in its own file (src/OnlineURL.hpp) so a new main.cpp never wipes it.
 #include "OnlineURL.hpp"
 constexpr float ONLINE_PING_SECS = 90.f;  // (2.3) "I'm here", every 1.5 minutes (was 2; the server's "online" is 3)
-constexpr float ONLINE_STATS_SECS = 30.f; // (2.3) the totals, every 30 s - only while you're looking at the window
+constexpr float ONLINE_STATS_SECS = 15.f; // (2.3) the totals, every 15 s - only while you're looking at the window
 // (Cloudflare's free plan: 100 000 requests a day. A game left open pings
 // ~960 times a day; the extra totals only while the window is up and you're
 // not playing.)
@@ -9712,6 +9712,20 @@ void fetchOnlineStats() {
         }
     });
 }
+// (2.3) "I'm gone": when the game closes (or a phone puts it in the
+// background) the server is told right away, so you show as offline at once
+// instead of 3 minutes later. Waits up to 2 s (the game is closing - a
+// request sent the normal way would never get out). If the game carries on
+// after all, the next ping (2 s later) puts you back online.
+bool s_onlineBye = false;
+void sendOnlineBye() {
+    if (!onlineEnabled() || s_onlineBye) return;
+    s_onlineBye = true;
+    web::WebRequest req;
+    req.bodyJSON(matjson::makeObject({{"id", onlineId()}}));
+    req.timeout(std::chrono::seconds(2));
+    (void)req.postSync(std::string(ONLINE_URL) + "/bye");
+}
 bool s_onlineNow = false;    // set: fetch the totals right away (the window just opened)
 bool s_onlineWanted = false; // the window is up (and you're not playing): keep the totals fresh
 
@@ -9733,6 +9747,10 @@ public:
         return true;
     }
     void update(float dt) override {
+        if (s_onlineBye) { // still running after a "bye" (back from the background): say hi again
+            s_onlineBye = false;
+            m_wait = std::min(m_wait, 2.f);
+        }
         m_wait -= dt;
         m_statsWait -= dt;
         if (m_wait <= 0.f) {
@@ -12396,6 +12414,19 @@ class $modify(BufAppDelegate, AppDelegate) {
     }
 };
 #endif
+
+// (2.3) Online: say goodbye when the game closes / goes to the background
+// (GD saves the game at both).
+class $modify(NovaOnlineDelegate, AppDelegate) {
+    void trySaveGame(bool force) {
+        AppDelegate::trySaveGame(force);
+        sendOnlineBye();
+    }
+    void applicationDidEnterBackground() {
+        AppDelegate::applicationDidEnterBackground();
+        sendOnlineBye();
+    }
+};
 
 // Show the window in the main menu too (if it's switched on).
 class $modify(BufMenuLayer, MenuLayer) {
