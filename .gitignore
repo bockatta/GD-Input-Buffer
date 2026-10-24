@@ -5,3 +5,4 @@ build/
 server/
 *.bat
 resources/
+src/OnlineURL.hpp
